@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
 import subprocess
 import ctypes
+from multiprocessing import cpu_count
 
 import psutil
 import requests
@@ -200,6 +201,8 @@ class MDNSCollector:
         self.ip_to_names: Dict[str, Set[str]] = {}
         self.ip_to_services: Dict[str, Set[str]] = {}
 
+        self.last_hit = time.time()
+
         self.browsers: List[ServiceBrowser] = []
 
     def _on_state_change(self, zeroconf: Zeroconf, service_type: str, name: str, state_change: ServiceStateChange):
@@ -230,6 +233,8 @@ class MDNSCollector:
                     self.ip_to_names.setdefault(ip, set()).add(pretty)
                     self.ip_to_services.setdefault(ip, set()).add(service_type.replace(".local.", "").strip("."))
 
+            self.last_hit = time.time()
+
         except Exception:
             return
 
@@ -237,7 +242,14 @@ class MDNSCollector:
         try:
             for t in self.COMMON_TYPES:
                 self.browsers.append(ServiceBrowser(self.zc, t, handlers=[self._on_state_change]))
-            time.sleep(self.duration_s)
+            start = time.time()
+            while True:
+                now = time.time()
+                if now - start >= self.duration_s:
+                    break
+                if now - self.last_hit > 1.2 and now - start > 1.0:
+                    break
+                time.sleep(0.1)
             with self.lock:
                 return dict(self.ip_to_names), dict(self.ip_to_services)
         finally:
@@ -279,6 +291,7 @@ def ssdp_discover(timeout_s: int = 3, mx: int = 2) -> Dict[str, dict]:
 
     results: Dict[str, dict] = {}
     end = time.time() + timeout_s
+    last_packet = time.time()
 
     try:
         # send a couple of times for better coverage
@@ -293,6 +306,8 @@ def ssdp_discover(timeout_s: int = 3, mx: int = 2) -> Dict[str, dict]:
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
+                if time.time() - last_packet > 0.5:
+                    break
                 continue
             except Exception:
                 break
@@ -321,6 +336,8 @@ def ssdp_discover(timeout_s: int = 3, mx: int = 2) -> Dict[str, dict]:
             else:
                 if (not results[ip].get("location")) and info.get("location"):
                     results[ip] = info
+
+            last_packet = time.time()
 
     finally:
         try:
@@ -423,14 +440,52 @@ class ScanWorker(QThread):
                 conf.iface = self.iface_name
 
             devices: Dict[str, Device] = {}
+            ping_results: Dict[str, float] = {}
 
             npcap_available = is_npcap_available()
+
+            net = ipaddress.IPv4Network(self.cidr, strict=False)
+            targets = [str(ip) for ip in net.hosts()]
+
+            max_ping_workers = min(256, cpu_count() * 8)
+
+            def icmp_ping(ip: str) -> Optional[float]:
+                try:
+                    res = ping(ip, timeout=0.6, unit="ms")
+                    return float(res) if res is not None else None
+                except Exception:
+                    return None
+
+            def run_ping_pool():
+                if not self.do_ping or not targets:
+                    return
+                total = len(targets)
+                completed = 0
+                last_emit = 0.0
+                with ThreadPoolExecutor(max_workers=max_ping_workers) as executor:
+                    future_map = {executor.submit(icmp_ping, ip): ip for ip in targets}
+                    for fut in as_completed(future_map):
+                        if self._stop:
+                            executor.shutdown(cancel_futures=True)
+                            return
+                        ip = future_map[fut]
+                        rtt = fut.result()
+                        if rtt is not None:
+                            ping_results[ip] = rtt
+                        completed += 1
+                        now = time.time()
+                        if now - last_emit >= 0.2:
+                            self.status.emit(f"ICMP ping: {completed}/{total} hosts probed")
+                            last_emit = now
+
+            ping_thread = threading.Thread(target=run_ping_pool, daemon=True)
+            ping_thread.start()
+
+            t_start = time.perf_counter()
 
             # 1) ARP scan
             if npcap_available:
                 self.status.emit(f"Scanning {self.cidr} (ARP)...")
-                net = ipaddress.IPv4Network(self.cidr, strict=False)
-                targets = [str(ip) for ip in net.hosts()]
 
                 conf.verb = 0
                 pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
@@ -449,11 +504,58 @@ class ScanWorker(QThread):
             else:
                 self.status.emit("ARP disabled (Npcap not available).")
 
-            # 2) SSDP / UPnP
-            if self.do_ssdp and not self._stop:
+            arp_end = time.perf_counter()
+            print(f"[TIMING] ARP duration: {(arp_end - t_start):.3f}s")
+
+            # 2) SSDP and mDNS in parallel with ping
+            ssdp_data: Dict[str, dict] = {}
+            mdns_names: Dict[str, Set[str]] = {}
+            mdns_services: Dict[str, Set[str]] = {}
+
+            def run_ssdp():
+                nonlocal ssdp_data
+                if not self.do_ssdp or self._stop:
+                    return
                 self.status.emit(f"Discovering UPnP/SSDP (timeout {self.ssdp_timeout_s}s)...")
-                ssdp = ssdp_discover(timeout_s=self.ssdp_timeout_s, mx=2)
-                for ip, info in ssdp.items():
+                ssdp_data = ssdp_discover(timeout_s=self.ssdp_timeout_s, mx=2)
+
+            def run_mdns():
+                nonlocal mdns_names, mdns_services
+                if not self.do_mdns or self._stop:
+                    return
+                self.status.emit(f"Discovering mDNS/Bonjour (listening {self.mdns_duration_s}s)...")
+                collector = MDNSCollector(duration_s=self.mdns_duration_s)
+                mdns_names, mdns_services = collector.run()
+
+            ssdp_thread = threading.Thread(target=run_ssdp, daemon=True)
+            mdns_thread = threading.Thread(target=run_mdns, daemon=True)
+
+            ssdp_thread.start()
+            mdns_thread.start()
+
+            ssdp_thread.join()
+            mdns_thread.join()
+
+            mdns_end = time.perf_counter()
+            if self.do_mdns:
+                for ip, names in mdns_names.items():
+                    if self._stop:
+                        self.status.emit("Scan stopped.")
+                        return
+                    if not ip_in_cidr(ip, self.cidr):
+                        continue
+                    d = self._merge_device(devices, ip)
+                    d.protocols.add("mDNS")
+                    for n in names:
+                        d.mdns_names.add(n)
+                    if not d.hostname and d.mdns_names:
+                        d.hostname = sorted(d.mdns_names)[0]
+                    svcs = mdns_services.get(ip, set())
+                    if svcs:
+                        d.description = normalize_description(d.description, "mDNS: " + ",".join(sorted(svcs)[:6]))
+
+            if self.do_ssdp:
+                for ip, info in ssdp_data.items():
                     if self._stop:
                         self.status.emit("Scan stopped.")
                         return
@@ -466,7 +568,6 @@ class ScanWorker(QThread):
                     d.ssdp_usn = info.get("usn")
                     d.ssdp_location = info.get("location")
 
-                    # Basic description from SSDP headers
                     desc_bits = []
                     if d.ssdp_st:
                         desc_bits.append(d.ssdp_st)
@@ -475,64 +576,37 @@ class ScanWorker(QThread):
                     if desc_bits:
                         d.description = normalize_description(d.description, "UPnP: " + " | ".join(desc_bits[:2]))
 
-                # Optional: Fetch UPnP XML for friendlyName
-                if self.fetch_upnp_xml and not self._stop:
-                    self.status.emit("Fetching UPnP device descriptions (XML)...")
-                    for ip, d in list(devices.items()):
-                        if self._stop:
-                            self.status.emit("Scan stopped.")
-                            return
-                        if not d.ssdp_location:
-                            continue
-                        pretty = fetch_upnp_friendly_name(d.ssdp_location, timeout_s=1.5)
-                        if pretty:
-                            d.description = normalize_description(d.description, pretty)
+            ssdp_end = time.perf_counter()
 
-            # 3) mDNS / Bonjour
-            if self.do_mdns and not self._stop:
-                self.status.emit(f"Discovering mDNS/Bonjour (listening {self.mdns_duration_s}s)...")
-                collector = MDNSCollector(duration_s=self.mdns_duration_s)
-                ip_to_names, ip_to_services = collector.run()
-
-                for ip, names in ip_to_names.items():
+            if self.fetch_upnp_xml and self.do_ssdp and not self._stop:
+                self.status.emit("Fetching UPnP device descriptions (XML)...")
+                for ip, d in list(devices.items()):
                     if self._stop:
                         self.status.emit("Scan stopped.")
                         return
+                    if not d.ssdp_location:
+                        continue
+                    pretty = fetch_upnp_friendly_name(d.ssdp_location, timeout_s=1.5)
+                    if pretty:
+                        d.description = normalize_description(d.description, pretty)
+
+            ping_thread.join()
+            ping_end = time.perf_counter()
+
+            if self.do_ping and not self._stop:
+                for ip, rtt in ping_results.items():
                     if not ip_in_cidr(ip, self.cidr):
                         continue
                     d = self._merge_device(devices, ip)
-                    d.protocols.add("mDNS")
-                    for n in names:
-                        d.mdns_names.add(n)
-                    # Prefer hostname from mDNS if empty
-                    if not d.hostname and d.mdns_names:
-                        # pick a deterministic one
-                        d.hostname = sorted(d.mdns_names)[0]
+                    d.rtt_ms = rtt
+                    d.protocols.add("ICMP")
 
-                    # Add services to description
-                    svcs = ip_to_services.get(ip, set())
-                    if svcs:
-                        d.description = normalize_description(d.description, "mDNS: " + ",".join(sorted(svcs)[:6]))
-
-            # 4) Full subnet probe (additive)
+            # 4) TCP fallback for unreachable hosts (full subnet)
             if self.full_subnet_scan and not self._stop:
-                net = ipaddress.IPv4Network(self.cidr, strict=False)
-                targets = [str(ip) for ip in net.hosts() if str(ip) not in devices]
-                total = len(targets)
+                remaining_targets = [ip for ip in targets if ip not in devices]
+                total = len(remaining_targets)
 
-                def probe_ip(ip: str) -> Tuple[bool, Optional[float], Set[str]]:
-                    rtt: Optional[float] = None
-                    protos: Set[str] = set()
-                    if self.do_ping:
-                        try:
-                            r = ping(ip, timeout=0.3, unit="ms")
-                            if r is not None:
-                                rtt = float(r)
-                                protos.add("ICMP")
-                                return True, rtt, protos
-                        except Exception:
-                            pass
-
+                def tcp_probe(ip: str) -> Tuple[bool, Optional[float]]:
                     tcp_ports = [80, 443, 22, 445, 3389]
                     for port in tcp_ports:
                         try:
@@ -543,13 +617,10 @@ class ScanWorker(QThread):
                             elapsed_ms = (time.time() - start_ts) * 1000.0
                             sock.close()
                             if res == 0 or res in (errno.ECONNREFUSED, 111, 10061):
-                                protos.add("TCP")
-                                if res == 0:
-                                    rtt = rtt if rtt is not None else elapsed_ms
-                                return True, rtt, protos
+                                return True, elapsed_ms if res == 0 else None
                         except Exception:
                             pass
-                    return False, rtt, protos
+                    return False, None
 
                 if total:
                     checked = 0
@@ -557,7 +628,7 @@ class ScanWorker(QThread):
                     last_emit = 0.0
                     self.status.emit(f"Probing subnet: 0/{total} checked – 0 alive")
                     with ThreadPoolExecutor(max_workers=64) as executor:
-                        future_map = {executor.submit(probe_ip, ip): ip for ip in targets}
+                        future_map = {executor.submit(tcp_probe, ip): ip for ip in remaining_targets}
                         for fut in as_completed(future_map):
                             if self._stop:
                                 self.status.emit("Scan stopped.")
@@ -565,52 +636,53 @@ class ScanWorker(QThread):
                                 return
                             ip = future_map[fut]
                             checked += 1
-                            alive, rtt, protos = fut.result()
+                            alive, rtt = fut.result()
                             if alive:
                                 alive_count += 1
-                                if ip not in devices:
-                                    d = self._merge_device(devices, ip)
-                                    if rtt is not None:
-                                        d.rtt_ms = rtt
-                                    if protos:
-                                        d.protocols.update(protos)
-                                    else:
-                                        d.protocols.add("TCP")
+                                d = self._merge_device(devices, ip)
+                                if rtt is not None and d.rtt_ms is None:
+                                    d.rtt_ms = rtt
+                                d.protocols.add("TCP")
                             now = time.time()
-                            if now - last_emit > 0.5:
+                            if now - last_emit > 0.2:
                                 self.status.emit(f"Probing subnet: {checked}/{total} checked – {alive_count} alive")
                                 last_emit = now
                     self.status.emit(f"Probing subnet: {total}/{total} checked – {alive_count} alive")
 
-            # 5) Ping RTT
-            if self.do_ping and not self._stop:
-                self.status.emit("Measuring latency (ICMP ping)...")
-                # Ping known devices first; optional: you can ping all hosts but it's heavy
-                for ip, d in list(devices.items()):
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
-                    try:
-                        r = ping(ip, timeout=1.0, unit="ms")
-                        if r is not None:
-                            d.rtt_ms = float(r)
-                            d.protocols.add("ICMP")
-                    except Exception:
-                        pass
-
-            # 6) Reverse DNS
+            # 5) Reverse DNS
             if self.do_rdns and not self._stop:
                 self.status.emit("Resolving hostnames (Reverse DNS)...")
-                for ip, d in list(devices.items()):
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
-                    if d.hostname:
-                        continue
-                    name = safe_gethostbyaddr(ip)
-                    if name:
-                        d.hostname = name
-                        d.protocols.add("rDNS")
+
+                def rdns_lookup(ip: str) -> Optional[str]:
+                    try:
+                        orig_timeout = socket.getdefaulttimeout()
+                        socket.setdefaulttimeout(0.3)
+                        return safe_gethostbyaddr(ip)
+                    finally:
+                        socket.setdefaulttimeout(orig_timeout)
+
+                rdns_targets = [
+                    (ip, d) for ip, d in devices.items()
+                    if (not d.hostname or "mDNS" not in d.protocols) and ("ICMP" in d.protocols or not d.hostname)
+                ]
+                if rdns_targets:
+                    with ThreadPoolExecutor(max_workers=32) as executor:
+                        future_map = {executor.submit(rdns_lookup, ip): (ip, d) for ip, d in rdns_targets}
+                        for fut in as_completed(future_map):
+                            if self._stop:
+                                executor.shutdown(cancel_futures=True)
+                                return
+                            ip, d = future_map[fut]
+                            name = fut.result()
+                            if name:
+                                d.hostname = name
+                                d.protocols.add("rDNS")
+
+            total_end = time.perf_counter()
+            print(f"[TIMING] mDNS duration: {(mdns_end - arp_end):.3f}s")
+            print(f"[TIMING] SSDP duration: {(ssdp_end - arp_end):.3f}s")
+            print(f"[TIMING] Ping duration: {(ping_end - t_start):.3f}s")
+            print(f"[TIMING] Total scan duration: {(total_end - t_start):.3f}s")
 
             self.result.emit(list(devices.values()))
             self.finished_ok.emit()
