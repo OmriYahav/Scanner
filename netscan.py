@@ -6,6 +6,8 @@ import socket
 import ipaddress
 import threading
 import xml.etree.ElementTree as ET
+import errno
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
 
@@ -373,6 +375,7 @@ class ScanWorker(QThread):
         do_ssdp: bool,
         do_rdns: bool,
         fetch_upnp_xml: bool,
+        full_subnet_scan: bool,
         mdns_duration_s: int,
         ssdp_timeout_s: int,
         parent=None
@@ -385,6 +388,7 @@ class ScanWorker(QThread):
         self.do_ssdp = do_ssdp
         self.do_rdns = do_rdns
         self.fetch_upnp_xml = fetch_upnp_xml
+        self.full_subnet_scan = full_subnet_scan
         self.mdns_duration_s = mdns_duration_s
         self.ssdp_timeout_s = ssdp_timeout_s
         self._stop = False
@@ -498,7 +502,75 @@ class ScanWorker(QThread):
                     if svcs:
                         d.description = normalize_description(d.description, "mDNS: " + ",".join(sorted(svcs)[:6]))
 
-            # 4) Ping RTT
+            # 4) Full subnet probe (additive)
+            if self.full_subnet_scan and not self._stop:
+                net = ipaddress.IPv4Network(self.cidr, strict=False)
+                targets = [str(ip) for ip in net.hosts() if str(ip) not in devices]
+                total = len(targets)
+
+                def probe_ip(ip: str) -> Tuple[bool, Optional[float], Set[str]]:
+                    rtt: Optional[float] = None
+                    protos: Set[str] = set()
+                    if self.do_ping:
+                        try:
+                            r = ping(ip, timeout=0.3, unit="ms")
+                            if r is not None:
+                                rtt = float(r)
+                                protos.add("ICMP")
+                                return True, rtt, protos
+                        except Exception:
+                            pass
+
+                    tcp_ports = [80, 443, 22, 445, 3389]
+                    for port in tcp_ports:
+                        try:
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock.settimeout(0.3)
+                            start_ts = time.time()
+                            res = sock.connect_ex((ip, port))
+                            elapsed_ms = (time.time() - start_ts) * 1000.0
+                            sock.close()
+                            if res == 0 or res in (errno.ECONNREFUSED, 111, 10061):
+                                protos.add("TCP")
+                                if res == 0:
+                                    rtt = rtt if rtt is not None else elapsed_ms
+                                return True, rtt, protos
+                        except Exception:
+                            pass
+                    return False, rtt, protos
+
+                if total:
+                    checked = 0
+                    alive_count = 0
+                    last_emit = 0.0
+                    self.status.emit(f"Probing subnet: 0/{total} checked – 0 alive")
+                    with ThreadPoolExecutor(max_workers=64) as executor:
+                        future_map = {executor.submit(probe_ip, ip): ip for ip in targets}
+                        for fut in as_completed(future_map):
+                            if self._stop:
+                                self.status.emit("Scan stopped.")
+                                executor.shutdown(cancel_futures=True)
+                                return
+                            ip = future_map[fut]
+                            checked += 1
+                            alive, rtt, protos = fut.result()
+                            if alive:
+                                alive_count += 1
+                                if ip not in devices:
+                                    d = self._merge_device(devices, ip)
+                                    if rtt is not None:
+                                        d.rtt_ms = rtt
+                                    if protos:
+                                        d.protocols.update(protos)
+                                    else:
+                                        d.protocols.add("TCP")
+                            now = time.time()
+                            if now - last_emit > 0.5:
+                                self.status.emit(f"Probing subnet: {checked}/{total} checked – {alive_count} alive")
+                                last_emit = now
+                    self.status.emit(f"Probing subnet: {total}/{total} checked – {alive_count} alive")
+
+            # 5) Ping RTT
             if self.do_ping and not self._stop:
                 self.status.emit("Measuring latency (ICMP ping)...")
                 # Ping known devices first; optional: you can ping all hosts but it's heavy
@@ -514,7 +586,7 @@ class ScanWorker(QThread):
                     except Exception:
                         pass
 
-            # 5) Reverse DNS
+            # 6) Reverse DNS
             if self.do_rdns and not self._stop:
                 self.status.emit("Resolving hostnames (Reverse DNS)...")
                 for ip, d in list(devices.items()):
@@ -568,6 +640,10 @@ class MainWindow(QMainWindow):
         self.cb_ping = QCheckBox("Ping (ICMP)")
         self.cb_ping.setChecked(True)
         top.addWidget(self.cb_ping)
+
+        self.cb_full_scan = QCheckBox("Full subnet scan (probe all IPs)")
+        self.cb_full_scan.setChecked(True)
+        top.addWidget(self.cb_full_scan)
 
         self.cb_mdns = QCheckBox("mDNS / Bonjour")
         self.cb_mdns.setChecked(True)
@@ -687,6 +763,7 @@ class MainWindow(QMainWindow):
             cidr=cidr,
             iface_name=it["name"],
             do_ping=self.cb_ping.isChecked(),
+            full_subnet_scan=self.cb_full_scan.isChecked(),
             do_mdns=self.cb_mdns.isChecked(),
             do_ssdp=self.cb_ssdp.isChecked(),
             do_rdns=self.cb_rdns.isChecked(),
