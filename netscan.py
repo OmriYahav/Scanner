@@ -365,6 +365,7 @@ class ScanWorker(QThread):
     def __init__(
         self,
         cidr: str,
+        iface_name: Optional[str],
         do_ping: bool,
         do_mdns: bool,
         do_ssdp: bool,
@@ -376,6 +377,7 @@ class ScanWorker(QThread):
     ):
         super().__init__(parent)
         self.cidr = cidr
+        self.iface_name = iface_name
         self.do_ping = do_ping
         self.do_mdns = do_mdns
         self.do_ssdp = do_ssdp
@@ -397,7 +399,11 @@ class ScanWorker(QThread):
         return d
 
     def run(self):
+        original_iface = conf.iface
         try:
+            if self.iface_name:
+                conf.iface = self.iface_name
+
             devices: Dict[str, Device] = {}
 
             npcap_available = is_npcap_available()
@@ -527,6 +533,8 @@ class ScanWorker(QThread):
             self.status.emit("Error: Permission denied. Run as Administrator (and ensure Npcap installed).")
         except Exception as e:
             self.status.emit(f"Error: {e}")
+        finally:
+            conf.iface = original_iface
 
 
 # -----------------------------
@@ -675,6 +683,7 @@ class MainWindow(QMainWindow):
 
         self.worker = ScanWorker(
             cidr=cidr,
+            iface_name=it["name"],
             do_ping=self.cb_ping.isChecked(),
             do_mdns=self.cb_mdns.isChecked(),
             do_ssdp=self.cb_ssdp.isChecked(),
