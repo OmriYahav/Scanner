@@ -180,6 +180,21 @@ def format_results(target: str, ip: str, open_ports: Sequence[int], elapsed: flo
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    if not argv:
+        parser.print_usage()
+        parser.exit(
+            2,
+            "\n".join(
+                [
+                    "Error: missing required arguments --target and --ports.",
+                    "Example: python netscan.py -t 192.168.1.1 -p 22,80,443",
+                    "Use --help to see all options.\n",
+                ]
+            ),
+        )
+
     args = parser.parse_args(argv)
 
     try:
