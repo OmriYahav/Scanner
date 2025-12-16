@@ -144,15 +144,17 @@ def normalize_description(existing: Optional[str], new: Optional[str]) -> Option
 def is_npcap_available() -> bool:
     try:
         sock = conf.L2socket()
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            return True
-        return False
     except Exception:
         return False
+
+    if not sock:
+        return False
+
+    try:
+        sock.close()
+    except Exception:
+        pass
+    return True
 
 
 # -----------------------------
