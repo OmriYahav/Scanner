@@ -10,6 +10,8 @@ import errno
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
+import subprocess
+import ctypes
 
 import psutil
 import requests
@@ -20,6 +22,7 @@ from scapy.all import ARP, Ether, srp, conf  # type: ignore
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
@@ -157,6 +160,15 @@ def is_npcap_available() -> bool:
     except Exception:
         pass
     return True
+
+
+def is_admin() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 # -----------------------------
@@ -624,6 +636,8 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
         self.npcap_available = False
+        self.is_admin_user = is_admin()
+        self.arp_available = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -684,14 +698,21 @@ class MainWindow(QMainWindow):
         self.btn_export = QPushButton("Export CSV")
         self.btn_install_npcap = QPushButton("Install Npcap")
         self.btn_install_npcap.setVisible(False)
+        self.btn_restart_admin = QPushButton("Restart as Admin")
+        self.btn_restart_admin.setVisible(False)
         self.btn_stop.setEnabled(False)
         timing.addWidget(self.btn_scan)
         timing.addWidget(self.btn_stop)
         timing.addWidget(self.btn_export)
         timing.addWidget(self.btn_install_npcap)
+        timing.addWidget(self.btn_restart_admin)
 
         self.status_lbl = QLabel("Ready.")
         layout.addWidget(self.status_lbl)
+
+        self.capability_lbl = QLabel("")
+        self.capability_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(self.capability_lbl)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -707,20 +728,47 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_scan)
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
+        self.btn_restart_admin.clicked.connect(self.restart_as_admin)
 
         self.update_npcap_state()
 
     def update_npcap_state(self):
         self.npcap_available = is_npcap_available()
+        self.is_admin_user = is_admin()
+        self.arp_available = self.npcap_available and self.is_admin_user
         self.btn_install_npcap.setVisible(not self.npcap_available)
+        self.btn_restart_admin.setVisible(sys.platform == "win32" and not self.is_admin_user)
         if self.npcap_available:
             if self.status_lbl.text().startswith("Npcap is not installed"):
                 self.status_lbl.setText("Ready.")
         else:
             self.status_lbl.setText("Npcap is not installed. ARP (MAC discovery) is disabled.")
 
+        npcap_text = "Installed" if self.npcap_available else "Missing"
+        admin_text = "Yes" if self.is_admin_user else "No"
+        arp_text = "Available" if self.arp_available else "Disabled"
+        self.capability_lbl.setText(
+            f"Npcap: {npcap_text}   |   Admin: {admin_text}   |   ARP: {arp_text}"
+        )
+
     def open_npcap_download(self):
         webbrowser.open("https://npcap.com/#download")
+
+    def restart_as_admin(self):
+        if sys.platform != "win32":
+            return
+        try:
+            params_list = sys.argv[1:]
+            if not getattr(sys, "frozen", False):
+                params_list = [sys.argv[0]] + params_list
+            params = subprocess.list2cmdline(params_list)
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Restart failed", f"Could not restart as admin: {e}")
+            return
+        QApplication.instance().quit()
 
 
     def load_interfaces(self):
@@ -786,6 +834,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
         self.status_lbl.setText(f"Done. Found {len(self.devices)} devices.")
+        self.show_mac_guidance_if_needed()
 
     def on_results(self, devices: list):
         self.devices = devices
@@ -816,7 +865,34 @@ class MainWindow(QMainWindow):
                 item = self.table.item(row, col)
                 item.setFlags(item.flags() ^ Qt.ItemIsEditable)
 
+            if not d.mac:
+                tint = QColor(255, 248, 220)
+                for col in range(7):
+                    item = self.table.item(row, col)
+                    item.setBackground(tint)
+
         self.table.setSortingEnabled(True)
+
+    def show_mac_guidance_if_needed(self):
+        total = len(self.devices)
+        if total == 0:
+            return
+        mac_count = sum(1 for d in self.devices if d.mac)
+        if mac_count == 0 or (mac_count / total) < 0.05:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Why MAC addresses may be missing")
+            msg.setText(
+                "MAC discovery requires ARP (Layer 2) on the same broadcast domain.\n\n"
+                "Full subnet scan (ICMP/mDNS/SSDP/TCP) can find devices even when ARP cannot.\n\n"
+                "To see MACs:\n"
+                " • Install Npcap\n"
+                " • Run as Administrator\n"
+                " • Scan devices on the same VLAN/L2 segment (Wi-Fi isolation/VLANs may block ARP)"
+            )
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.setModal(False)
+            msg.show()
 
     def export_csv(self):
         if not self.devices:
