@@ -26,7 +26,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
-    QFileDialog, QCheckBox, QSpinBox, QMessageBox
+    QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit
 )
 
 
@@ -638,6 +638,7 @@ class MainWindow(QMainWindow):
         self.npcap_available = False
         self.is_admin_user = is_admin()
         self.arp_available = False
+        self.cidr_dirty = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -651,13 +652,16 @@ class MainWindow(QMainWindow):
         self.if_combo = QComboBox()
         top.addWidget(self.if_combo, 3)
 
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("Scan range (CIDR):"))
+        self.cidr_input = QLineEdit()
+        range_layout.addWidget(self.cidr_input, 2)
+        range_layout.addStretch(1)
+        layout.addLayout(range_layout)
+
         self.cb_ping = QCheckBox("Ping (ICMP)")
         self.cb_ping.setChecked(True)
         top.addWidget(self.cb_ping)
-
-        self.cb_full_scan = QCheckBox("Full subnet scan (probe all IPs)")
-        self.cb_full_scan.setChecked(True)
-        top.addWidget(self.cb_full_scan)
 
         self.cb_mdns = QCheckBox("mDNS / Bonjour")
         self.cb_mdns.setChecked(True)
@@ -724,12 +728,15 @@ class MainWindow(QMainWindow):
 
         self.load_interfaces()
 
+        self.if_combo.currentIndexChanged.connect(self.on_iface_changed)
+        self.cidr_input.textEdited.connect(self.on_cidr_edited)
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_stop.clicked.connect(self.stop_scan)
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
         self.btn_restart_admin.clicked.connect(self.restart_as_admin)
 
+        self.on_iface_changed(self.if_combo.currentIndex())
         self.update_npcap_state()
 
     def update_npcap_state(self):
@@ -750,6 +757,8 @@ class MainWindow(QMainWindow):
         self.capability_lbl.setText(
             f"Npcap: {npcap_text}   |   Admin: {admin_text}   |   ARP: {arp_text}"
         )
+        color = "green" if (self.is_admin_user and self.arp_available) else "red"
+        self.capability_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
 
     def open_npcap_download(self):
         webbrowser.open("https://npcap.com/#download")
@@ -770,6 +779,22 @@ class MainWindow(QMainWindow):
             return
         QApplication.instance().quit()
 
+
+    def _set_cidr_text(self, cidr: str):
+        self.cidr_input.blockSignals(True)
+        self.cidr_input.setText(cidr)
+        self.cidr_input.blockSignals(False)
+        self.cidr_dirty = False
+
+    def on_iface_changed(self, idx: int):
+        it = self.if_combo.itemData(idx)
+        if not it:
+            return
+        if not self.cidr_dirty:
+            self._set_cidr_text(it["cidr"])
+
+    def on_cidr_edited(self, _text: str):
+        self.cidr_dirty = True
 
     def load_interfaces(self):
         self.if_combo.clear()
@@ -799,7 +824,25 @@ class MainWindow(QMainWindow):
         if self.cb_upnp_xml.isChecked() and not self.cb_ssdp.isChecked():
             QMessageBox.information(self, "Note", "UPnP XML requires SSDP enabled.")
 
-        cidr = it["cidr"]
+        cidr_text = self.cidr_input.text().strip()
+        if not cidr_text:
+            QMessageBox.warning(self, "Invalid CIDR", "Please enter a CIDR range to scan (e.g., 192.168.1.0/24).")
+            return
+        try:
+            net = ipaddress.IPv4Network(cidr_text, strict=False)
+        except Exception:
+            QMessageBox.warning(self, "Invalid CIDR", "Please enter a valid IPv4 CIDR (e.g., 192.168.1.0/24).")
+            return
+
+        if net.num_addresses > 4096:
+            QMessageBox.warning(
+                self,
+                "Range too large",
+                "Please choose a CIDR with 4096 hosts or fewer to avoid excessively large scans.",
+            )
+            return
+
+        cidr = str(net)
 
         self.table.setRowCount(0)
         self.devices = []
@@ -811,7 +854,7 @@ class MainWindow(QMainWindow):
             cidr=cidr,
             iface_name=it["name"],
             do_ping=self.cb_ping.isChecked(),
-            full_subnet_scan=self.cb_full_scan.isChecked(),
+            full_subnet_scan=True,
             do_mdns=self.cb_mdns.isChecked(),
             do_ssdp=self.cb_ssdp.isChecked(),
             do_rdns=self.cb_rdns.isChecked(),
