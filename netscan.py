@@ -1,6 +1,7 @@
 import sys
 import csv
 import time
+import webbrowser
 import socket
 import ipaddress
 import threading
@@ -138,6 +139,20 @@ def normalize_description(existing: Optional[str], new: Optional[str]) -> Option
     if new.lower() in existing.lower():
         return existing
     return f"{existing} | {new}"
+
+
+def is_npcap_available() -> bool:
+    try:
+        sock = conf.L2socket()
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return True
+        return False
+    except Exception:
+        return False
 
 
 # -----------------------------
@@ -385,25 +400,30 @@ class ScanWorker(QThread):
         try:
             devices: Dict[str, Device] = {}
 
+            npcap_available = is_npcap_available()
+
             # 1) ARP scan
-            self.status.emit(f"Scanning {self.cidr} (ARP)...")
-            net = ipaddress.IPv4Network(self.cidr, strict=False)
-            targets = [str(ip) for ip in net.hosts()]
+            if npcap_available:
+                self.status.emit(f"Scanning {self.cidr} (ARP)...")
+                net = ipaddress.IPv4Network(self.cidr, strict=False)
+                targets = [str(ip) for ip in net.hosts()]
 
-            conf.verb = 0
-            pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
+                conf.verb = 0
+                pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
 
-            ans, _ = srp(pkt, timeout=2, retry=1)
-            for _, rcv in ans:
-                if self._stop:
-                    self.status.emit("Scan stopped.")
-                    return
-                ip = rcv.psrc
-                if not ip_in_cidr(ip, self.cidr):
-                    continue
-                d = self._merge_device(devices, ip)
-                d.mac = rcv.hwsrc
-                d.protocols.add("ARP")
+                ans, _ = srp(pkt, timeout=2, retry=1)
+                for _, rcv in ans:
+                    if self._stop:
+                        self.status.emit("Scan stopped.")
+                        return
+                    ip = rcv.psrc
+                    if not ip_in_cidr(ip, self.cidr):
+                        continue
+                    d = self._merge_device(devices, ip)
+                    d.mac = rcv.hwsrc
+                    d.protocols.add("ARP")
+            else:
+                self.status.emit("ARP disabled (Npcap not available).")
 
             # 2) SSDP / UPnP
             if self.do_ssdp and not self._stop:
@@ -521,6 +541,7 @@ class MainWindow(QMainWindow):
         self.oui_map = build_oui_map("oui.csv")  # optional next to script/exe
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
+        self.npcap_available = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -575,10 +596,13 @@ class MainWindow(QMainWindow):
         self.btn_scan = QPushButton("Start Scan")
         self.btn_stop = QPushButton("Stop Scan")
         self.btn_export = QPushButton("Export CSV")
+        self.btn_install_npcap = QPushButton("Install Npcap")
+        self.btn_install_npcap.setVisible(False)
         self.btn_stop.setEnabled(False)
         timing.addWidget(self.btn_scan)
         timing.addWidget(self.btn_stop)
         timing.addWidget(self.btn_export)
+        timing.addWidget(self.btn_install_npcap)
 
         self.status_lbl = QLabel("Ready.")
         layout.addWidget(self.status_lbl)
@@ -596,6 +620,22 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_stop.clicked.connect(self.stop_scan)
         self.btn_export.clicked.connect(self.export_csv)
+        self.btn_install_npcap.clicked.connect(self.open_npcap_download)
+
+        self.update_npcap_state()
+
+    def update_npcap_state(self):
+        self.npcap_available = is_npcap_available()
+        self.btn_install_npcap.setVisible(not self.npcap_available)
+        if self.npcap_available:
+            if self.status_lbl.text().startswith("Npcap is not installed"):
+                self.status_lbl.setText("Ready.")
+        else:
+            self.status_lbl.setText("Npcap is not installed. ARP (MAC discovery) is disabled.")
+
+    def open_npcap_download(self):
+        webbrowser.open("https://npcap.com/#download")
+
 
     def load_interfaces(self):
         self.if_combo.clear()
@@ -609,9 +649,17 @@ class MainWindow(QMainWindow):
             self.if_combo.addItem(label, it)
 
     def start_scan(self):
+        self.update_npcap_state()
         it = self.if_combo.currentData()
         if not it:
             return
+
+        if not self.npcap_available:
+            QMessageBox.information(
+                self,
+                "Npcap not installed",
+                "Npcap is not installed. MAC/Vendor discovery (ARP) is disabled until you install Npcap. Use the Install Npcap button to download it.",
+            )
 
         # quick warning: UPnP XML fetch can slow down
         if self.cb_upnp_xml.isChecked() and not self.cb_ssdp.isChecked():
