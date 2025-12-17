@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import socket
 from typing import Optional
@@ -16,8 +17,9 @@ class MdnsAdvertiser:
         self.settings = settings
         self.zeroconf: Optional[Zeroconf] = None
         self.info: Optional[ServiceInfo] = None
+        self.mdns_enabled = False
 
-    def start(self):
+    async def start(self):
         desc = {
             "version": self.settings.version,
             "capabilities": ",".join(self.settings.capabilities),
@@ -26,8 +28,10 @@ class MdnsAdvertiser:
         service_type = "_netlinker._tcp.local."
         try:
             address_bytes = [socket.inet_aton(self.settings.host_ip)]
+            interfaces = [self.settings.host_ip]
         except OSError:
             address_bytes = []
+            interfaces = None
         self.info = ServiceInfo(
             service_type,
             f"{self.settings.service_instance_name}.{service_type}",
@@ -36,23 +40,42 @@ class MdnsAdvertiser:
             properties=desc,
             server=f"{self.settings.hostname}.local.",
         )
-        self.zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
         try:
-            self.zeroconf.register_service(self.info)
-            LOGGER.info(
-                "mDNS advertised as %s on port %s", self.settings.service_instance_name, self.settings.api_port
-            )
+            self.zeroconf = Zeroconf(ip_version=IPVersion.V4Only, interfaces=interfaces)
         except Exception:
-            LOGGER.exception("Failed to start mDNS advertisement")
+            LOGGER.exception("Failed to initialize Zeroconf")
+            self.mdns_enabled = False
+            return
+        for attempt in range(3):
+            try:
+                await asyncio.to_thread(self.zeroconf.register_service, self.info)
+                self.mdns_enabled = True
+                LOGGER.info(
+                    "mDNS advertised as %s on %s:%s", service_type, self.settings.host_ip, self.settings.api_port
+                )
+                return
+            except Exception:
+                LOGGER.exception("Failed to start mDNS advertisement (attempt %s)", attempt + 1)
+                await asyncio.sleep(0.5)
+        self.mdns_enabled = False
+        try:
+            await asyncio.to_thread(self.zeroconf.close)
+        except Exception:
+            LOGGER.exception("Failed to close Zeroconf after failed advertisement")
 
-    def stop(self):
+    async def stop(self):
         if self.zeroconf and self.info:
             try:
-                self.zeroconf.unregister_service(self.info)
+                await asyncio.to_thread(self.zeroconf.unregister_service, self.info)
             except Exception:
                 LOGGER.exception("Failed to unregister mDNS service")
-            self.zeroconf.close()
+            try:
+                await asyncio.to_thread(self.zeroconf.close)
+            except Exception:
+                LOGGER.exception("Failed to close Zeroconf")
             self.zeroconf = None
+            self.info = None
+        self.mdns_enabled = False
 
 
 __all__ = ["MdnsAdvertiser"]
