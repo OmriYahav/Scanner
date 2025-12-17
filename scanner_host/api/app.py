@@ -170,11 +170,11 @@ def build_app(settings: HostSettings, advertiser: MdnsAdvertiser) -> FastAPI:
 
     @app.on_event("startup")
     async def on_startup():
-        advertiser.start()
+        await advertiser.start()
 
     @app.on_event("shutdown")
     async def on_shutdown():
-        advertiser.stop()
+        await advertiser.stop()
 
     return app
 
