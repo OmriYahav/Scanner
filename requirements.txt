@@ -1,9 +1,0 @@
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-aiofiles==23.2.1
-zeroconf==0.132.2
-psutil==5.9.8
-requests==2.31.0
-ping3==4.0.4
-scapy==2.5.0
-PySide6==6.7.0
