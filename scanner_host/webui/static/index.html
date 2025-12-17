@@ -10,6 +10,8 @@
     .devices li { margin-bottom: 4px; }
     button { padding: 8px 12px; margin-right: 8px; }
     code { background: #eee; padding: 2px 4px; border-radius: 4px; }
+    .status-ok { color: green; font-weight: bold; }
+    .status-bad { color: #c00; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -59,8 +61,8 @@
     async function refreshStatus() {
       try {
         const data = await fetchJSON('/status');
-        subtitle.textContent = `${data.service_name} (${data.hostname})`;
-        statusEl.innerHTML = `Version <code>${data.version}</code> — IP <code>${data.ip}:${data.api_port}</code>`;
+        subtitle.textContent = `${data.service_instance} (${data.hostname})`;
+        statusEl.innerHTML = `Version <code>${data.version}</code> — IP <code>${data.ip}:${data.api_port}</code> — Capabilities: <code>${data.capabilities.join(', ')}</code>`;
         connectedCount.textContent = `${data.connected} device${data.connected === 1 ? '' : 's'} online`;
         devicesEl.innerHTML = '';
         data.devices.forEach(d => {
@@ -71,6 +73,8 @@
         });
       } catch (err) {
         console.error(err);
+        subtitle.textContent = 'Host offline';
+        statusEl.textContent = 'Waiting for host...';
       }
     }
 
@@ -78,7 +82,7 @@
       try {
         const data = await fetchJSON('/pair/code');
         pairCode.textContent = data.code;
-        pairingExpires.textContent = `Expires at ${new Date(data.expires_at * 1000).toLocaleTimeString()}`;
+        pairingExpires.textContent = `Expires in ${(data.expires_in || 0).toFixed(0)}s`;
       } catch (err) {
         pairCode.textContent = '(none)';
         pairingExpires.textContent = '';
@@ -86,8 +90,12 @@
     }
 
     document.getElementById('startPairing').addEventListener('click', async () => {
-      await fetchJSON('/pair/start', { method: 'POST' });
-      refreshPairCode();
+      try {
+        await fetchJSON('/pair/start', { method: 'POST' });
+        refreshPairCode();
+      } catch (err) {
+        alert('Could not start pairing: ' + err.message);
+      }
     });
 
     document.getElementById('pingTest').addEventListener('click', () => {
