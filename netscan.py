@@ -18,12 +18,14 @@ import requests
 from ping3 import ping
 
 try:
-    from scapy.all import ARP, Ether, Dot1Q, conf, sniff, srp  # type: ignore
+    from scapy.all import ARP, Ether, Dot1Q, conf, sniff, srp, get_if_list  # type: ignore
     from scapy.layers.dns import DNS  # type: ignore
     from scapy.layers.inet import IP, UDP  # type: ignore
+    from scapy.arch.windows import get_windows_if_list  # type: ignore
     SCAPY_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency at runtime
-    ARP = Ether = conf = sniff = srp = IP = UDP = DNS = Dot1Q = None  # type: ignore
+    ARP = Ether = conf = sniff = srp = IP = UDP = DNS = Dot1Q = get_if_list = None  # type: ignore
+    get_windows_if_list = None  # type: ignore
     SCAPY_AVAILABLE = False
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
@@ -508,6 +510,51 @@ def parse_lldp_tlvs(raw: bytes) -> Dict[str, str]:
         elif t == 8 and l >= 1:  # Management address
             info["management_address"] = val[1:].decode("utf-8", errors="ignore")
     return info
+
+
+def resolve_capture_interface(target_name: Optional[str]) -> Optional[str]:
+    if not target_name or not SCAPY_AVAILABLE:
+        return target_name
+
+    target_lower = target_name.lower()
+    best_iface: Optional[str] = None
+    best_score = 0
+
+    def score(candidate: str) -> int:
+        cand_lower = candidate.lower()
+        if target_lower == cand_lower:
+            return 5
+        if target_lower in cand_lower:
+            return 4
+        if cand_lower in target_lower:
+            return 3
+        return 0
+
+    try:
+        if get_windows_if_list:
+            for iface in get_windows_if_list():
+                for key in ["friendlyname", "name", "description", "guid"]:
+                    val = iface.get(key) if isinstance(iface, dict) else None
+                    if not val:
+                        continue
+                    sc = score(str(val))
+                    if sc > best_score:
+                        best_score = sc
+                        best_iface = iface.get("name") or iface.get("guid") or str(val)
+    except Exception:
+        pass
+
+    try:
+        if get_if_list:
+            for iface in get_if_list():
+                sc = score(iface)
+                if sc > best_score:
+                    best_score = sc
+                    best_iface = iface
+    except Exception:
+        pass
+
+    return best_iface or target_name
 
 
 def summarize_multicast_evidence(packets: List) -> Tuple[Dict[str, str], List[str]]:
@@ -1118,6 +1165,13 @@ class Layer2InfoWorker(QThread):
         payload = {
             "lldp": {"status": "Unknown"},
             "vlans": {"status": "Unknown", "vlans": []},
+            "meta": {
+                "iface": self.iface_name or "-",
+                "captured": 0,
+                "lldp_frames": 0,
+                "vlan_frames": 0,
+                "error": None,
+            },
         }
 
         if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
@@ -1125,32 +1179,52 @@ class Layer2InfoWorker(QThread):
             return
 
         try:
-            packets = sniff(iface=self.iface_name, timeout=3, store=True)
-        except Exception:
+            resolved_iface = resolve_capture_interface(self.iface_name)
+            payload["meta"]["iface"] = resolved_iface or self.iface_name
+            packets = sniff(iface=resolved_iface, timeout=3, store=True, promisc=True)
+        except Exception as e:
+            payload["lldp"]["status"] = "Layer 2 capture: Unavailable (requires Npcap + permissions)"
+            payload["vlans"]["status"] = "Unknown (capture failed)"
+            payload["meta"]["error"] = str(e)
             self.result.emit(payload)
             return
 
+        payload["meta"]["captured"] = len(packets)
         lldp_detected = False
         lldp_details: Dict[str, str] = {}
         vlan_ids: Set[int] = set()
+        lldp_frames = 0
+        vlan_frame_count = 0
 
         for pkt in packets:
             try:
                 eth = pkt.getlayer(Ether)
-                if eth and getattr(eth, "dst", "").lower() == "01:80:c2:00:00:0e" and getattr(eth, "type", None) == 0x88cc:
+                if not eth:
+                    continue
+
+                eth_type = getattr(eth, "type", None)
+                dst_mac = getattr(eth, "dst", "").lower()
+
+                if eth_type == 0x88CC or dst_mac == "01:80:c2:00:00:0e":
                     lldp_detected = True
+                    lldp_frames += 1
                     raw = bytes(pkt.payload)
                     parsed = parse_lldp_tlvs(raw)
                     for k, v in parsed.items():
                         if v:
                             lldp_details.setdefault(k, v)
-                if Dot1Q and pkt.haslayer(Dot1Q):
-                    vlan_id = getattr(pkt[Dot1Q], "vlan", None)
+
+                vlan_layer = pkt[Dot1Q] if Dot1Q and pkt.haslayer(Dot1Q) else None
+                if vlan_layer or eth_type == 0x8100:
+                    vlan_frame_count += 1
+                    vlan_id = getattr(vlan_layer, "vlan", None)
                     if vlan_id is not None:
                         vlan_ids.add(int(vlan_id))
             except Exception:
                 continue
 
+        payload["meta"]["lldp_frames"] = lldp_frames
+        payload["meta"]["vlan_frames"] = vlan_frame_count
         payload["lldp"]["status"] = "Detected" if lldp_detected else "Not detected"
         payload["lldp"].update(lldp_details)
 
@@ -1315,6 +1389,7 @@ class MainWindow(QMainWindow):
             return val
 
         connection_card = Card("Connection")
+        connection_card.setMaximumWidth(620)
         conn_layout = connection_card.content_layout
         conn_grid = QGridLayout()
         conn_grid.setHorizontalSpacing(18)
@@ -1346,6 +1421,7 @@ class MainWindow(QMainWindow):
         conn_layout.addLayout(internet_row)
 
         dhcp_card = Card("DHCP")
+        dhcp_card.setMaximumWidth(620)
         dhcp_layout = dhcp_card.content_layout
         dhcp_labels = [
             ("DHCP Server", "dhcp_server"),
@@ -1371,14 +1447,16 @@ class MainWindow(QMainWindow):
 
         left_column = QVBoxLayout()
         left_column.setSpacing(12)
+        left_column.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         left_column.addWidget(connection_card)
         left_column.addWidget(dhcp_card)
-        left_column.addStretch(1)
 
         right_column = QVBoxLayout()
         right_column.setSpacing(12)
+        right_column.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
         self.env_group = Card("Environment Status")
+        self.env_group.setMaximumWidth(620)
         env_layout = self.env_group.content_layout
         env_rows = []
         self.npcap_status_lbl = QLabel()
@@ -1408,6 +1486,7 @@ class MainWindow(QMainWindow):
         right_column.addWidget(self.env_group)
 
         self.igmp_group = Card("Multicast / IGMP")
+        self.igmp_group.setMaximumWidth(620)
         igmp_layout = self.igmp_group.content_layout
         igmp_row = QHBoxLayout()
         igmp_row.setSpacing(8)
@@ -1424,6 +1503,7 @@ class MainWindow(QMainWindow):
         right_column.addWidget(self.igmp_group)
 
         l2_group = Card("Layer 2 Info")
+        l2_group.setMaximumWidth(620)
         l2_layout = QFormLayout()
         l2_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         l2_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -1450,6 +1530,13 @@ class MainWindow(QMainWindow):
         l2_layout.addRow(make_label("VLAN Status"), self.vlan_status_badge)
         l2_layout.addRow(make_label("VLAN Details"), self.vlan_lbl)
 
+        self.l2_iface_hint = QLabel("Capture interface: -")
+        self.l2_iface_hint.setObjectName("hintLabel")
+        self.l2_capture_hint = QLabel("Captured frames: 0")
+        self.l2_capture_hint.setObjectName("hintLabel")
+        self.l2_counts_hint = QLabel("LLDP frames: 0 | VLAN-tagged frames: 0")
+        self.l2_counts_hint.setObjectName("hintLabel")
+
         l2_btn_row = QHBoxLayout()
         l2_btn_row.addStretch(1)
         self.btn_l2_refresh = QPushButton("Refresh L2")
@@ -1457,14 +1544,19 @@ class MainWindow(QMainWindow):
         l2_layout.addRow(QLabel(""), l2_btn_row)
 
         l2_group.content_layout.addLayout(l2_layout)
+        l2_group.content_layout.addWidget(self.l2_iface_hint)
+        l2_group.content_layout.addWidget(self.l2_capture_hint)
+        l2_group.content_layout.addWidget(self.l2_counts_hint)
         right_column.addWidget(l2_group)
 
         content_row = QHBoxLayout()
-        content_row.setSpacing(12)
-        content_row.addLayout(left_column, 2)
-        content_row.addLayout(right_column, 1)
+        content_row.setSpacing(24)
+        content_row.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        content_row.addLayout(left_column)
+        content_row.addSpacing(24)
+        content_row.addLayout(right_column)
+        content_row.addStretch(1)
         layout.addLayout(content_row)
-        layout.addStretch(1)
         return widget
 
     def build_scan_tab(self) -> QWidget:
@@ -2130,6 +2222,7 @@ class MainWindow(QMainWindow):
     def _update_l2_ui(self, payload: dict):
         lldp = payload.get("lldp", {}) if payload else {}
         vlans = payload.get("vlans", {}) if payload else {}
+        meta = payload.get("meta", {}) if payload else {}
         lldp_status = str(lldp.get("status", "Unknown"))
         color_map = {"detected": "green", "not detected": "red", "unknown": "yellow"}
         self._style_status(self.lldp_status_lbl, "LLDP", lldp_status, color_map)
@@ -2152,6 +2245,21 @@ class MainWindow(QMainWindow):
             self.vlan_lbl.setText(", ".join(str(v) for v in vlan_ids))
         else:
             self.vlan_lbl.setText(vlan_status)
+
+        iface_text = str(meta.get("iface", "-")) if meta else "-"
+        captured = meta.get("captured", 0) if meta else 0
+        lldp_frames = meta.get("lldp_frames", 0) if meta else 0
+        vlan_frames = meta.get("vlan_frames", 0) if meta else 0
+        error_text = meta.get("error") if meta else None
+
+        self.l2_iface_hint.setText(f"Capture interface: {iface_text}")
+        if error_text:
+            self.l2_capture_hint.setText("Captured frames: Unknown (capture failed)")
+        else:
+            self.l2_capture_hint.setText(f"Captured frames: {captured}")
+        self.l2_counts_hint.setText(
+            f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
+        )
 
     def on_l2_finished(self):
         self.l2_check_running = False
