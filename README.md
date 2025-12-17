@@ -6,9 +6,9 @@ This repository now contains a LAN-only host (Python) and a companion Expo/React
 
 ### Features
 - Serves REST + WebSocket API with a local dashboard at `http://localhost:8000/`.
-- Publishes `_netlinker._tcp.local` via mDNS/Bonjour for device discovery.
+- Publishes `_netlinker._tcp.local` via mDNS/Bonjour for device discovery (service name `NetLinker Host - <hostname>`).
 - In-memory secure pairing flow (6-digit code) that issues bearer tokens.
-- Presence tracking via WebSocket heartbeat so the dashboard can show connected phones.
+- Presence tracking via WebSocket heartbeat so the dashboard and desktop GUI can show connected phones.
 - Reuses existing `netscan.py` logic through `scanner_host/engine/netscan_adapter.py` (engine remains Python).
 
 ### Running locally (Windows-friendly)
@@ -17,23 +17,37 @@ This repository now contains a LAN-only host (Python) and a companion Expo/React
    ```bash
    pip install -r requirements.txt
    ```
-3. Start the host:
+3. Start the desktop GUI (includes embedded host + mDNS advertiser):
+   ```bash
+   python netscan.py
+   ```
+   The "Host status" area shows the API address, pairing code, and connected mobile devices. The legacy scan controls still work.
+4. For a headless/dev-only host, you can still run just the API server:
    ```bash
    python main.py
    ```
-4. Open the dashboard at [http://localhost:8000](http://localhost:8000) to view status, pairing code, and connected devices.
+5. Open the dashboard at [http://localhost:8000](http://localhost:8000) to view status, pairing code, and connected devices.
 
-> mDNS advertisement relies on the `zeroconf` Python package. If you need ARP/packet features from the legacy scanner, install Npcap and run with elevated permissions on Windows.
+> mDNS advertisement relies on the `zeroconf` Python package. If you need ARP/packet features from the legacy scanner, install Npcap and run with elevated permissions on Windows. Windows Firewall may prompt to allow the API port (default 8000).
 
 ### API overview
 - `GET /status` — host metadata + connected devices
 - `POST /pair/start` — begin a pairing session
-- `GET /pair/code` — fetch current 6-digit code
+- `GET /pair/code` — fetch current 6-digit code + expiry
 - `POST /pair/confirm` — { code, device_id, device_name } → { token }
 - `POST /tests/ping` — authenticated; pings a target using the legacy engine
 - `WS /ws` — mobile connects, sends `hello` with token/device_id/device_name, then heartbeat every ~10s
 
 Tokens are stored in-memory for now; the code is structured to allow persistence later.
+
+### Packaging (PyInstaller ready)
+Generate a single-folder build (includes GUI + host + static dashboard):
+```bash
+pyinstaller --noconfirm --name NetLinkerHost \
+  --add-data "scanner_host/webui/static:scanner_host/webui/static" \
+  netscan.py
+```
+The resulting folder can be wrapped into an installer later; ensure the chosen API port is allowed through Windows Firewall.
 
 ## Mobile (Expo + Dev Client)
 
@@ -65,8 +79,9 @@ scanner_host/
   auth/           Pairing + token handling
   discovery/      mDNS advertisement
   engine/         Wrappers around legacy netscan
+  runtime/        Helpers to embed the host inside the GUI
   webui/          Static dashboard served by the host
 main.py           Entrypoint to start the host
-netscan.py        Existing scanning logic (unchanged)
+netscan.py        Existing scanning logic + embedded host GUI
 mobile/           Expo project for the client
 ```

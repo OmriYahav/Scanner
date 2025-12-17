@@ -48,10 +48,13 @@ def auth_dependency(
 def status(settings: HostSettings = Depends(lambda: router._settings), presence: PresenceRegistry = Depends(get_presence_registry)):
     return {
         "service_name": settings.service_name,
+        "service_instance": settings.service_instance_name,
         "version": settings.version,
         "hostname": settings.hostname,
+        "host_name": settings.hostname,
         "ip": settings.host_ip,
         "api_port": settings.api_port,
+        "capabilities": settings.capabilities,
         "connected": presence.online_count(),
         "devices": presence.list_devices(),
     }
@@ -63,6 +66,7 @@ def start_pairing(pairing: PairingManager = Depends(get_pairing_manager)):
     return {
         "pairing_id": session.pairing_id,
         "expires_at": session.expires_at,
+        "expires_in": session.expires_in,
     }
 
 
@@ -71,7 +75,7 @@ def get_pairing_code(pairing: PairingManager = Depends(get_pairing_manager)):
     session = pairing.active_pairing()
     if not session:
         raise HTTPException(status_code=404, detail="No active pairing")
-    return {"code": session.code, "expires_at": session.expires_at}
+    return {"code": session.code, "expires_at": session.expires_at, "expires_in": session.expires_in}
 
 
 @router.post("/pair/confirm")
@@ -118,11 +122,13 @@ async def websocket_endpoint(
             await websocket.close(code=4001)
             return
         presence.register(token_info)
-        await websocket.send_json({
-            "type": "welcome",
-            "service": settings.service_name,
-            "heartbeat_timeout": HEARTBEAT_TIMEOUT,
-        })
+        await websocket.send_json(
+            {
+                "type": "welcome",
+                "service": settings.service_name,
+                "heartbeat_timeout": HEARTBEAT_TIMEOUT,
+            }
+        )
         while True:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_TIMEOUT)
             payload = json.loads(msg)

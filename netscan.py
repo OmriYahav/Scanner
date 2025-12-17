@@ -22,13 +22,15 @@ from scapy.all import ARP, Ether, srp, conf  # type: ignore
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
     QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit
 )
+
+from scanner_host.runtime import HostRuntime
 
 
 # -----------------------------
@@ -711,6 +713,7 @@ class MainWindow(QMainWindow):
         self.is_admin_user = is_admin()
         self.arp_available = False
         self.cidr_dirty = False
+        self.host_runtime = HostRuntime()
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -790,6 +793,31 @@ class MainWindow(QMainWindow):
         self.capability_lbl.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(self.capability_lbl)
 
+        # Embedded host status (LAN pairing, mDNS, API)
+        host_box = QVBoxLayout()
+        host_box.addWidget(QLabel("Host status (LAN pairing)"))
+        self.host_status_lbl = QLabel("Starting host...")
+        self.host_detail_lbl = QLabel("")
+        self.host_detail_lbl.setWordWrap(True)
+        host_box.addWidget(self.host_status_lbl)
+        host_box.addWidget(self.host_detail_lbl)
+
+        pairing_row = QHBoxLayout()
+        self.pair_code_lbl = QLabel("(no code)")
+        self.pairing_expires_lbl = QLabel("")
+        self.btn_host_pair = QPushButton("Start pairing")
+        pairing_row.addWidget(QLabel("Pairing code:"))
+        pairing_row.addWidget(self.pair_code_lbl)
+        pairing_row.addWidget(self.pairing_expires_lbl)
+        pairing_row.addWidget(self.btn_host_pair)
+        pairing_row.addStretch(1)
+        host_box.addLayout(pairing_row)
+
+        self.connected_devices_lbl = QLabel("No mobile devices connected yet.")
+        self.connected_devices_lbl.setWordWrap(True)
+        host_box.addWidget(self.connected_devices_lbl)
+        layout.addLayout(host_box)
+
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             ["IP", "MAC Address", "MAC Vendor", "Hostname", "Ping (ms)", "Protocols", "Description"]
@@ -807,9 +835,11 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
         self.btn_restart_admin.clicked.connect(self.restart_as_admin)
+        self.btn_host_pair.clicked.connect(self.start_pairing_session)
 
         self.on_iface_changed(self.if_combo.currentIndex())
         self.update_npcap_state()
+        self.start_host_server()
 
     def update_npcap_state(self):
         self.npcap_available = is_npcap_available()
@@ -832,6 +862,78 @@ class MainWindow(QMainWindow):
         color = "green" if (self.is_admin_user and self.arp_available) else "red"
         self.capability_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
 
+    def start_host_server(self):
+        try:
+            self.host_runtime.start()
+            self.host_status_lbl.setText(
+                f"Host running on {self.host_runtime.settings.host_ip}:{self.host_runtime.settings.api_port}"
+            )
+        except Exception as exc:
+            self.host_status_lbl.setText(f"Host failed to start: {exc}")
+            return
+
+        self.refresh_host_status()
+        self.host_timer = QTimer(self)
+        self.host_timer.setInterval(5000)
+        self.host_timer.timeout.connect(self.refresh_host_status)
+        self.host_timer.start()
+
+    def refresh_host_status(self):
+        try:
+            res = requests.get(f"{self.host_runtime.base_url}/status", timeout=3)
+            res.raise_for_status()
+            data = res.json()
+            self.host_status_lbl.setText(
+                f"Host running: {data.get('ip')}:{data.get('api_port')} ({data.get('service_instance')})"
+            )
+            caps = data.get("capabilities", [])
+            self.host_detail_lbl.setText(
+                "Capabilities: " + (", ".join(caps) if caps else "(none)")
+            )
+            devices = data.get("devices") or []
+            if devices:
+                lines = []
+                for d in devices:
+                    last_seen = time.strftime("%H:%M:%S", time.localtime(d.get("last_seen", 0)))
+                    state = "online" if d.get("online") else "offline"
+                    lines.append(
+                        f"• {d.get('device_name', '?')} ({d.get('device_id')}) – {state}, last seen {last_seen}"
+                    )
+                self.connected_devices_lbl.setText("\n".join(lines))
+            else:
+                self.connected_devices_lbl.setText("No mobile devices connected yet.")
+        except Exception as exc:
+            self.host_status_lbl.setText(f"Host offline: {exc}")
+            self.host_detail_lbl.setText("Ensure the embedded host can bind to the LAN adapter.")
+
+        self.refresh_pairing_code()
+
+    def refresh_pairing_code(self):
+        try:
+            res = requests.get(f"{self.host_runtime.base_url}/pair/code", timeout=3)
+            if res.status_code == 404:
+                self.pair_code_lbl.setText("(no active code)")
+                self.pairing_expires_lbl.setText("")
+                return
+            res.raise_for_status()
+            data = res.json()
+            self.pair_code_lbl.setText(data.get("code", "(none)"))
+            expires_in = data.get("expires_in")
+            if expires_in is not None:
+                self.pairing_expires_lbl.setText(f"Expires in {int(expires_in)}s")
+        except Exception as exc:
+            self.pair_code_lbl.setText("(error)")
+            self.pairing_expires_lbl.setText(str(exc))
+
+    def start_pairing_session(self):
+        try:
+            res = requests.post(f"{self.host_runtime.base_url}/pair/start", timeout=3)
+            res.raise_for_status()
+            self.status_lbl.setText("Pairing code generated for mobile app.")
+        except Exception as exc:
+            self.status_lbl.setText(f"Could not start pairing: {exc}")
+        self.refresh_pairing_code()
+
     def open_npcap_download(self):
         webbrowser.open("https://npcap.com/#download")
 
@@ -850,6 +952,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Restart failed", f"Could not restart as admin: {e}")
             return
         QApplication.instance().quit()
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "host_timer"):
+                self.host_timer.stop()
+            self.host_runtime.stop()
+        finally:
+            super().closeEvent(event)
 
 
     def _set_cidr_text(self, cidr: str):

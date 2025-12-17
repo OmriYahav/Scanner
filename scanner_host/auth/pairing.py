@@ -15,6 +15,10 @@ class PairingSession:
     created_at: float
     expires_at: float
 
+    @property
+    def expires_in(self) -> float:
+        return max(0.0, self.expires_at - time.time())
+
 
 @dataclass
 class DeviceToken:
