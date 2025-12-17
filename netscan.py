@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
     QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGroupBox,
-    QFormLayout
+    QFormLayout, QTabWidget, QPlainTextEdit
 )
 
 
@@ -668,6 +668,61 @@ class ScanWorker(QThread):
 # -----------------------------
 # GUI
 # -----------------------------
+class DiagnosticsWorker(QThread):
+    diagOutputLine = Signal(str)
+    diagStatusChanged = Signal(str)
+    diagRunningChanged = Signal(bool)
+
+    def __init__(self, command: List[str]):
+        super().__init__()
+        self.command = command
+        self.process: Optional[subprocess.Popen] = None
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        status = "Running"
+        self.diagRunningChanged.emit(True)
+        self.diagStatusChanged.emit(status)
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if not self.process.stdout:
+                raise RuntimeError("No output stream")
+
+            for raw_line in self.process.stdout:
+                if self._stop_event.is_set():
+                    status = "Stopped"
+                    break
+                self.diagOutputLine.emit(raw_line.rstrip())
+
+            if self._stop_event.is_set() and self.process.poll() is None:
+                try:
+                    self.process.terminate()
+                except Exception:
+                    pass
+
+            if status == "Running":
+                ret = self.process.wait()
+                status = "Completed" if ret == 0 else "Failed"
+        except Exception as e:
+            status = f"Failed: {e}"
+        finally:
+            self.diagStatusChanged.emit(status)
+            self.diagRunningChanged.emit(False)
+
+
 class MainWindow(QMainWindow):
     externalIpChanged = Signal(str)
     internetStatusChanged = Signal(bool)
@@ -687,79 +742,56 @@ class MainWindow(QMainWindow):
         self.last_connectivity_ts: float = 0.0
         self.igmp_check_running = False
         self.env_check_running = False
+        self.diag_worker: Optional[DiagnosticsWorker] = None
 
         self.externalIpChanged.connect(self.set_external_ip)
         self.internetStatusChanged.connect(self.set_connectivity_state)
         self.igmpStatusChanged.connect(self.apply_igmp_status)
         self.envStatusChanged.connect(self.apply_env_status)
+        self.connectivity_check_running = False
 
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
+        tabs = QTabWidget()
+        self.setCentralWidget(tabs)
 
-        # Top controls
-        top = QHBoxLayout()
-        layout.addLayout(top)
+        self.network_tab = self.build_network_info_tab()
+        self.scan_tab = self.build_scan_tab()
+        self.diagnostics_tab = self.build_diagnostics_tab()
 
-        top.addWidget(QLabel("Interface:"))
-        self.if_combo = QComboBox()
-        top.addWidget(self.if_combo, 3)
+        tabs.addTab(self.network_tab, "Network Info")
+        tabs.addTab(self.scan_tab, "Scan")
+        tabs.addTab(self.diagnostics_tab, "Diagnostics")
 
-        self.cb_ping = QCheckBox("Ping (ICMP)")
-        self.cb_ping.setChecked(True)
-        top.addWidget(self.cb_ping)
+        self.load_interfaces()
 
-        self.cb_mdns = QCheckBox("mDNS / Bonjour")
-        self.cb_mdns.setChecked(True)
-        top.addWidget(self.cb_mdns)
+        self.btn_scan.clicked.connect(self.start_scan)
+        self.btn_stop.clicked.connect(self.stop_scan)
+        self.btn_export.clicked.connect(self.export_csv)
+        self.btn_install_npcap.clicked.connect(self.open_npcap_download)
+        self.if_combo.currentIndexChanged.connect(self.on_interface_changed)
+        self.btn_env_refresh.clicked.connect(self.run_env_checks)
+        self.btn_diag_ping.clicked.connect(self.run_diag_ping)
+        self.btn_diag_traceroute.clicked.connect(self.run_diag_traceroute)
+        self.btn_diag_stop.clicked.connect(self.stop_diag_worker)
 
-        self.cb_ssdp = QCheckBox("UPnP / SSDP")
-        self.cb_ssdp.setChecked(True)
-        top.addWidget(self.cb_ssdp)
+        self.update_npcap_state()
+        self.fetch_external_ip()
+        self.connectivity_timer = QTimer(self)
+        self.connectivity_timer.setInterval(5000)
+        self.connectivity_timer.timeout.connect(self.check_connectivity)
+        self.connectivity_timer.start()
+        self.igmp_timer = QTimer(self)
+        self.igmp_timer.setInterval(20000)
+        self.igmp_timer.timeout.connect(self.run_igmp_check)
+        self.igmp_timer.start()
+        self.env_timer = QTimer(self)
+        self.env_timer.setInterval(20000)
+        self.env_timer.timeout.connect(self.run_env_checks)
+        self.env_timer.start()
+        self.on_interface_changed(self.if_combo.currentIndex())
 
-        self.cb_rdns = QCheckBox("Reverse DNS")
-        self.cb_rdns.setChecked(False)
-        top.addWidget(self.cb_rdns)
-
-        self.cb_upnp_xml = QCheckBox("Fetch UPnP XML (friendlyName)")
-        self.cb_upnp_xml.setChecked(False)
-        top.addWidget(self.cb_upnp_xml)
-
-        range_layout = QHBoxLayout()
-        layout.addLayout(range_layout)
-        range_layout.addWidget(QLabel("Custom range (optional):"))
-        self.range_input = QLineEdit()
-        self.range_input.setPlaceholderText("192.168.1.0/24 or 192.168.1.10-192.168.1.50")
-        range_layout.addWidget(self.range_input)
-
-        # Timing controls
-        timing = QHBoxLayout()
-        layout.addLayout(timing)
-
-        timing.addWidget(QLabel("mDNS seconds:"))
-        self.sp_mdns = QSpinBox()
-        self.sp_mdns.setRange(2, 20)
-        self.sp_mdns.setValue(5)
-        timing.addWidget(self.sp_mdns)
-
-        timing.addWidget(QLabel("SSDP timeout:"))
-        self.sp_ssdp = QSpinBox()
-        self.sp_ssdp.setRange(1, 10)
-        self.sp_ssdp.setValue(3)
-        timing.addWidget(self.sp_ssdp)
-
-        timing.addStretch(1)
-
-        self.btn_scan = QPushButton("Start Scan")
-        self.btn_stop = QPushButton("Stop Scan")
-        self.btn_export = QPushButton("Export CSV")
-        self.btn_install_npcap = QPushButton("Install Npcap")
-        self.btn_install_npcap.setVisible(False)
-        self.btn_stop.setEnabled(False)
-        timing.addWidget(self.btn_scan)
-        timing.addWidget(self.btn_stop)
-        timing.addWidget(self.btn_export)
-        timing.addWidget(self.btn_install_npcap)
+    def build_network_info_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
 
         network_group = QGroupBox("Network Info")
         layout.addWidget(network_group)
@@ -803,7 +835,7 @@ class MainWindow(QMainWindow):
         ]
 
         self.dhcp_value_labels: Dict[str, QLabel] = {}
-        for row, (title, key) in enumerate(dhcp_labels):
+        for title, key in dhcp_labels:
             label_widget = make_label(title)
             val_lbl = QLabel("")
             val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -844,6 +876,92 @@ class MainWindow(QMainWindow):
         panels_layout.addWidget(self.env_group, 1)
 
         network_form.addRow(make_label("Status Panels:"), panels_row)
+        layout.addStretch(1)
+        return widget
+
+    def build_scan_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        config_group = QGroupBox("Scan Configuration")
+        layout.addWidget(config_group)
+        config_form = QFormLayout()
+        config_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        config_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        config_form.setHorizontalSpacing(12)
+        config_form.setVerticalSpacing(6)
+        config_group.setLayout(config_form)
+
+        self.if_combo = QComboBox()
+        config_form.addRow(QLabel("Interface:"), self.if_combo)
+
+        check_row = QWidget()
+        check_layout = QHBoxLayout(check_row)
+        check_layout.setContentsMargins(0, 0, 0, 0)
+        check_layout.setSpacing(8)
+
+        self.cb_ping = QCheckBox("Ping (ICMP)")
+        self.cb_ping.setChecked(True)
+        check_layout.addWidget(self.cb_ping)
+
+        self.cb_mdns = QCheckBox("mDNS / Bonjour")
+        self.cb_mdns.setChecked(True)
+        check_layout.addWidget(self.cb_mdns)
+
+        self.cb_ssdp = QCheckBox("UPnP / SSDP")
+        self.cb_ssdp.setChecked(True)
+        check_layout.addWidget(self.cb_ssdp)
+
+        self.cb_rdns = QCheckBox("Reverse DNS")
+        self.cb_rdns.setChecked(False)
+        check_layout.addWidget(self.cb_rdns)
+
+        self.cb_upnp_xml = QCheckBox("Fetch UPnP XML (friendlyName)")
+        self.cb_upnp_xml.setChecked(False)
+        check_layout.addWidget(self.cb_upnp_xml)
+        check_layout.addStretch(1)
+        config_form.addRow(QLabel("Protocols:"), check_row)
+
+        self.range_input = QLineEdit()
+        self.range_input.setPlaceholderText("192.168.1.0/24 or 192.168.1.10-192.168.1.50")
+        config_form.addRow(QLabel("Custom range (optional):"), self.range_input)
+
+        timing_row = QWidget()
+        timing_layout = QHBoxLayout(timing_row)
+        timing_layout.setContentsMargins(0, 0, 0, 0)
+        timing_layout.setSpacing(8)
+
+        timing_layout.addWidget(QLabel("mDNS seconds:"))
+        self.sp_mdns = QSpinBox()
+        self.sp_mdns.setRange(2, 20)
+        self.sp_mdns.setValue(5)
+        timing_layout.addWidget(self.sp_mdns)
+
+        timing_layout.addWidget(QLabel("SSDP timeout:"))
+        self.sp_ssdp = QSpinBox()
+        self.sp_ssdp.setRange(1, 10)
+        self.sp_ssdp.setValue(3)
+        timing_layout.addWidget(self.sp_ssdp)
+        timing_layout.addStretch(1)
+        config_form.addRow(QLabel("Timing:"), timing_row)
+
+        actions_group = QGroupBox("Scan Actions")
+        layout.addWidget(actions_group)
+        actions_layout = QHBoxLayout(actions_group)
+        actions_layout.setSpacing(10)
+
+        self.btn_scan = QPushButton("Start Scan")
+        self.btn_stop = QPushButton("Stop Scan")
+        self.btn_export = QPushButton("Export CSV")
+        self.btn_install_npcap = QPushButton("Install Npcap")
+        self.btn_install_npcap.setVisible(False)
+        self.btn_stop.setEnabled(False)
+
+        actions_layout.addWidget(self.btn_scan)
+        actions_layout.addWidget(self.btn_stop)
+        actions_layout.addWidget(self.btn_export)
+        actions_layout.addWidget(self.btn_install_npcap)
+        actions_layout.addStretch(1)
 
         vendor_status = (
             f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
@@ -851,7 +969,7 @@ class MainWindow(QMainWindow):
             else "Ready. MAC vendor lookup unavailable (oui.csv not loaded)."
         )
         self.status_lbl = QLabel(vendor_status)
-        layout.addWidget(self.status_lbl)
+        actions_layout.addWidget(self.status_lbl)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -860,32 +978,130 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 1)
+        return widget
 
-        self.load_interfaces()
+    def build_diagnostics_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
 
-        self.btn_scan.clicked.connect(self.start_scan)
-        self.btn_stop.clicked.connect(self.stop_scan)
-        self.btn_export.clicked.connect(self.export_csv)
-        self.btn_install_npcap.clicked.connect(self.open_npcap_download)
-        self.if_combo.currentIndexChanged.connect(self.on_interface_changed)
-        self.btn_env_refresh.clicked.connect(self.run_env_checks)
+        target_row = QWidget()
+        target_layout = QHBoxLayout(target_row)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        target_layout.setSpacing(8)
+        target_layout.addWidget(QLabel("Target:"))
+        self.diag_target_input = QLineEdit()
+        self.diag_target_input.setPlaceholderText("example.com or 8.8.8.8")
+        target_layout.addWidget(self.diag_target_input)
+        layout.addWidget(target_row)
 
-        self.update_npcap_state()
-        self.fetch_external_ip()
-        self.connectivity_check_running = False
-        self.connectivity_timer = QTimer(self)
-        self.connectivity_timer.setInterval(5000)
-        self.connectivity_timer.timeout.connect(self.check_connectivity)
-        self.connectivity_timer.start()
-        self.igmp_timer = QTimer(self)
-        self.igmp_timer.setInterval(20000)
-        self.igmp_timer.timeout.connect(self.run_igmp_check)
-        self.igmp_timer.start()
-        self.env_timer = QTimer(self)
-        self.env_timer.setInterval(20000)
-        self.env_timer.timeout.connect(self.run_env_checks)
-        self.env_timer.start()
-        self.on_interface_changed(self.if_combo.currentIndex())
+        options_row = QWidget()
+        options_layout = QHBoxLayout(options_row)
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        options_layout.setSpacing(12)
+
+        options_layout.addWidget(QLabel("Ping count:"))
+        self.diag_ping_count = QSpinBox()
+        self.diag_ping_count.setRange(1, 200)
+        self.diag_ping_count.setValue(4)
+        options_layout.addWidget(self.diag_ping_count)
+
+        options_layout.addWidget(QLabel("Timeout (ms):"))
+        self.diag_timeout = QSpinBox()
+        self.diag_timeout.setRange(200, 5000)
+        self.diag_timeout.setValue(1000)
+        options_layout.addWidget(self.diag_timeout)
+
+        options_layout.addWidget(QLabel("Traceroute max hops:"))
+        self.diag_max_hops = QSpinBox()
+        self.diag_max_hops.setRange(1, 64)
+        self.diag_max_hops.setValue(30)
+        options_layout.addWidget(self.diag_max_hops)
+        options_layout.addStretch(1)
+        layout.addWidget(options_row)
+
+        buttons_row = QWidget()
+        buttons_layout = QHBoxLayout(buttons_row)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.setSpacing(10)
+        self.btn_diag_ping = QPushButton("Ping")
+        self.btn_diag_traceroute = QPushButton("Traceroute")
+        self.btn_diag_stop = QPushButton("Stop")
+        self.btn_diag_stop.setEnabled(False)
+        buttons_layout.addWidget(self.btn_diag_ping)
+        buttons_layout.addWidget(self.btn_diag_traceroute)
+        buttons_layout.addWidget(self.btn_diag_stop)
+        buttons_layout.addStretch(1)
+        layout.addWidget(buttons_row)
+
+        self.diag_output = QPlainTextEdit()
+        self.diag_output.setReadOnly(True)
+        self.diag_output.setMinimumHeight(250)
+        layout.addWidget(self.diag_output, 1)
+
+        self.diag_status_lbl = QLabel("Idle")
+        layout.addWidget(self.diag_status_lbl)
+        return widget
+
+    def start_diag_worker(self, command: List[str], pre_status: str):
+        if self.diag_worker and self.diag_worker.isRunning():
+            return
+        self.diag_output.clear()
+        self.diag_status_lbl.setText(pre_status)
+        self.diag_worker = DiagnosticsWorker(command)
+        self.diag_worker.diagOutputLine.connect(self.on_diag_output_line)
+        self.diag_worker.diagStatusChanged.connect(self.on_diag_status_changed)
+        self.diag_worker.diagRunningChanged.connect(self.on_diag_running_changed)
+        self.diag_worker.finished.connect(self.on_diag_finished)
+        self.diag_worker.start()
+
+    def run_diag_ping(self):
+        target = self.diag_target_input.text().strip()
+        if not target:
+            self.diag_status_lbl.setText("Failed: Target required")
+            return
+        cmd = [
+            "ping",
+            "-n",
+            str(self.diag_ping_count.value()),
+            "-w",
+            str(self.diag_timeout.value()),
+            target,
+        ]
+        self.start_diag_worker(cmd, f"Running ping to {target}...")
+
+    def run_diag_traceroute(self):
+        target = self.diag_target_input.text().strip()
+        if not target:
+            self.diag_status_lbl.setText("Failed: Target required")
+            return
+        cmd = [
+            "tracert",
+            "-h",
+            str(self.diag_max_hops.value()),
+            target,
+        ]
+        self.start_diag_worker(cmd, f"Running traceroute to {target}...")
+
+    def stop_diag_worker(self):
+        if self.diag_worker:
+            self.diag_worker.stop()
+
+    @Slot(str)
+    def on_diag_output_line(self, line: str):
+        self.diag_output.appendPlainText(line)
+
+    @Slot(str)
+    def on_diag_status_changed(self, status: str):
+        self.diag_status_lbl.setText(status)
+
+    @Slot(bool)
+    def on_diag_running_changed(self, running: bool):
+        self.btn_diag_ping.setEnabled(not running)
+        self.btn_diag_traceroute.setEnabled(not running)
+        self.btn_diag_stop.setEnabled(running)
+
+    def on_diag_finished(self):
+        self.diag_worker = None
 
     def update_npcap_state(self):
         self.npcap_available = is_npcap_available()
