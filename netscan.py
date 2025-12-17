@@ -1,4 +1,5 @@
 import sys
+import os
 import csv
 import time
 import webbrowser
@@ -84,6 +85,9 @@ def get_active_ipv4_interfaces() -> List[dict]:
     return out
 
 
+DEFAULT_OUI_URL = "https://raw.githubusercontent.com/oui-lookup/ieee-oui/master/oui.csv"
+
+
 def build_oui_map(path: str) -> Dict[str, str]:
     """
     CSV format: OUI,Vendor
@@ -107,6 +111,20 @@ def build_oui_map(path: str) -> Dict[str, str]:
     except FileNotFoundError:
         pass
     return m
+
+
+def load_oui_map(path: str = "oui.csv", url: str = DEFAULT_OUI_URL) -> Dict[str, str]:
+    """Ensure an OUI map is available by downloading a CSV if missing."""
+    if not os.path.exists(path):
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200 and resp.text:
+                with open(path, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(resp.text)
+        except Exception:
+            pass
+
+    return build_oui_map(path)
 
 
 def vendor_from_mac(mac: Optional[str], oui_map: Dict[str, str]) -> Optional[str]:
@@ -640,7 +658,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Local Network Device Discovery (Windows)")
         self.resize(1180, 680)
 
-        self.oui_map = build_oui_map("oui.csv")  # optional next to script/exe
+        self.oui_map = load_oui_map("oui.csv")
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
         self.npcap_available = False
@@ -737,7 +755,12 @@ class MainWindow(QMainWindow):
         timing.addWidget(self.btn_export)
         timing.addWidget(self.btn_install_npcap)
 
-        self.status_lbl = QLabel("Ready.")
+        vendor_status = (
+            f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
+            if self.oui_map
+            else "Ready. MAC vendor lookup unavailable (oui.csv not loaded)."
+        )
+        self.status_lbl = QLabel(vendor_status)
         layout.addWidget(self.status_lbl)
 
         self.table = QTableWidget(0, 7)
