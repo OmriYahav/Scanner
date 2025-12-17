@@ -8,6 +8,8 @@ import ipaddress
 import threading
 import subprocess
 import xml.etree.ElementTree as ET
+import ctypes
+import shutil
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
 
@@ -15,7 +17,7 @@ import psutil
 import requests
 from ping3 import ping
 
-from scapy.all import ARP, Ether, srp, conf  # type: ignore
+from scapy.all import ARP, Ether, IGMP, conf, sniff, srp  # type: ignore
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
@@ -658,6 +660,8 @@ class ScanWorker(QThread):
 class MainWindow(QMainWindow):
     externalIpChanged = Signal(str)
     internetStatusChanged = Signal(bool)
+    igmpStatusChanged = Signal(dict)
+    envStatusChanged = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -670,9 +674,13 @@ class MainWindow(QMainWindow):
         self.npcap_available = False
         self.last_connectivity_state: Optional[bool] = None
         self.last_connectivity_ts: float = 0.0
+        self.igmp_check_running = False
+        self.env_check_running = False
 
         self.externalIpChanged.connect(self.set_external_ip)
         self.internetStatusChanged.connect(self.set_connectivity_state)
+        self.igmpStatusChanged.connect(self.apply_igmp_status)
+        self.envStatusChanged.connect(self.apply_env_status)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -791,6 +799,41 @@ class MainWindow(QMainWindow):
             self.dhcp_value_labels[key] = val_lbl
             network_form.addRow(label_widget, val_lbl)
 
+        panels_row = QWidget()
+        panels_layout = QHBoxLayout(panels_row)
+        panels_layout.setContentsMargins(0, 0, 0, 0)
+        panels_layout.setSpacing(12)
+
+        self.igmp_group = QGroupBox("Multicast / IGMP")
+        igmp_layout = QVBoxLayout(self.igmp_group)
+        self.igmp_status_lbl = QLabel("IGMP Snooping: Unknown")
+        self.igmp_status_lbl.setToolTip(
+            "Best-effort inference; definitive snooping status requires switch/router access."
+        )
+        igmp_layout.addWidget(self.igmp_status_lbl)
+        igmp_layout.addStretch(1)
+        panels_layout.addWidget(self.igmp_group, 1)
+
+        self.env_group = QGroupBox("Environment Status")
+        env_layout = QVBoxLayout(self.env_group)
+        self.npcap_status_lbl = QLabel("Npcap Installed: Unknown")
+        env_layout.addWidget(self.npcap_status_lbl)
+        self.admin_status_lbl = QLabel("Running as Administrator: Unknown")
+        env_layout.addWidget(self.admin_status_lbl)
+        self.arp_status_lbl = QLabel("ARP Available: Unknown")
+        env_layout.addWidget(self.arp_status_lbl)
+        arp_hint = QLabel("ARP may require Admin and/or Npcap for best results.")
+        arp_hint.setStyleSheet("color: gray; font-size: 11px;")
+        env_layout.addWidget(arp_hint)
+        env_btn_row = QHBoxLayout()
+        env_btn_row.addStretch(1)
+        self.btn_env_refresh = QPushButton("Refresh")
+        env_btn_row.addWidget(self.btn_env_refresh)
+        env_layout.addLayout(env_btn_row)
+        panels_layout.addWidget(self.env_group, 1)
+
+        network_form.addRow(make_label("Status Panels:"), panels_row)
+
         vendor_status = (
             f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
             if self.oui_map
@@ -814,6 +857,7 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
         self.if_combo.currentIndexChanged.connect(self.on_interface_changed)
+        self.btn_env_refresh.clicked.connect(self.run_env_checks)
 
         self.update_npcap_state()
         self.fetch_external_ip()
@@ -822,6 +866,14 @@ class MainWindow(QMainWindow):
         self.connectivity_timer.setInterval(5000)
         self.connectivity_timer.timeout.connect(self.check_connectivity)
         self.connectivity_timer.start()
+        self.igmp_timer = QTimer(self)
+        self.igmp_timer.setInterval(20000)
+        self.igmp_timer.timeout.connect(self.run_igmp_check)
+        self.igmp_timer.start()
+        self.env_timer = QTimer(self)
+        self.env_timer.setInterval(20000)
+        self.env_timer.timeout.connect(self.run_env_checks)
+        self.env_timer.start()
         self.on_interface_changed(self.if_combo.currentIndex())
 
     def update_npcap_state(self):
@@ -912,6 +964,182 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _style_status(self, lbl: QLabel, prefix: str, status: str, color_map: Dict[str, str]):
+        color = color_map.get(status.lower(), "black")
+        lbl.setText(f"{prefix}: {status}")
+        lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _contains_multicast_join(self, text: str) -> bool:
+        for token in text.split():
+            try:
+                ip = ipaddress.IPv4Address(token.strip(','))
+            except Exception:
+                continue
+            if ip.is_multicast:
+                return True
+        return False
+
+    def _check_multicast_joins(self) -> Optional[bool]:
+        commands = [
+            ["netsh", "interface", "ip", "show", "joins"],
+            ["netstat", "-g"],
+        ]
+        for cmd in commands:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+            output = f"{proc.stdout}\n{proc.stderr}" if proc else ""
+            if output and self._contains_multicast_join(output):
+                return True
+        if not any(shutil.which(cmd[0]) for cmd in commands):
+            return None
+        return False
+
+    def _passive_igmp_sniff(self, iface_name: Optional[str]) -> Optional[bool]:
+        if not iface_name:
+            return None
+        try:
+            packets = sniff(filter="igmp", iface=iface_name, timeout=2, store=True, count=5)
+            for pkt in packets:
+                if pkt.haslayer(IGMP):
+                    return True
+            return False if packets else False
+        except Exception:
+            return None
+
+    def detect_igmp_status(self, iface_name: Optional[str]) -> dict:
+        status = "Unknown"
+        detail = ""
+
+        joins_present = self._check_multicast_joins()
+        if joins_present:
+            status = "Likely"
+            detail = "Multicast group joins detected."
+        else:
+            sniff_result = self._passive_igmp_sniff(iface_name)
+            if sniff_result:
+                status = "Likely"
+                detail = "Observed IGMP traffic."
+        return {"status": status, "detail": detail}
+
+    def run_igmp_check(self):
+        if self.igmp_check_running:
+            return
+        self.igmp_check_running = True
+        data = self.if_combo.currentData()
+        iface_name = data.get("name") if isinstance(data, dict) else None
+
+        def worker():
+            try:
+                result = self.detect_igmp_status(iface_name)
+            except Exception:
+                result = {"status": "Unknown", "detail": ""}
+            self.igmpStatusChanged.emit(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(dict)
+    def apply_igmp_status(self, payload: dict):
+        try:
+            status = str(payload.get("status", "Unknown"))
+            detail = payload.get("detail") or ""
+            tooltip = "Best-effort inference; definitive snooping status requires switch/router access."
+            if detail:
+                tooltip = f"{tooltip} {detail}"
+            self.igmp_status_lbl.setToolTip(tooltip)
+            color_map = {"likely": "green", "unknown": "orange", "unlikely": "red"}
+            self._style_status(self.igmp_status_lbl, "IGMP Snooping", status, color_map)
+        finally:
+            self.igmp_check_running = False
+
+    def _check_npcap_installed(self) -> Optional[bool]:
+        try:
+            proc = subprocess.run(["sc", "query", "npcap"], capture_output=True, text=True, timeout=3)
+            if proc.returncode == 0 and proc.stdout:
+                return True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            return None
+
+        system_root = os.environ.get("SystemRoot", "C:\\Windows")
+        for dll in ["wpcap.dll", "Packet.dll"]:
+            dll_path = os.path.join(system_root, "System32", dll)
+            if os.path.exists(dll_path):
+                return True
+        return False
+
+    def _check_is_admin(self) -> Optional[bool]:
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return None
+
+    def _check_arp_available(self) -> Optional[bool]:
+        try:
+            proc = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=3)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+        output = (proc.stdout or "") + (proc.stderr or "")
+        lower = output.lower()
+        if "denied" in lower or "permission" in lower:
+            return False
+        return proc.returncode == 0
+
+    def detect_env_status(self) -> dict:
+        npcap_state = self._check_npcap_installed()
+        admin_state = self._check_is_admin()
+        arp_state = self._check_arp_available()
+
+        def to_text(val: Optional[bool], true_text: str, false_text: str) -> str:
+            if val is True:
+                return true_text
+            if val is False:
+                return false_text
+            return "Unknown"
+
+        return {
+            "npcap": to_text(npcap_state, "Installed", "Not installed"),
+            "admin": to_text(admin_state, "Admin", "Not Admin"),
+            "arp": to_text(arp_state, "Available", "Limited/Unavailable"),
+        }
+
+    def run_env_checks(self):
+        if self.env_check_running:
+            return
+        self.env_check_running = True
+
+        def worker():
+            try:
+                result = self.detect_env_status()
+            except Exception:
+                result = {"npcap": "Unknown", "admin": "Unknown", "arp": "Unknown"}
+            self.envStatusChanged.emit(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(dict)
+    def apply_env_status(self, payload: dict):
+        try:
+            color_map_basic = {"installed": "green", "not installed": "red", "unknown": "orange"}
+            color_map_admin = {"admin": "green", "not admin": "red", "unknown": "orange"}
+            color_map_arp = {
+                "available": "green",
+                "limited/unavailable": "red",
+                "unknown": "orange",
+            }
+            self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic)
+            self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin)
+            self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp)
+        finally:
+            self.env_check_running = False
+
     def on_interface_changed(self, index: int):
         data = self.if_combo.itemData(index)
         iface_name = data.get("name") if isinstance(data, dict) else None
@@ -919,6 +1147,8 @@ class MainWindow(QMainWindow):
         info["interface"] = iface_name or "N/A"
         for key, lbl in self.dhcp_value_labels.items():
             lbl.setText(info.get(key, "") or "N/A")
+        self.run_igmp_check()
+        self.run_env_checks()
 
 
     def load_interfaces(self):
