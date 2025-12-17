@@ -19,7 +19,7 @@ from scapy.all import ARP, Ether, srp, conf  # type: ignore
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
@@ -655,6 +655,9 @@ class ScanWorker(QThread):
 # GUI
 # -----------------------------
 class MainWindow(QMainWindow):
+    externalIpChanged = Signal(str)
+    internetStatusChanged = Signal(bool)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Local Network Device Discovery (Windows)")
@@ -664,6 +667,9 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
         self.npcap_available = False
+
+        self.externalIpChanged.connect(self.set_external_ip)
+        self.internetStatusChanged.connect(self.set_connectivity_state)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -818,15 +824,17 @@ class MainWindow(QMainWindow):
                 if resp.status_code == 200 and resp.text:
                     ip_text = resp.text.strip()
             except Exception:
-                pass
+                ip_text = "Unavailable"
 
-            def update():
-                self.external_ip_lbl.setText(f"External IP: {ip_text or 'Unavailable'}")
-
-            QMetaObject.invokeMethod(self, update, Qt.QueuedConnection)
+            self.externalIpChanged.emit(ip_text or "Unavailable")
 
         threading.Thread(target=worker, daemon=True).start()
 
+    @Slot(str)
+    def set_external_ip(self, ip: str):
+        self.external_ip_lbl.setText(f"External IP: {ip or 'Unavailable'}")
+
+    @Slot(bool)
     def set_connectivity_state(self, online: bool):
         color = "green" if online else "red"
         text = "Online" if online else "Offline"
@@ -847,9 +855,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 online = False
 
-            QMetaObject.invokeMethod(
-                self, lambda: self.set_connectivity_state(online), Qt.QueuedConnection
-            )
+            self.internetStatusChanged.emit(online)
 
         threading.Thread(target=worker, daemon=True).start()
 
