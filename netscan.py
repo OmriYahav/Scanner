@@ -1179,6 +1179,7 @@ class MainWindow(QMainWindow):
         self.env_check_running = False
         self.l2_check_running = False
         self.av_check_running = False
+        self.last_network_snapshot: Dict[str, str] = {}
         self.diag_worker: Optional[DiagnosticsWorker] = None
         self.l2_worker: Optional[Layer2InfoWorker] = None
         self.av_worker: Optional[AVInsightsWorker] = None
@@ -1229,6 +1230,10 @@ class MainWindow(QMainWindow):
         self.env_timer.setInterval(20000)
         self.env_timer.timeout.connect(self.run_env_checks)
         self.env_timer.start()
+        self.network_monitor_timer = QTimer(self)
+        self.network_monitor_timer.setInterval(4000)
+        self.network_monitor_timer.timeout.connect(self.refresh_network_info)
+        self.network_monitor_timer.start()
         self.on_interface_changed(self.if_combo.currentIndex())
 
     def apply_stylesheet(self):
@@ -1258,7 +1263,6 @@ class MainWindow(QMainWindow):
         self.connectivity_lbl = QLabel()
         set_badge(self.connectivity_lbl, "gray", "Internet: checking...")
         header_row.addWidget(self.connectivity_lbl)
-        header_row.addStretch(1)
         summary_layout.addLayout(header_row)
 
         def make_label(text: str) -> QLabel:
@@ -1295,27 +1299,13 @@ class MainWindow(QMainWindow):
             grid.addWidget(label_widget, row, 0)
             grid.addWidget(val_lbl, row, 1)
         summary_layout.addLayout(grid)
-        layout.addWidget(summary_card)
+        left_column = QVBoxLayout()
+        left_column.setSpacing(12)
+        left_column.addWidget(summary_card)
+        left_column.addStretch(1)
 
-        panels_row = QHBoxLayout()
-        panels_row.setSpacing(12)
-
-        self.igmp_group = Card("Multicast / IGMP")
-        igmp_layout = self.igmp_group.content_layout
-        igmp_row = QHBoxLayout()
-        igmp_row.setSpacing(8)
-        igmp_label = QLabel("IGMP Snooping")
-        igmp_label.setObjectName("keyLabel")
-        igmp_row.addWidget(igmp_label)
-        self.igmp_status_lbl = QLabel()
-        self.igmp_status_lbl.setToolTip(
-            "Best-effort inference; definitive snooping status requires switch/router access."
-        )
-        set_badge(self.igmp_status_lbl, "gray", "Unknown")
-        igmp_row.addWidget(self.igmp_status_lbl)
-        igmp_row.addStretch(1)
-        igmp_layout.addLayout(igmp_row)
-        panels_row.addWidget(self.igmp_group, 1)
+        right_column = QVBoxLayout()
+        right_column.setSpacing(12)
 
         self.env_group = Card("Environment Status")
         env_layout = self.env_group.content_layout
@@ -1344,9 +1334,23 @@ class MainWindow(QMainWindow):
         self.btn_env_refresh = QPushButton("Refresh")
         env_btn_row.addWidget(self.btn_env_refresh)
         env_layout.addLayout(env_btn_row)
-        panels_row.addWidget(self.env_group, 1)
+        right_column.addWidget(self.env_group)
 
-        layout.addLayout(panels_row)
+        self.igmp_group = Card("Multicast / IGMP")
+        igmp_layout = self.igmp_group.content_layout
+        igmp_row = QHBoxLayout()
+        igmp_row.setSpacing(8)
+        igmp_label = QLabel("IGMP Snooping")
+        igmp_label.setObjectName("keyLabel")
+        igmp_row.addWidget(igmp_label)
+        self.igmp_status_lbl = QLabel()
+        self.igmp_status_lbl.setToolTip(
+            "Best-effort inference; definitive snooping status requires switch/router access."
+        )
+        set_badge(self.igmp_status_lbl, "gray", "Unknown")
+        igmp_row.addWidget(self.igmp_status_lbl)
+        igmp_layout.addLayout(igmp_row)
+        right_column.addWidget(self.igmp_group)
 
         l2_group = Card("Layer 2 Info")
         l2_layout = QFormLayout()
@@ -1382,7 +1386,13 @@ class MainWindow(QMainWindow):
         l2_layout.addRow(QLabel(""), l2_btn_row)
 
         l2_group.content_layout.addLayout(l2_layout)
-        layout.addWidget(l2_group)
+        right_column.addWidget(l2_group)
+
+        content_row = QHBoxLayout()
+        content_row.setSpacing(12)
+        content_row.addLayout(left_column, 2)
+        content_row.addLayout(right_column, 1)
+        layout.addLayout(content_row)
         layout.addStretch(1)
         return widget
 
@@ -2073,17 +2083,7 @@ class MainWindow(QMainWindow):
         self.av_check_running = False
 
     def on_interface_changed(self, index: int):
-        data = self.if_combo.itemData(index)
-        iface_name = data.get("name") if isinstance(data, dict) else None
-        info = get_dhcp_info(iface_name, data if isinstance(data, dict) else None)
-        info["interface"] = iface_name or "N/A"
-        for key, lbl in self.dhcp_value_labels.items():
-            lbl.setText(info.get(key, "") or "N/A")
-        self.run_igmp_check()
-        self.run_env_checks()
-        self.av_iface_lbl.setText(f"Interface: {iface_name or 'Unknown'}")
-        self.refresh_av_insights(auto_trigger=True)
-        self.run_l2_check()
+        self.refresh_network_info(force=True)
 
 
     def load_interfaces(self):
@@ -2097,6 +2097,128 @@ class MainWindow(QMainWindow):
             label = f"{it['name']}  |  {it['ip']}  |  {it['cidr']}"
             self.if_combo.addItem(label, it)
 
+    def _sync_interface_list(self, active_ifaces: List[dict], preferred_name: Optional[str]) -> Tuple[Optional[str], Optional[dict]]:
+        existing_entries = []
+        for i in range(self.if_combo.count()):
+            data = self.if_combo.itemData(i)
+            if isinstance(data, dict):
+                existing_entries.append((data.get("name"), data.get("ip"), data.get("cidr")))
+
+        new_entries = [(it.get("name"), it.get("ip"), it.get("cidr")) for it in active_ifaces]
+        new_names = [it.get("name") for it in active_ifaces]
+        needs_reload = existing_entries != new_entries
+        target_name = preferred_name if preferred_name in new_names else new_names[0] if new_names else None
+
+        if needs_reload:
+            self.if_combo.blockSignals(True)
+            self.if_combo.clear()
+            for it in active_ifaces:
+                label = f"{it['name']}  |  {it['ip']}  |  {it['cidr']}"
+                self.if_combo.addItem(label, it)
+            if target_name and target_name in new_names:
+                self.if_combo.setCurrentIndex(new_names.index(target_name))
+            self.if_combo.blockSignals(False)
+
+        data = self.if_combo.currentData()
+        iface_name = data.get("name") if isinstance(data, dict) else target_name
+        iface_data = next((it for it in active_ifaces if it.get("name") == iface_name), None)
+        if iface_data is None and active_ifaces:
+            iface_data = active_ifaces[0]
+            iface_name = iface_data.get("name")
+            if needs_reload:
+                self.if_combo.blockSignals(True)
+                self.if_combo.setCurrentIndex(0)
+                self.if_combo.blockSignals(False)
+        return iface_name, iface_data
+
+    def _apply_dhcp_info(self, info: Dict[str, str], unavailable: bool = False):
+        fallback = "Unavailable" if unavailable else "N/A"
+        for key, lbl in self.dhcp_value_labels.items():
+            lbl.setText(info.get(key, "") or fallback)
+
+    def _set_l2_refreshing_state(self):
+        set_badge(self.lldp_status_lbl, "yellow", "LLDP: Refreshing...")
+        set_badge(self.vlan_status_badge, "yellow", "VLANs: Refreshing...")
+        for lbl in [
+            self.lldp_chassis_lbl,
+            self.lldp_port_lbl,
+            self.lldp_sysname_lbl,
+            self.lldp_portdesc_lbl,
+            self.lldp_mgmt_lbl,
+            self.vlan_lbl,
+        ]:
+            lbl.setText("Refreshing...")
+
+    def _set_network_refreshing_state(self):
+        self.external_ip_lbl.setText("External IP: Updating...")
+        set_badge(self.connectivity_lbl, "yellow", "Internet: Checking...")
+        for lbl in self.dhcp_value_labels.values():
+            lbl.setText("Updating...")
+        self._set_l2_refreshing_state()
+
+    def _set_network_unavailable_state(self):
+        self.external_ip_lbl.setText("External IP: Unavailable")
+        set_badge(self.connectivity_lbl, "red", "Internet: Offline")
+        self._apply_dhcp_info({}, unavailable=True)
+        set_badge(self.lldp_status_lbl, "gray", "LLDP: Unavailable")
+        set_badge(self.vlan_status_badge, "gray", "VLANs: Unavailable")
+        for lbl in [
+            self.lldp_chassis_lbl,
+            self.lldp_port_lbl,
+            self.lldp_sysname_lbl,
+            self.lldp_portdesc_lbl,
+            self.lldp_mgmt_lbl,
+            self.vlan_lbl,
+        ]:
+            lbl.setText("Unavailable")
+
+    def refresh_network_info(self, force: bool = False):
+        active_ifaces = get_active_ipv4_interfaces()
+        preferred_data = self.if_combo.currentData()
+        preferred_name = preferred_data.get("name") if isinstance(preferred_data, dict) else None
+
+        if not active_ifaces:
+            if force or self.last_network_snapshot:
+                self.last_network_snapshot = {}
+                self.if_combo.blockSignals(True)
+                self.if_combo.clear()
+                self.if_combo.addItem("No active IPv4 interfaces found", None)
+                self.if_combo.blockSignals(False)
+                self.btn_scan.setEnabled(False)
+                self._set_network_unavailable_state()
+            return
+
+        self.btn_scan.setEnabled(True)
+
+        iface_name, iface_data = self._sync_interface_list(active_ifaces, preferred_name)
+        if not iface_name or not iface_data:
+            return
+
+        dhcp_info = get_dhcp_info(iface_name, iface_data)
+        dhcp_info.setdefault("interface", iface_name)
+        dhcp_info.setdefault("ip", iface_data.get("ip", ""))
+
+        snapshot = {
+            "interface": iface_name,
+            "ip": dhcp_info.get("ip", ""),
+            "gateway": dhcp_info.get("gateway", ""),
+            "dhcp_server": dhcp_info.get("dhcp_server", ""),
+        }
+
+        if not force and snapshot == self.last_network_snapshot:
+            return
+
+        self.last_network_snapshot = snapshot
+        self._set_network_refreshing_state()
+        self._apply_dhcp_info(dhcp_info)
+        self.av_iface_lbl.setText(f"Interface: {iface_name}")
+
+        self.fetch_external_ip()
+        self.check_connectivity()
+        self.run_env_checks()
+        self.run_igmp_check()
+        self.refresh_av_insights(auto_trigger=True)
+        self.run_l2_check()
     def start_scan(self):
         self.update_npcap_state()
         it = self.if_combo.currentData()
