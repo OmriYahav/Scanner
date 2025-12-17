@@ -3,6 +3,7 @@ import csv
 import time
 import webbrowser
 import socket
+import asyncio
 import ipaddress
 import threading
 import xml.etree.ElementTree as ET
@@ -45,6 +46,7 @@ class Device:
     ssdp_st: Optional[str] = None
     ssdp_usn: Optional[str] = None
     ssdp_location: Optional[str] = None
+    open_tcp_ports: List[int] = field(default_factory=list)
 
 
 # -----------------------------
@@ -373,6 +375,11 @@ class ScanWorker(QThread):
         fetch_upnp_xml: bool,
         mdns_duration_s: int,
         ssdp_timeout_s: int,
+        do_port_scan: bool,
+        port_start: int,
+        port_end: int,
+        port_timeout_ms: int,
+        port_concurrency: int,
         parent=None
     ):
         super().__init__(parent)
@@ -385,6 +392,11 @@ class ScanWorker(QThread):
         self.fetch_upnp_xml = fetch_upnp_xml
         self.mdns_duration_s = mdns_duration_s
         self.ssdp_timeout_s = ssdp_timeout_s
+        self.do_port_scan = do_port_scan
+        self.port_start = port_start
+        self.port_end = port_end
+        self.port_timeout_ms = port_timeout_ms
+        self.port_concurrency = max(1, port_concurrency)
         self._stop = False
 
     def stop(self):
@@ -397,6 +409,57 @@ class ScanWorker(QThread):
             devices[ip] = d
         d.last_seen_ts = time.time()
         return d
+
+    async def _probe_port(self, ip: str, port: int, timeout_s: float) -> bool:
+        if self._stop:
+            return False
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout_s)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except (OSError, asyncio.CancelledError):
+            return False
+
+    async def _scan_ports_async(
+        self,
+        ips: List[str],
+        ports: List[int],
+        timeout_s: float,
+        max_concurrency: int,
+    ) -> Dict[str, List[int]]:
+        if not ips or not ports or self._stop:
+            return {}
+
+        sem = asyncio.Semaphore(max_concurrency)
+        open_ports: Dict[str, List[int]] = {ip: [] for ip in ips}
+        total = len(ips) * len(ports)
+        progress = 0
+
+        async def worker(ip: str, port: int):
+            nonlocal progress
+            if self._stop:
+                return
+            async with sem:
+                if self._stop:
+                    return
+                is_open = await self._probe_port(ip, port, timeout_s)
+                if is_open:
+                    open_ports[ip].append(port)
+                progress += 1
+                if progress % 50 == 0:
+                    self.status.emit(f"Port scan progress: {progress}/{total}")
+
+        tasks = [asyncio.create_task(worker(ip, port)) for ip in ips for port in ports]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self._stop:
+            return {}
+        return {ip: sorted(set(lst)) for ip, lst in open_ports.items() if lst}
 
     def run(self):
         original_iface = conf.iface
@@ -526,6 +589,37 @@ class ScanWorker(QThread):
                         d.hostname = name
                         d.protocols.add("rDNS")
 
+            # 6) TCP port scan
+            if self.do_port_scan and not self._stop:
+                ips = list(devices.keys())
+                ports = list(range(self.port_start, self.port_end + 1))
+                if ips and ports:
+                    self.status.emit(
+                        f"Scanning TCP ports {self.port_start}-{self.port_end} (timeout {self.port_timeout_ms}ms, concurrency {self.port_concurrency})..."
+                    )
+                    try:
+                        open_map = asyncio.run(
+                            self._scan_ports_async(
+                                ips=ips,
+                                ports=ports,
+                                timeout_s=max(0.05, self.port_timeout_ms / 1000.0),
+                                max_concurrency=self.port_concurrency,
+                            )
+                        )
+                        for ip, open_ports in open_map.items():
+                            if self._stop:
+                                self.status.emit("Scan stopped.")
+                                return
+                            d = self._merge_device(devices, ip)
+                            d.protocols.add("TCP")
+                            d.open_tcp_ports.extend(open_ports)
+                            desc = "Open TCP: " + ",".join(str(p) for p in open_ports)
+                            d.description = normalize_description(d.description, desc)
+                    except Exception as e:
+                        self.status.emit(f"Port scan error: {e}")
+                else:
+                    self.status.emit("Port scan skipped (no targets).")
+
             self.result.emit(list(devices.values()))
             self.finished_ok.emit()
 
@@ -599,6 +693,37 @@ class MainWindow(QMainWindow):
         self.sp_ssdp.setValue(3)
         timing.addWidget(self.sp_ssdp)
 
+        # Port scan controls
+        ports = QHBoxLayout()
+        layout.addLayout(ports)
+
+        self.cb_portscan = QCheckBox("TCP port scan")
+        ports.addWidget(self.cb_portscan)
+
+        ports.addWidget(QLabel("From:"))
+        self.sp_port_start = QSpinBox()
+        self.sp_port_start.setRange(1, 65535)
+        self.sp_port_start.setValue(20)
+        ports.addWidget(self.sp_port_start)
+
+        ports.addWidget(QLabel("To:"))
+        self.sp_port_end = QSpinBox()
+        self.sp_port_end.setRange(1, 65535)
+        self.sp_port_end.setValue(1024)
+        ports.addWidget(self.sp_port_end)
+
+        ports.addWidget(QLabel("Timeout (ms):"))
+        self.sp_port_timeout = QSpinBox()
+        self.sp_port_timeout.setRange(50, 10000)
+        self.sp_port_timeout.setValue(300)
+        ports.addWidget(self.sp_port_timeout)
+
+        ports.addWidget(QLabel("Concurrency:"))
+        self.sp_port_concurrency = QSpinBox()
+        self.sp_port_concurrency.setRange(1, 1000)
+        self.sp_port_concurrency.setValue(200)
+        ports.addWidget(self.sp_port_concurrency)
+
         timing.addStretch(1)
 
         self.btn_scan = QPushButton("Start Scan")
@@ -629,7 +754,9 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_scan)
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
+        self.cb_portscan.toggled.connect(self._toggle_port_controls)
 
+        self._toggle_port_controls(self.cb_portscan.isChecked())
         self.update_npcap_state()
 
     def update_npcap_state(self):
@@ -643,6 +770,15 @@ class MainWindow(QMainWindow):
 
     def open_npcap_download(self):
         webbrowser.open("https://npcap.com/#download")
+
+    def _toggle_port_controls(self, checked: bool):
+        for w in [
+            self.sp_port_start,
+            self.sp_port_end,
+            self.sp_port_timeout,
+            self.sp_port_concurrency,
+        ]:
+            w.setEnabled(checked)
 
 
     def load_interfaces(self):
@@ -675,6 +811,25 @@ class MainWindow(QMainWindow):
 
         cidr = it["cidr"]
 
+        port_scan_enabled = self.cb_portscan.isChecked()
+        port_start = int(self.sp_port_start.value())
+        port_end = int(self.sp_port_end.value())
+        port_timeout_ms = int(self.sp_port_timeout.value())
+        port_concurrency = int(self.sp_port_concurrency.value())
+        if port_scan_enabled:
+            if port_start < 1 or port_end > 65535 or port_start > port_end:
+                QMessageBox.warning(self, "Invalid ports", "Please choose a TCP port range between 1 and 65535.")
+                self.btn_scan.setEnabled(True)
+                return
+            if port_concurrency < 1:
+                QMessageBox.warning(self, "Invalid concurrency", "Port scan concurrency must be at least 1.")
+                self.btn_scan.setEnabled(True)
+                return
+            if port_timeout_ms < 10:
+                QMessageBox.warning(self, "Invalid timeout", "Timeout must be at least 10ms.")
+                self.btn_scan.setEnabled(True)
+                return
+
         self.table.setRowCount(0)
         self.devices = []
         self.btn_scan.setEnabled(False)
@@ -691,6 +846,11 @@ class MainWindow(QMainWindow):
             fetch_upnp_xml=(self.cb_ssdp.isChecked() and self.cb_upnp_xml.isChecked()),
             mdns_duration_s=int(self.sp_mdns.value()),
             ssdp_timeout_s=int(self.sp_ssdp.value()),
+            do_port_scan=port_scan_enabled,
+            port_start=port_start,
+            port_end=port_end,
+            port_timeout_ms=port_timeout_ms,
+            port_concurrency=port_concurrency,
         )
         self.worker.status.connect(self.status_lbl.setText)
         self.worker.result.connect(self.on_results)
