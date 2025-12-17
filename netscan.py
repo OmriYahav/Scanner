@@ -23,7 +23,8 @@ from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
-    QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGridLayout
+    QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGroupBox,
+    QFormLayout
 )
 
 
@@ -667,6 +668,8 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
         self.npcap_available = False
+        self.last_connectivity_state: Optional[bool] = None
+        self.last_connectivity_ts: float = 0.0
 
         self.externalIpChanged.connect(self.set_external_ip)
         self.internetStatusChanged.connect(self.set_connectivity_state)
@@ -739,20 +742,36 @@ class MainWindow(QMainWindow):
         timing.addWidget(self.btn_export)
         timing.addWidget(self.btn_install_npcap)
 
-        info_layout = QHBoxLayout()
-        layout.addLayout(info_layout)
+        network_group = QGroupBox("Network Info")
+        layout.addWidget(network_group)
+        network_form = QFormLayout()
+        network_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        network_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        network_form.setHorizontalSpacing(12)
+        network_form.setVerticalSpacing(4)
+        network_group.setLayout(network_form)
 
+        label_width = 160
+
+        def make_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setMinimumWidth(label_width)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            return lbl
+
+        header_row = QWidget()
+        header_layout = QHBoxLayout(header_row)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(12)
         self.external_ip_lbl = QLabel("External IP: fetching...")
-        info_layout.addWidget(self.external_ip_lbl)
+        header_layout.addWidget(self.external_ip_lbl)
 
         self.connectivity_lbl = QLabel("Internet: checking...")
         self.connectivity_lbl.setStyleSheet("color: red;")
-        info_layout.addWidget(self.connectivity_lbl)
+        header_layout.addWidget(self.connectivity_lbl)
+        header_layout.addStretch(1)
 
-        info_layout.addStretch(1)
-
-        dhcp_grid = QGridLayout()
-        layout.addLayout(dhcp_grid)
+        network_form.addRow(make_label("External / Internet:"), header_row)
 
         dhcp_labels = [
             ("DHCP Server:", "dhcp_server"),
@@ -766,10 +785,11 @@ class MainWindow(QMainWindow):
 
         self.dhcp_value_labels: Dict[str, QLabel] = {}
         for row, (title, key) in enumerate(dhcp_labels):
-            dhcp_grid.addWidget(QLabel(title), row, 0)
+            label_widget = make_label(title)
             val_lbl = QLabel("")
+            val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             self.dhcp_value_labels[key] = val_lbl
-            dhcp_grid.addWidget(val_lbl, row, 1)
+            network_form.addRow(label_widget, val_lbl)
 
         vendor_status = (
             f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
@@ -799,7 +819,7 @@ class MainWindow(QMainWindow):
         self.fetch_external_ip()
         self.connectivity_check_running = False
         self.connectivity_timer = QTimer(self)
-        self.connectivity_timer.setInterval(8000)
+        self.connectivity_timer.setInterval(5000)
         self.connectivity_timer.timeout.connect(self.check_connectivity)
         self.connectivity_timer.start()
         self.on_interface_changed(self.if_combo.currentIndex())
@@ -848,14 +868,47 @@ class MainWindow(QMainWindow):
         self.connectivity_check_running = True
 
         def worker():
-            online = False
             try:
-                requests.get("https://www.msftconnecttest.com/connecttest.txt", timeout=2)
-                online = True
-            except Exception:
+                def socket_reachable(host: str, port: int, timeout: float) -> bool:
+                    try:
+                        with socket.create_connection((host, port), timeout=timeout):
+                            return True
+                    except Exception:
+                        return False
+
                 online = False
 
-            self.internetStatusChanged.emit(online)
+                for target in [("1.1.1.1", 443), ("8.8.8.8", 53)]:
+                    if socket_reachable(target[0], target[1], 0.8):
+                        online = True
+                        break
+
+                if not online:
+                    for url in [
+                        "https://www.msftconnecttest.com/connecttest.txt",
+                        "https://www.google.com/generate_204",
+                    ]:
+                        try:
+                            resp = requests.get(url, timeout=1.5, allow_redirects=False)
+                            if resp.status_code in (200, 204):
+                                online = True
+                                break
+                        except Exception:
+                            continue
+
+                now = time.time()
+                should_emit = (
+                    self.last_connectivity_state is None
+                    or online != self.last_connectivity_state
+                    or (now - self.last_connectivity_ts) > 15
+                )
+
+                if should_emit:
+                    self.last_connectivity_state = online
+                    self.last_connectivity_ts = now
+                    self.internetStatusChanged.emit(online)
+            finally:
+                self.connectivity_check_running = False
 
         threading.Thread(target=worker, daemon=True).start()
 
