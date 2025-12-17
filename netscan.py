@@ -18,11 +18,12 @@ import requests
 from ping3 import ping
 
 try:
-    from scapy.all import ARP, Ether, conf, sniff, srp  # type: ignore
-    from scapy.layers.inet import IP  # type: ignore
+    from scapy.all import ARP, Ether, Dot1Q, conf, sniff, srp  # type: ignore
+    from scapy.layers.dns import DNS  # type: ignore
+    from scapy.layers.inet import IP, UDP  # type: ignore
     SCAPY_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency at runtime
-    ARP = Ether = conf = sniff = srp = IP = None  # type: ignore
+    ARP = Ether = conf = sniff = srp = IP = UDP = DNS = Dot1Q = None  # type: ignore
     SCAPY_AVAILABLE = False
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
@@ -476,7 +477,146 @@ def fetch_upnp_friendly_name(location_url: str, timeout_s: float = 1.5) -> Optio
         # Keep it short-ish
         return " / ".join(parts[:3])
     except Exception:
-        return None
+            return None
+
+
+# -----------------------------
+# Passive Layer 2 / AV helpers
+# -----------------------------
+def parse_lldp_tlvs(raw: bytes) -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    idx = 0
+    length = len(raw)
+    while idx + 2 <= length:
+        t = (raw[idx] >> 1) & 0x7F
+        l = ((raw[idx] & 0x01) << 8) | raw[idx + 1]
+        idx += 2
+        if l <= 0 or idx + l > length:
+            break
+        val = raw[idx:idx + l]
+        idx += l
+        if t == 0:  # End of LLDPDU
+            break
+        if t == 1 and l >= 2:  # Chassis ID
+            info["chassis_id"] = val[1:].decode("utf-8", errors="ignore")
+        elif t == 2 and l >= 2:  # Port ID
+            info["port_id"] = val[1:].decode("utf-8", errors="ignore")
+        elif t == 4:  # Port description
+            info["port_description"] = val.decode("utf-8", errors="ignore")
+        elif t == 5:  # System name
+            info["system_name"] = val.decode("utf-8", errors="ignore")
+        elif t == 8 and l >= 1:  # Management address
+            info["management_address"] = val[1:].decode("utf-8", errors="ignore")
+    return info
+
+
+def summarize_multicast_evidence(packets: List) -> Tuple[Dict[str, str], List[str]]:
+    summary: Dict[str, str] = {
+        "multicast": "Unknown",
+        "igmp": "Unknown",
+        "igmp_querier": "Unknown",
+        "ptp": "Unknown",
+        "dante": "Unknown",
+        "nvx": "Unknown",
+    }
+    evidence: List[str] = []
+
+    if not packets:
+        for k in summary:
+            summary[k] = "Not detected"
+        return summary, evidence
+
+    multicast_count = 0
+    igmp_seen = False
+    ptp_seen = False
+    dante_hint = False
+    nvx_possible = False
+    multicast_streams: Dict[str, int] = {}
+    ptp_count = 0
+
+    for pkt in packets:
+        try:
+            eth = pkt.getlayer(Ether)
+            ip = pkt.getlayer(IP) if IP else None
+            udp = pkt.getlayer(UDP) if UDP else None
+
+            if eth:
+                dst = getattr(eth, "dst", "")
+                if dst.lower().startswith("01:00:5e"):
+                    multicast_count += 1
+                if getattr(eth, "type", None) == 0x88F7:
+                    ptp_seen = True
+                    ptp_count += 1
+
+            if ip:
+                dst_ip = getattr(ip, "dst", "")
+                try:
+                    if dst_ip and ipaddress.IPv4Address(dst_ip).is_multicast:
+                        multicast_count += 1
+                        if udp:
+                            key = f"{dst_ip}:{getattr(udp, 'dport', '')}"
+                            multicast_streams[key] = multicast_streams.get(key, 0) + 1
+                except Exception:
+                    pass
+                if getattr(ip, "proto", None) == 2:
+                    igmp_seen = True
+
+            if udp:
+                dport = getattr(udp, "dport", None)
+                if dport in (319, 320):
+                    ptp_seen = True
+                    ptp_count += 1
+                if dport == 5353 and DNS and pkt.haslayer(DNS):
+                    dns_layer = pkt.getlayer(DNS)
+                    qname = getattr(getattr(dns_layer, "qd", None), "qname", b"") or b""
+                    if any(token in qname.lower() for token in [b"_dante._udp", b"_netaudio-arc._udp"]):
+                        dante_hint = True
+                if ip and dport and ipaddress.IPv4Address(getattr(ip, "dst", "0.0.0.0")).is_multicast:
+                    if multicast_streams.get(f"{ip.dst}:{dport}", 0) > 5:
+                        nvx_possible = True
+        except Exception:
+            continue
+
+    if multicast_count > 0:
+        summary["multicast"] = "Present"
+        evidence.append(f"Observed multicast frames: {multicast_count}")
+    else:
+        summary["multicast"] = "None"
+
+    if igmp_seen:
+        summary["igmp"] = "Seen"
+    else:
+        summary["igmp"] = "Not seen"
+
+    if igmp_seen:
+        summary["igmp_querier"] = "Likely"
+    else:
+        summary["igmp_querier"] = "Not detected"
+
+    if ptp_seen:
+        summary["ptp"] = "Seen"
+        evidence.append(f"Observed PTP packets count: {ptp_count}")
+    else:
+        summary["ptp"] = "Not seen"
+
+    if dante_hint:
+        summary["dante"] = "Likely"
+        evidence.append("Observed mDNS service suggesting Dante (_dante._udp/_netaudio-arc._udp)")
+    else:
+        summary["dante"] = "Not detected"
+
+    if nvx_possible:
+        summary["nvx"] = "Possible"
+        evidence.append("Detected sustained multicast UDP flows (possible AV/video)")
+    else:
+        summary["nvx"] = "Not detected"
+
+    if multicast_streams:
+        top_keys = list(multicast_streams.items())[:5]
+        formatted = ", ".join(f"{k} (count {v})" for k, v in top_keys)
+        evidence.append(f"Observed UDP multicast streams: {formatted}")
+
+    return summary, evidence
 
 
 # -----------------------------
@@ -723,6 +863,95 @@ class DiagnosticsWorker(QThread):
             self.diagRunningChanged.emit(False)
 
 
+class Layer2InfoWorker(QThread):
+    result = Signal(dict)
+
+    def __init__(self, iface_name: Optional[str]):
+        super().__init__()
+        self.iface_name = iface_name
+
+    def run(self):
+        payload = {
+            "lldp": {"status": "Unknown"},
+            "vlans": {"status": "Unknown", "vlans": []},
+        }
+
+        if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
+            self.result.emit(payload)
+            return
+
+        try:
+            packets = sniff(iface=self.iface_name, timeout=3, store=True)
+        except Exception:
+            self.result.emit(payload)
+            return
+
+        lldp_detected = False
+        lldp_details: Dict[str, str] = {}
+        vlan_ids: Set[int] = set()
+
+        for pkt in packets:
+            try:
+                eth = pkt.getlayer(Ether)
+                if eth and getattr(eth, "dst", "").lower() == "01:80:c2:00:00:0e" and getattr(eth, "type", None) == 0x88cc:
+                    lldp_detected = True
+                    raw = bytes(pkt.payload)
+                    parsed = parse_lldp_tlvs(raw)
+                    for k, v in parsed.items():
+                        if v:
+                            lldp_details.setdefault(k, v)
+                if Dot1Q and pkt.haslayer(Dot1Q):
+                    vlan_id = getattr(pkt[Dot1Q], "vlan", None)
+                    if vlan_id is not None:
+                        vlan_ids.add(int(vlan_id))
+            except Exception:
+                continue
+
+        payload["lldp"]["status"] = "Detected" if lldp_detected else "Not detected"
+        payload["lldp"].update(lldp_details)
+
+        if vlan_ids:
+            payload["vlans"]["status"] = "Detected"
+            payload["vlans"]["vlans"] = sorted(vlan_ids)
+        else:
+            payload["vlans"]["status"] = "None detected"
+        self.result.emit(payload)
+
+
+class AVInsightsWorker(QThread):
+    avInsightsUpdated = Signal(dict)
+    avEvidenceLine = Signal(str)
+
+    def __init__(self, iface_name: Optional[str]):
+        super().__init__()
+        self.iface_name = iface_name
+
+    def run(self):
+        payload = {
+            "multicast": "Unknown",
+            "igmp": "Unknown",
+            "igmp_querier": "Unknown",
+            "ptp": "Unknown",
+            "dante": "Unknown",
+            "nvx": "Unknown",
+        }
+
+        if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
+            self.avInsightsUpdated.emit(payload)
+            return
+
+        try:
+            packets = sniff(iface=self.iface_name, timeout=3, store=True)
+        except Exception:
+            self.avInsightsUpdated.emit(payload)
+            return
+
+        summary, evidence = summarize_multicast_evidence(packets)
+        self.avInsightsUpdated.emit(summary)
+        for line in evidence[:30]:
+            self.avEvidenceLine.emit(line)
+
+
 class MainWindow(QMainWindow):
     externalIpChanged = Signal(str)
     internetStatusChanged = Signal(bool)
@@ -742,7 +971,11 @@ class MainWindow(QMainWindow):
         self.last_connectivity_ts: float = 0.0
         self.igmp_check_running = False
         self.env_check_running = False
+        self.l2_check_running = False
+        self.av_check_running = False
         self.diag_worker: Optional[DiagnosticsWorker] = None
+        self.l2_worker: Optional[Layer2InfoWorker] = None
+        self.av_worker: Optional[AVInsightsWorker] = None
 
         self.externalIpChanged.connect(self.set_external_ip)
         self.internetStatusChanged.connect(self.set_connectivity_state)
@@ -756,10 +989,12 @@ class MainWindow(QMainWindow):
         self.network_tab = self.build_network_info_tab()
         self.scan_tab = self.build_scan_tab()
         self.diagnostics_tab = self.build_diagnostics_tab()
+        self.av_tab = self.build_av_tab()
 
         tabs.addTab(self.network_tab, "Network Info")
         tabs.addTab(self.scan_tab, "Scan")
         tabs.addTab(self.diagnostics_tab, "Diagnostics")
+        tabs.addTab(self.av_tab, "AV / Multicast Insights")
 
         self.load_interfaces()
 
@@ -772,6 +1007,7 @@ class MainWindow(QMainWindow):
         self.btn_diag_ping.clicked.connect(self.run_diag_ping)
         self.btn_diag_traceroute.clicked.connect(self.run_diag_traceroute)
         self.btn_diag_stop.clicked.connect(self.stop_diag_worker)
+        self.btn_l2_refresh.clicked.connect(self.run_l2_check)
 
         self.update_npcap_state()
         self.fetch_external_ip()
@@ -876,6 +1112,38 @@ class MainWindow(QMainWindow):
         panels_layout.addWidget(self.env_group, 1)
 
         network_form.addRow(make_label("Status Panels:"), panels_row)
+
+        l2_group = QGroupBox("Layer 2 Info")
+        l2_layout = QFormLayout()
+        l2_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        l2_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        l2_layout.setHorizontalSpacing(10)
+        l2_layout.setVerticalSpacing(4)
+
+        self.lldp_status_lbl = QLabel("LLDP: Unknown")
+        self.lldp_chassis_lbl = QLabel("Chassis ID: -")
+        self.lldp_port_lbl = QLabel("Port ID: -")
+        self.lldp_sysname_lbl = QLabel("System Name: -")
+        self.lldp_portdesc_lbl = QLabel("Port Description: -")
+        self.lldp_mgmt_lbl = QLabel("Management Address: -")
+        self.vlan_lbl = QLabel("VLAN tags observed: Unknown")
+
+        l2_layout.addRow(make_label("LLDP Status:"), self.lldp_status_lbl)
+        l2_layout.addRow(make_label("Chassis ID:"), self.lldp_chassis_lbl)
+        l2_layout.addRow(make_label("Port ID:"), self.lldp_port_lbl)
+        l2_layout.addRow(make_label("System Name:"), self.lldp_sysname_lbl)
+        l2_layout.addRow(make_label("Port Description:"), self.lldp_portdesc_lbl)
+        l2_layout.addRow(make_label("Management Address:"), self.lldp_mgmt_lbl)
+        l2_layout.addRow(make_label("VLANs:"), self.vlan_lbl)
+
+        l2_btn_row = QHBoxLayout()
+        l2_btn_row.addStretch(1)
+        self.btn_l2_refresh = QPushButton("Refresh L2")
+        l2_btn_row.addWidget(self.btn_l2_refresh)
+        l2_layout.addRow(QLabel(""), l2_btn_row)
+
+        l2_group.setLayout(l2_layout)
+        layout.addWidget(l2_group)
         layout.addStretch(1)
         return widget
 
@@ -1040,6 +1308,63 @@ class MainWindow(QMainWindow):
 
         self.diag_status_lbl = QLabel("Idle")
         layout.addWidget(self.diag_status_lbl)
+        return widget
+
+    def build_av_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        header_row = QWidget()
+        header_layout = QHBoxLayout(header_row)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        self.av_iface_lbl = QLabel("Interface: Unknown")
+        header_layout.addWidget(self.av_iface_lbl)
+        header_layout.addStretch(1)
+        self.btn_av_refresh = QPushButton("Refresh")
+        header_layout.addWidget(self.btn_av_refresh)
+        layout.addWidget(header_row)
+
+        insights_group = QGroupBox("Insights")
+        insights_layout = QFormLayout()
+        insights_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        insights_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        insights_layout.setHorizontalSpacing(10)
+        insights_layout.setVerticalSpacing(4)
+
+        self.av_status_labels: Dict[str, QLabel] = {}
+
+        def add_insight_row(title: str, key: str):
+            lbl = QLabel(f"{title}: Unknown")
+            lbl.setStyleSheet("color: orange; font-weight: bold;")
+            self.av_status_labels[key] = lbl
+            insights_layout.addRow(QLabel(title), lbl)
+
+        add_insight_row("Multicast traffic", "multicast")
+        add_insight_row("IGMP activity", "igmp")
+        add_insight_row("IGMP Querier", "igmp_querier")
+        add_insight_row("PTP (IEEE 1588)", "ptp")
+        add_insight_row("Dante", "dante")
+        add_insight_row("NVX / Video Multicast", "nvx")
+
+        insights_group.setLayout(insights_layout)
+        layout.addWidget(insights_group)
+
+        evidence_group = QGroupBox("Evidence")
+        evidence_layout = QVBoxLayout(evidence_group)
+        self.av_evidence = QPlainTextEdit()
+        self.av_evidence.setReadOnly(True)
+        self.av_evidence.setMaximumBlockCount(30)
+        evidence_layout.addWidget(self.av_evidence)
+        evidence_btn_row = QHBoxLayout()
+        evidence_btn_row.addStretch(1)
+        self.btn_av_clear = QPushButton("Clear")
+        evidence_btn_row.addWidget(self.btn_av_clear)
+        evidence_layout.addLayout(evidence_btn_row)
+        layout.addWidget(evidence_group, 1)
+
+        self.btn_av_refresh.clicked.connect(self.refresh_av_insights)
+        self.btn_av_clear.clicked.connect(self.clear_av_evidence)
         return widget
 
     def start_diag_worker(self, command: List[str], pre_status: str):
@@ -1370,6 +1695,103 @@ class MainWindow(QMainWindow):
         finally:
             self.env_check_running = False
 
+    def run_l2_check(self):
+        if self.l2_check_running:
+            return
+        data = self.if_combo.currentData()
+        iface_name = data.get("name") if isinstance(data, dict) else None
+        if not iface_name:
+            self._update_l2_ui({"lldp": {"status": "Unknown"}, "vlans": {"status": "Unknown", "vlans": []}})
+            return
+
+        self.l2_check_running = True
+        self.l2_worker = Layer2InfoWorker(iface_name)
+        self.l2_worker.result.connect(self.apply_l2_result)
+        self.l2_worker.finished.connect(self.on_l2_finished)
+        self.l2_worker.start()
+
+    @Slot(dict)
+    def apply_l2_result(self, payload: dict):
+        self._update_l2_ui(payload)
+
+    def _update_l2_ui(self, payload: dict):
+        lldp = payload.get("lldp", {}) if payload else {}
+        vlans = payload.get("vlans", {}) if payload else {}
+        lldp_status = str(lldp.get("status", "Unknown"))
+        color_map = {"detected": "green", "not detected": "red", "unknown": "orange"}
+        self._style_status(self.lldp_status_lbl, "LLDP", lldp_status, color_map)
+
+        def set_or_dash(lbl: QLabel, value: Optional[str]):
+            lbl.setText(value if value else "-")
+
+        set_or_dash(self.lldp_chassis_lbl, lldp.get("chassis_id"))
+        set_or_dash(self.lldp_port_lbl, lldp.get("port_id"))
+        set_or_dash(self.lldp_sysname_lbl, lldp.get("system_name"))
+        set_or_dash(self.lldp_portdesc_lbl, lldp.get("port_description"))
+        set_or_dash(self.lldp_mgmt_lbl, lldp.get("management_address"))
+
+        vlan_status = str(vlans.get("status", "Unknown"))
+        vlan_ids = vlans.get("vlans") or []
+        if vlan_status.lower() == "detected" and vlan_ids:
+            self.vlan_lbl.setText(f"VLAN tags observed: {', '.join(str(v) for v in vlan_ids)}")
+            self.vlan_lbl.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.vlan_lbl.setText(f"VLAN tags observed: {vlan_status}")
+            self.vlan_lbl.setStyleSheet("color: orange; font-weight: bold;")
+
+    def on_l2_finished(self):
+        self.l2_check_running = False
+
+    def refresh_av_insights(self, auto_trigger: bool = False):
+        if self.av_check_running:
+            return
+        data = self.if_combo.currentData()
+        iface_name = data.get("name") if isinstance(data, dict) else None
+        if not iface_name:
+            self.apply_av_insights({})
+            return
+
+        if not auto_trigger:
+            self.clear_av_evidence()
+
+        self.av_check_running = True
+        self.av_worker = AVInsightsWorker(iface_name)
+        self.av_worker.avInsightsUpdated.connect(self.apply_av_insights)
+        self.av_worker.avEvidenceLine.connect(self.append_av_evidence)
+        self.av_worker.finished.connect(self.on_av_finished)
+        self.av_worker.start()
+
+    @Slot(dict)
+    def apply_av_insights(self, payload: dict):
+        default_status = "Unknown"
+        color_map = {
+            "present": "green",
+            "seen": "green",
+            "likely": "green",
+            "possible": "orange",
+            "not seen": "red",
+            "not detected": "red",
+            "none": "red",
+            "unknown": "orange",
+        }
+        for key, lbl in self.av_status_labels.items():
+            status = str(payload.get(key, default_status)) if payload else default_status
+            styled = f"{status} (best-effort)"
+            color = color_map.get(status.lower(), "orange")
+            lbl.setText(styled)
+            lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    @Slot(str)
+    def append_av_evidence(self, line: str):
+        if line:
+            self.av_evidence.appendPlainText(line)
+
+    def clear_av_evidence(self):
+        self.av_evidence.clear()
+
+    def on_av_finished(self):
+        self.av_check_running = False
+
     def on_interface_changed(self, index: int):
         data = self.if_combo.itemData(index)
         iface_name = data.get("name") if isinstance(data, dict) else None
@@ -1379,6 +1801,9 @@ class MainWindow(QMainWindow):
             lbl.setText(info.get(key, "") or "N/A")
         self.run_igmp_check()
         self.run_env_checks()
+        self.av_iface_lbl.setText(f"Interface: {iface_name or 'Unknown'}")
+        self.refresh_av_insights(auto_trigger=True)
+        self.run_l2_check()
 
 
     def load_interfaces(self):
