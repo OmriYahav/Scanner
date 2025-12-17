@@ -4,9 +4,9 @@ import csv
 import time
 import webbrowser
 import socket
-import asyncio
 import ipaddress
 import threading
+import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
@@ -19,11 +19,11 @@ from scapy.all import ARP, Ether, srp, conf  # type: ignore
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
-    QFileDialog, QCheckBox, QSpinBox, QMessageBox
+    QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGridLayout
 )
 
 
@@ -142,12 +142,39 @@ def safe_gethostbyaddr(ip: str) -> Optional[str]:
         return None
 
 
-def ip_in_cidr(ip: str, cidr: str) -> bool:
+def ip_in_networks(ip: str, networks: List[ipaddress.IPv4Network]) -> bool:
     try:
-        net = ipaddress.IPv4Network(cidr, strict=False)
-        return ipaddress.IPv4Address(ip) in net
+        addr = ipaddress.IPv4Address(ip)
     except Exception:
         return False
+    for net in networks:
+        if addr in net:
+            return True
+    return False
+
+
+def parse_manual_range(text: str) -> List[ipaddress.IPv4Network]:
+    text = text.strip()
+    if not text:
+        return []
+
+    # CIDR
+    if "/" in text:
+        return [ipaddress.IPv4Network(text, strict=False)]
+
+    # Start - End
+    if "-" in text or "–" in text or "—" in text:
+        normalized = text.replace("–", "-").replace("—", "-")
+        parts = [p.strip() for p in normalized.split("-", 1)]
+        if len(parts) != 2:
+            raise ValueError("Invalid range format")
+        start_ip = ipaddress.IPv4Address(parts[0])
+        end_ip = ipaddress.IPv4Address(parts[1])
+        if int(end_ip) < int(start_ip):
+            raise ValueError("Start IP must be before End IP")
+        return list(ipaddress.summarize_address_range(start_ip, end_ip))
+
+    raise ValueError("Unsupported range format")
 
 
 def normalize_description(existing: Optional[str], new: Optional[str]) -> Optional[str]:
@@ -173,6 +200,73 @@ def is_npcap_available() -> bool:
         return False
     except Exception:
         return False
+
+
+def parse_dhcp_info_from_ipconfig(interface_name: str) -> Dict[str, str]:
+    try:
+        output = subprocess.check_output(["ipconfig", "/all"], text=True, errors="ignore")
+    except Exception:
+        return {}
+
+    lines = output.splitlines()
+    capture = False
+    info: Dict[str, str] = {}
+    dns_collect = []
+    i = 0
+    target = interface_name.lower()
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped and not line.startswith(" "):
+            capture = target in stripped.lower()
+        elif capture and stripped:
+            lower = stripped.lower()
+            if lower.startswith("dhcp server"):
+                info["dhcp_server"] = stripped.split(":", 1)[-1].strip()
+            elif lower.startswith("lease obtained"):
+                info["lease_start"] = stripped.split(":", 1)[-1].strip()
+            elif lower.startswith("lease expires"):
+                info["lease_end"] = stripped.split(":", 1)[-1].strip()
+            elif lower.startswith("subnet mask"):
+                info["subnet_mask"] = stripped.split(":", 1)[-1].strip()
+            elif lower.startswith("default gateway"):
+                parts = stripped.split(":", 1)
+                if len(parts) > 1:
+                    info["gateway"] = parts[1].strip()
+                elif i + 1 < len(lines):
+                    info["gateway"] = lines[i + 1].strip()
+            elif lower.startswith("dns servers"):
+                parts = stripped.split(":", 1)
+                if len(parts) > 1 and parts[1].strip():
+                    dns_collect.append(parts[1].strip())
+                j = i + 1
+                while j < len(lines) and lines[j].startswith("   "):
+                    candidate = lines[j].strip()
+                    if candidate:
+                        dns_collect.append(candidate)
+                    j += 1
+            elif lower.startswith("ipv4 address") and "subnet" not in info:
+                if "(" in stripped:
+                    stripped = stripped.split("(", 1)[0]
+                val = stripped.split(":", 1)[-1].strip()
+                info["ip"] = val
+        if capture and stripped and not line.startswith(" ") and target not in stripped.lower():
+            break
+        i += 1
+
+    if dns_collect:
+        info["dns"] = ", ".join(dns_collect)
+    return info
+
+
+def get_dhcp_info(interface_name: Optional[str], iface_data: Optional[dict]) -> Dict[str, str]:
+    if not interface_name:
+        return {}
+
+    info = parse_dhcp_info_from_ipconfig(interface_name)
+    if iface_data:
+        info.setdefault("subnet_mask", iface_data.get("mask", ""))
+    return info
 
 
 # -----------------------------
@@ -384,7 +478,7 @@ class ScanWorker(QThread):
 
     def __init__(
         self,
-        cidr: str,
+        cidrs: List[ipaddress.IPv4Network],
         iface_name: Optional[str],
         do_ping: bool,
         do_mdns: bool,
@@ -393,15 +487,10 @@ class ScanWorker(QThread):
         fetch_upnp_xml: bool,
         mdns_duration_s: int,
         ssdp_timeout_s: int,
-        do_port_scan: bool,
-        port_start: int,
-        port_end: int,
-        port_timeout_ms: int,
-        port_concurrency: int,
         parent=None
     ):
         super().__init__(parent)
-        self.cidr = cidr
+        self.cidrs = cidrs
         self.iface_name = iface_name
         self.do_ping = do_ping
         self.do_mdns = do_mdns
@@ -410,11 +499,6 @@ class ScanWorker(QThread):
         self.fetch_upnp_xml = fetch_upnp_xml
         self.mdns_duration_s = mdns_duration_s
         self.ssdp_timeout_s = ssdp_timeout_s
-        self.do_port_scan = do_port_scan
-        self.port_start = port_start
-        self.port_end = port_end
-        self.port_timeout_ms = port_timeout_ms
-        self.port_concurrency = max(1, port_concurrency)
         self._stop = False
 
     def stop(self):
@@ -428,57 +512,6 @@ class ScanWorker(QThread):
         d.last_seen_ts = time.time()
         return d
 
-    async def _probe_port(self, ip: str, port: int, timeout_s: float) -> bool:
-        if self._stop:
-            return False
-        try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=timeout_s)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return True
-        except asyncio.TimeoutError:
-            return False
-        except (OSError, asyncio.CancelledError):
-            return False
-
-    async def _scan_ports_async(
-        self,
-        ips: List[str],
-        ports: List[int],
-        timeout_s: float,
-        max_concurrency: int,
-    ) -> Dict[str, List[int]]:
-        if not ips or not ports or self._stop:
-            return {}
-
-        sem = asyncio.Semaphore(max_concurrency)
-        open_ports: Dict[str, List[int]] = {ip: [] for ip in ips}
-        total = len(ips) * len(ports)
-        progress = 0
-
-        async def worker(ip: str, port: int):
-            nonlocal progress
-            if self._stop:
-                return
-            async with sem:
-                if self._stop:
-                    return
-                is_open = await self._probe_port(ip, port, timeout_s)
-                if is_open:
-                    open_ports[ip].append(port)
-                progress += 1
-                if progress % 50 == 0:
-                    self.status.emit(f"Port scan progress: {progress}/{total}")
-
-        tasks = [asyncio.create_task(worker(ip, port)) for ip in ips for port in ports]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if self._stop:
-            return {}
-        return {ip: sorted(set(lst)) for ip, lst in open_ports.items() if lst}
-
     def run(self):
         original_iface = conf.iface
         try:
@@ -491,24 +524,24 @@ class ScanWorker(QThread):
 
             # 1) ARP scan
             if npcap_available:
-                self.status.emit(f"Scanning {self.cidr} (ARP)...")
-                net = ipaddress.IPv4Network(self.cidr, strict=False)
-                targets = [str(ip) for ip in net.hosts()]
+                for net in self.cidrs:
+                    self.status.emit(f"Scanning {net} (ARP)...")
+                    targets = [str(ip) for ip in net.hosts()]
 
-                conf.verb = 0
-                pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
+                    conf.verb = 0
+                    pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
 
-                ans, _ = srp(pkt, timeout=2, retry=1)
-                for _, rcv in ans:
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
-                    ip = rcv.psrc
-                    if not ip_in_cidr(ip, self.cidr):
-                        continue
-                    d = self._merge_device(devices, ip)
-                    d.mac = rcv.hwsrc
-                    d.protocols.add("ARP")
+                    ans, _ = srp(pkt, timeout=2, retry=1)
+                    for _, rcv in ans:
+                        if self._stop:
+                            self.status.emit("Scan stopped.")
+                            return
+                        ip = rcv.psrc
+                        if not ip_in_networks(ip, self.cidrs):
+                            continue
+                        d = self._merge_device(devices, ip)
+                        d.mac = rcv.hwsrc
+                        d.protocols.add("ARP")
             else:
                 self.status.emit("ARP disabled (Npcap not available).")
 
@@ -520,7 +553,7 @@ class ScanWorker(QThread):
                     if self._stop:
                         self.status.emit("Scan stopped.")
                         return
-                    if not ip_in_cidr(ip, self.cidr):
+                    if not ip_in_networks(ip, self.cidrs):
                         continue
                     d = self._merge_device(devices, ip)
                     d.protocols.add("SSDP")
@@ -561,7 +594,7 @@ class ScanWorker(QThread):
                     if self._stop:
                         self.status.emit("Scan stopped.")
                         return
-                    if not ip_in_cidr(ip, self.cidr):
+                    if not ip_in_networks(ip, self.cidrs):
                         continue
                     d = self._merge_device(devices, ip)
                     d.protocols.add("mDNS")
@@ -606,37 +639,6 @@ class ScanWorker(QThread):
                     if name:
                         d.hostname = name
                         d.protocols.add("rDNS")
-
-            # 6) TCP port scan
-            if self.do_port_scan and not self._stop:
-                ips = list(devices.keys())
-                ports = list(range(self.port_start, self.port_end + 1))
-                if ips and ports:
-                    self.status.emit(
-                        f"Scanning TCP ports {self.port_start}-{self.port_end} (timeout {self.port_timeout_ms}ms, concurrency {self.port_concurrency})..."
-                    )
-                    try:
-                        open_map = asyncio.run(
-                            self._scan_ports_async(
-                                ips=ips,
-                                ports=ports,
-                                timeout_s=max(0.05, self.port_timeout_ms / 1000.0),
-                                max_concurrency=self.port_concurrency,
-                            )
-                        )
-                        for ip, open_ports in open_map.items():
-                            if self._stop:
-                                self.status.emit("Scan stopped.")
-                                return
-                            d = self._merge_device(devices, ip)
-                            d.protocols.add("TCP")
-                            d.open_tcp_ports.extend(open_ports)
-                            desc = "Open TCP: " + ",".join(str(p) for p in open_ports)
-                            d.description = normalize_description(d.description, desc)
-                    except Exception as e:
-                        self.status.emit(f"Port scan error: {e}")
-                else:
-                    self.status.emit("Port scan skipped (no targets).")
 
             self.result.emit(list(devices.values()))
             self.finished_ok.emit()
@@ -695,6 +697,13 @@ class MainWindow(QMainWindow):
         self.cb_upnp_xml.setChecked(False)
         top.addWidget(self.cb_upnp_xml)
 
+        range_layout = QHBoxLayout()
+        layout.addLayout(range_layout)
+        range_layout.addWidget(QLabel("Custom range (optional):"))
+        self.range_input = QLineEdit()
+        self.range_input.setPlaceholderText("192.168.1.0/24 or 192.168.1.10-192.168.1.50")
+        range_layout.addWidget(self.range_input)
+
         # Timing controls
         timing = QHBoxLayout()
         layout.addLayout(timing)
@@ -711,37 +720,6 @@ class MainWindow(QMainWindow):
         self.sp_ssdp.setValue(3)
         timing.addWidget(self.sp_ssdp)
 
-        # Port scan controls
-        ports = QHBoxLayout()
-        layout.addLayout(ports)
-
-        self.cb_portscan = QCheckBox("TCP port scan")
-        ports.addWidget(self.cb_portscan)
-
-        ports.addWidget(QLabel("From:"))
-        self.sp_port_start = QSpinBox()
-        self.sp_port_start.setRange(1, 65535)
-        self.sp_port_start.setValue(20)
-        ports.addWidget(self.sp_port_start)
-
-        ports.addWidget(QLabel("To:"))
-        self.sp_port_end = QSpinBox()
-        self.sp_port_end.setRange(1, 65535)
-        self.sp_port_end.setValue(1024)
-        ports.addWidget(self.sp_port_end)
-
-        ports.addWidget(QLabel("Timeout (ms):"))
-        self.sp_port_timeout = QSpinBox()
-        self.sp_port_timeout.setRange(50, 10000)
-        self.sp_port_timeout.setValue(300)
-        ports.addWidget(self.sp_port_timeout)
-
-        ports.addWidget(QLabel("Concurrency:"))
-        self.sp_port_concurrency = QSpinBox()
-        self.sp_port_concurrency.setRange(1, 1000)
-        self.sp_port_concurrency.setValue(200)
-        ports.addWidget(self.sp_port_concurrency)
-
         timing.addStretch(1)
 
         self.btn_scan = QPushButton("Start Scan")
@@ -754,6 +732,38 @@ class MainWindow(QMainWindow):
         timing.addWidget(self.btn_stop)
         timing.addWidget(self.btn_export)
         timing.addWidget(self.btn_install_npcap)
+
+        info_layout = QHBoxLayout()
+        layout.addLayout(info_layout)
+
+        self.external_ip_lbl = QLabel("External IP: fetching...")
+        info_layout.addWidget(self.external_ip_lbl)
+
+        self.connectivity_lbl = QLabel("Internet: checking...")
+        self.connectivity_lbl.setStyleSheet("color: red;")
+        info_layout.addWidget(self.connectivity_lbl)
+
+        info_layout.addStretch(1)
+
+        dhcp_grid = QGridLayout()
+        layout.addLayout(dhcp_grid)
+
+        dhcp_labels = [
+            ("DHCP Server:", "dhcp_server"),
+            ("Lease start:", "lease_start"),
+            ("Lease expiration:", "lease_end"),
+            ("Subnet mask:", "subnet_mask"),
+            ("Default gateway:", "gateway"),
+            ("DNS servers:", "dns"),
+            ("Interface:", "interface"),
+        ]
+
+        self.dhcp_value_labels: Dict[str, QLabel] = {}
+        for row, (title, key) in enumerate(dhcp_labels):
+            dhcp_grid.addWidget(QLabel(title), row, 0)
+            val_lbl = QLabel("")
+            self.dhcp_value_labels[key] = val_lbl
+            dhcp_grid.addWidget(val_lbl, row, 1)
 
         vendor_status = (
             f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
@@ -777,10 +787,16 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_scan)
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
-        self.cb_portscan.toggled.connect(self._toggle_port_controls)
+        self.if_combo.currentIndexChanged.connect(self.on_interface_changed)
 
-        self._toggle_port_controls(self.cb_portscan.isChecked())
         self.update_npcap_state()
+        self.fetch_external_ip()
+        self.connectivity_check_running = False
+        self.connectivity_timer = QTimer(self)
+        self.connectivity_timer.setInterval(8000)
+        self.connectivity_timer.timeout.connect(self.check_connectivity)
+        self.connectivity_timer.start()
+        self.on_interface_changed(self.if_combo.currentIndex())
 
     def update_npcap_state(self):
         self.npcap_available = is_npcap_available()
@@ -794,14 +810,56 @@ class MainWindow(QMainWindow):
     def open_npcap_download(self):
         webbrowser.open("https://npcap.com/#download")
 
-    def _toggle_port_controls(self, checked: bool):
-        for w in [
-            self.sp_port_start,
-            self.sp_port_end,
-            self.sp_port_timeout,
-            self.sp_port_concurrency,
-        ]:
-            w.setEnabled(checked)
+    def fetch_external_ip(self):
+        def worker():
+            ip_text = "Unavailable"
+            try:
+                resp = requests.get("https://api.ipify.org", timeout=3)
+                if resp.status_code == 200 and resp.text:
+                    ip_text = resp.text.strip()
+            except Exception:
+                pass
+
+            def update():
+                self.external_ip_lbl.setText(f"External IP: {ip_text or 'Unavailable'}")
+
+            QMetaObject.invokeMethod(self, update, Qt.QueuedConnection)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def set_connectivity_state(self, online: bool):
+        color = "green" if online else "red"
+        text = "Online" if online else "Offline"
+        self.connectivity_lbl.setText(f"Internet: {text}")
+        self.connectivity_lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
+        self.connectivity_check_running = False
+
+    def check_connectivity(self):
+        if self.connectivity_check_running:
+            return
+        self.connectivity_check_running = True
+
+        def worker():
+            online = False
+            try:
+                requests.get("https://www.msftconnecttest.com/connecttest.txt", timeout=2)
+                online = True
+            except Exception:
+                online = False
+
+            QMetaObject.invokeMethod(
+                self, lambda: self.set_connectivity_state(online), Qt.QueuedConnection
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_interface_changed(self, index: int):
+        data = self.if_combo.itemData(index)
+        iface_name = data.get("name") if isinstance(data, dict) else None
+        info = get_dhcp_info(iface_name, data if isinstance(data, dict) else None)
+        info["interface"] = iface_name or "N/A"
+        for key, lbl in self.dhcp_value_labels.items():
+            lbl.setText(info.get(key, "") or "N/A")
 
 
     def load_interfaces(self):
@@ -832,35 +890,28 @@ class MainWindow(QMainWindow):
         if self.cb_upnp_xml.isChecked() and not self.cb_ssdp.isChecked():
             QMessageBox.information(self, "Note", "UPnP XML requires SSDP enabled.")
 
-        cidr = it["cidr"]
+        cidrs: List[ipaddress.IPv4Network] = []
+        range_text = self.range_input.text().strip()
+        if range_text:
+            try:
+                cidrs = parse_manual_range(range_text)
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid range", f"Please enter a valid CIDR or IP range. ({e})")
+                self.btn_scan.setEnabled(True)
+                return
+        else:
+            cidrs = [ipaddress.IPv4Network(it["cidr"], strict=False)]
 
-        port_scan_enabled = self.cb_portscan.isChecked()
-        port_start = int(self.sp_port_start.value())
-        port_end = int(self.sp_port_end.value())
-        port_timeout_ms = int(self.sp_port_timeout.value())
-        port_concurrency = int(self.sp_port_concurrency.value())
-        if port_scan_enabled:
-            if port_start < 1 or port_end > 65535 or port_start > port_end:
-                QMessageBox.warning(self, "Invalid ports", "Please choose a TCP port range between 1 and 65535.")
-                self.btn_scan.setEnabled(True)
-                return
-            if port_concurrency < 1:
-                QMessageBox.warning(self, "Invalid concurrency", "Port scan concurrency must be at least 1.")
-                self.btn_scan.setEnabled(True)
-                return
-            if port_timeout_ms < 10:
-                QMessageBox.warning(self, "Invalid timeout", "Timeout must be at least 10ms.")
-                self.btn_scan.setEnabled(True)
-                return
+        cidr_label = ", ".join(str(n) for n in cidrs)
 
         self.table.setRowCount(0)
         self.devices = []
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.status_lbl.setText(f"Starting scan on {cidr} ...")
+        self.status_lbl.setText(f"Starting scan on {cidr_label} ...")
 
         self.worker = ScanWorker(
-            cidr=cidr,
+            cidrs=cidrs,
             iface_name=it["name"],
             do_ping=self.cb_ping.isChecked(),
             do_mdns=self.cb_mdns.isChecked(),
@@ -869,11 +920,6 @@ class MainWindow(QMainWindow):
             fetch_upnp_xml=(self.cb_ssdp.isChecked() and self.cb_upnp_xml.isChecked()),
             mdns_duration_s=int(self.sp_mdns.value()),
             ssdp_timeout_s=int(self.sp_ssdp.value()),
-            do_port_scan=port_scan_enabled,
-            port_start=port_start,
-            port_end=port_end,
-            port_timeout_ms=port_timeout_ms,
-            port_concurrency=port_concurrency,
         )
         self.worker.status.connect(self.status_lbl.setText)
         self.worker.result.connect(self.on_results)
