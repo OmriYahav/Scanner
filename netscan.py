@@ -811,9 +811,10 @@ class ScanWorker(QThread):
 CARD_RADIUS = 12
 
 
-def set_badge(lbl: QLabel, state: str, text: str):
+def set_badge(lbl: QLabel, state: str, text: str, size: str = "lg"):
     lbl.setObjectName("badge")
     lbl.setProperty("badgeState", state)
+    lbl.setProperty("badgeSize", size)
     lbl.setText(text)
     lbl.setAlignment(Qt.AlignCenter)
     lbl.style().unpolish(lbl)
@@ -827,7 +828,7 @@ class Card(QWidget):
         self.setObjectName("card")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
         self.title_label: Optional[QLabel] = None
         if title:
             self.title_label = QLabel(title)
@@ -835,7 +836,7 @@ class Card(QWidget):
             layout.addWidget(self.title_label)
         self.content_layout = QVBoxLayout()
         self.content_layout.setContentsMargins(0, 0, 0, 0)
-        self.content_layout.setSpacing(10)
+        self.content_layout.setSpacing(12)
         layout.addLayout(self.content_layout)
 
 
@@ -866,6 +867,7 @@ QWidget#card, QGroupBox {{
     background: #FFFFFF;
     border: 1px solid #E5E7EB;
     border-radius: {CARD_RADIUS}px;
+    padding: 2px;
 }}
 
 QGroupBox {{
@@ -911,13 +913,24 @@ QLabel#hintLabel {{
 }}
 
 QLabel#badge {{
-    padding: 4px 10px;
     border-radius: 999px;
-    font-size: 12px;
     font-weight: 700;
     background: #E5E7EB;
     color: #374151;
     min-width: 80px;
+}}
+
+QLabel#badge[badgeSize="lg"] {{
+    padding: 6px 12px;
+    font-size: 12px;
+    min-height: 26px;
+}}
+
+QLabel#badge[badgeSize="sm"] {{
+    padding: 3px 8px;
+    font-size: 11px;
+    min-height: 20px;
+    min-width: 64px;
 }}
 
 QLabel#badge[badgeState="green"] {{
@@ -938,6 +951,11 @@ QLabel#badge[badgeState="yellow"] {{
 QLabel#badge[badgeState="gray"] {{
     background: #E5E7EB;
     color: #374151;
+}}
+
+QLabel#badge[badgeState="blue"] {{
+    background: #DBEAFE;
+    color: #1D4ED8;
 }}
 
 QPushButton {{
@@ -964,6 +982,27 @@ QPushButton#ghostButton {{
     background: transparent;
     color: #2563EB;
     border: 1px solid #E5E7EB;
+}}
+
+QPushButton#secondaryButton {{
+    background: #EEF2FF;
+    color: #1D4ED8;
+    border: 1px solid #C7D2FE;
+}}
+
+QPushButton#secondaryButton:hover {{
+    background: #E0E7FF;
+    border-color: #A5B4FC;
+}}
+
+QPushButton#dangerButton {{
+    background: #EF4444;
+    border: 1px solid #EF4444;
+}}
+
+QPushButton#dangerButton:hover {{
+    background: #DC2626;
+    border-color: #DC2626;
 }}
 
 QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
@@ -1180,6 +1219,7 @@ class MainWindow(QMainWindow):
         self.l2_check_running = False
         self.av_check_running = False
         self.last_network_snapshot: Dict[str, str] = {}
+        self.network_last_updated_ts: Optional[float] = None
         self.diag_worker: Optional[DiagnosticsWorker] = None
         self.l2_worker: Optional[Layer2InfoWorker] = None
         self.av_worker: Optional[AVInsightsWorker] = None
@@ -1234,6 +1274,10 @@ class MainWindow(QMainWindow):
         self.network_monitor_timer.setInterval(4000)
         self.network_monitor_timer.timeout.connect(self.refresh_network_info)
         self.network_monitor_timer.start()
+        self.network_timestamp_timer = QTimer(self)
+        self.network_timestamp_timer.setInterval(1000)
+        self.network_timestamp_timer.timeout.connect(self._update_network_updated_label)
+        self.network_timestamp_timer.start()
         self.on_interface_changed(self.if_combo.currentIndex())
 
     def apply_stylesheet(self):
@@ -1247,23 +1291,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        title = QLabel("Network Overview")
-        title.setObjectName("pageTitle")
-        layout.addWidget(title)
-
-        summary_card = Card("Network Details")
-        summary_layout = summary_card.content_layout
-
         header_row = QHBoxLayout()
         header_row.setSpacing(8)
-        self.external_ip_lbl = QLabel("External IP: fetching...")
-        self.external_ip_lbl.setObjectName("valueLabel")
-        header_row.addWidget(self.external_ip_lbl)
-
-        self.connectivity_lbl = QLabel()
-        set_badge(self.connectivity_lbl, "gray", "Internet: checking...")
-        header_row.addWidget(self.connectivity_lbl)
-        summary_layout.addLayout(header_row)
+        title = QLabel("Network Overview")
+        title.setObjectName("pageTitle")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        self.network_updated_lbl = QLabel("Last updated: -")
+        self.network_updated_lbl.setObjectName("hintLabel")
+        header_row.addWidget(self.network_updated_lbl)
+        layout.addLayout(header_row)
 
         def make_label(text: str) -> QLabel:
             lbl = QLabel(text)
@@ -1277,6 +1314,39 @@ class MainWindow(QMainWindow):
             val.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             return val
 
+        connection_card = Card("Connection")
+        conn_layout = connection_card.content_layout
+        conn_grid = QGridLayout()
+        conn_grid.setHorizontalSpacing(18)
+        conn_grid.setVerticalSpacing(8)
+        conn_grid.setContentsMargins(0, 0, 0, 0)
+
+        self.external_ip_lbl = make_value_label()
+        self.external_ip_lbl.setText("Fetching...")
+        self.client_ip_lbl = make_value_label()
+        self.interface_lbl = make_value_label()
+
+        conn_grid.addWidget(make_label("External IP"), 0, 0)
+        conn_grid.addWidget(self.external_ip_lbl, 0, 1)
+        conn_grid.addWidget(make_label("Client IP"), 1, 0)
+        conn_grid.addWidget(self.client_ip_lbl, 1, 1)
+        conn_grid.addWidget(make_label("Interface"), 2, 0)
+        conn_grid.addWidget(self.interface_lbl, 2, 1)
+        conn_layout.addLayout(conn_grid)
+
+        internet_row = QHBoxLayout()
+        internet_row.setSpacing(8)
+        internet_lbl = QLabel("Internet")
+        internet_lbl.setObjectName("keyLabel")
+        internet_row.addWidget(internet_lbl)
+        self.connectivity_lbl = QLabel()
+        set_badge(self.connectivity_lbl, "gray", "Checking...", size="lg")
+        internet_row.addWidget(self.connectivity_lbl)
+        internet_row.addStretch(1)
+        conn_layout.addLayout(internet_row)
+
+        dhcp_card = Card("DHCP")
+        dhcp_layout = dhcp_card.content_layout
         dhcp_labels = [
             ("DHCP Server", "dhcp_server"),
             ("Lease start", "lease_start"),
@@ -1284,7 +1354,6 @@ class MainWindow(QMainWindow):
             ("Subnet mask", "subnet_mask"),
             ("Default gateway", "gateway"),
             ("DNS servers", "dns"),
-            ("Interface", "interface"),
         ]
 
         grid = QGridLayout()
@@ -1298,10 +1367,12 @@ class MainWindow(QMainWindow):
             self.dhcp_value_labels[key] = val_lbl
             grid.addWidget(label_widget, row, 0)
             grid.addWidget(val_lbl, row, 1)
-        summary_layout.addLayout(grid)
+        dhcp_layout.addLayout(grid)
+
         left_column = QVBoxLayout()
         left_column.setSpacing(12)
-        left_column.addWidget(summary_card)
+        left_column.addWidget(connection_card)
+        left_column.addWidget(dhcp_card)
         left_column.addStretch(1)
 
         right_column = QVBoxLayout()
@@ -1322,7 +1393,7 @@ class MainWindow(QMainWindow):
             key_lbl = QLabel(title_text)
             key_lbl.setObjectName("keyLabel")
             row.addWidget(key_lbl)
-            set_badge(lbl, "gray", "Unknown")
+            set_badge(lbl, "gray", "Unknown", size="sm")
             row.addWidget(lbl)
             row.addStretch(1)
             env_layout.addLayout(row)
@@ -1406,7 +1477,30 @@ class MainWindow(QMainWindow):
         title.setObjectName("pageTitle")
         layout.addWidget(title)
 
-        config_card = Card("Scan Configuration")
+        controls_card = Card("Scan Controls")
+        controls_layout = controls_card.content_layout
+
+        header_bar = QHBoxLayout()
+        header_bar.setSpacing(10)
+        header_label = QLabel("Configure targets and run scans")
+        header_label.setObjectName("sectionTitle")
+        header_bar.addWidget(header_label)
+        header_bar.addStretch(1)
+        self.btn_scan = QPushButton("Start Scan")
+        self.btn_stop = QPushButton("Stop Scan")
+        self.btn_stop.setObjectName("dangerButton")
+        self.btn_export = QPushButton("Export CSV")
+        self.btn_export.setObjectName("secondaryButton")
+        self.btn_install_npcap = QPushButton("Install Npcap")
+        self.btn_install_npcap.setObjectName("ghostButton")
+        self.btn_install_npcap.setVisible(False)
+        self.btn_stop.setEnabled(False)
+        header_bar.addWidget(self.btn_scan)
+        header_bar.addWidget(self.btn_stop)
+        header_bar.addWidget(self.btn_export)
+        header_bar.addWidget(self.btn_install_npcap)
+        controls_layout.addLayout(header_bar)
+
         config_form = QFormLayout()
         config_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         config_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -1466,36 +1560,24 @@ class MainWindow(QMainWindow):
         timing_layout.addStretch(1)
         config_form.addRow(QLabel("Timing:"), timing_row)
 
-        config_card.content_layout.addLayout(config_form)
-        layout.addWidget(config_card)
-
-        actions_card = Card("Actions & Status")
-        actions_layout = QHBoxLayout()
-        actions_layout.setSpacing(10)
-
-        self.btn_scan = QPushButton("Start Scan")
-        self.btn_stop = QPushButton("Stop Scan")
-        self.btn_export = QPushButton("Export CSV")
-        self.btn_install_npcap = QPushButton("Install Npcap")
-        self.btn_install_npcap.setVisible(False)
-        self.btn_stop.setEnabled(False)
-
-        actions_layout.addWidget(self.btn_scan)
-        actions_layout.addWidget(self.btn_stop)
-        actions_layout.addWidget(self.btn_export)
-        actions_layout.addWidget(self.btn_install_npcap)
-        actions_layout.addStretch(1)
+        controls_layout.addLayout(config_form)
 
         vendor_status = (
             f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
             if self.oui_map
             else "Ready. MAC vendor lookup unavailable (oui.csv not loaded)."
         )
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_hint = QLabel("Status")
+        status_hint.setObjectName("keyLabel")
+        status_row.addWidget(status_hint)
         self.status_lbl = QLabel(vendor_status)
         self.status_lbl.setObjectName("valueLabel")
-        actions_layout.addWidget(self.status_lbl)
-        actions_card.content_layout.addLayout(actions_layout)
-        layout.addWidget(actions_card)
+        status_row.addWidget(self.status_lbl)
+        status_row.addStretch(1)
+        controls_layout.addLayout(status_row)
+        layout.addWidget(controls_card)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -1570,6 +1652,26 @@ class MainWindow(QMainWindow):
         self.diag_output.setObjectName("console")
         self.diag_output.setReadOnly(True)
         self.diag_output.setMinimumHeight(250)
+        context_row = QHBoxLayout()
+        context_row.setSpacing(12)
+        tool_label = QLabel("Tool:")
+        tool_label.setObjectName("keyLabel")
+        self.diag_tool_value = QLabel("-")
+        self.diag_tool_value.setObjectName("valueLabel")
+        target_label = QLabel("Target:")
+        target_label.setObjectName("keyLabel")
+        self.diag_target_value = QLabel("-")
+        self.diag_target_value.setObjectName("valueLabel")
+        self.diag_running_badge = QLabel()
+        set_badge(self.diag_running_badge, "gray", "Idle", size="sm")
+        context_row.addWidget(tool_label)
+        context_row.addWidget(self.diag_tool_value)
+        context_row.addSpacing(10)
+        context_row.addWidget(target_label)
+        context_row.addWidget(self.diag_target_value)
+        context_row.addStretch(1)
+        context_row.addWidget(self.diag_running_badge)
+        output_card.content_layout.addLayout(context_row)
         output_card.content_layout.addWidget(self.diag_output)
 
         status_row = QHBoxLayout()
@@ -1608,6 +1710,9 @@ class MainWindow(QMainWindow):
         self.av_status_labels: Dict[str, QLabel] = {}
         grid = QGridLayout()
         grid.setSpacing(12)
+        subtitle = QLabel("Real-time Multicast Indicators")
+        subtitle.setObjectName("sectionTitle")
+        insights_card.content_layout.addWidget(subtitle)
         metrics = [
             ("Multicast Traffic", "multicast"),
             ("IGMP Activity", "igmp"),
@@ -1620,8 +1725,9 @@ class MainWindow(QMainWindow):
             tile = QWidget()
             tile.setObjectName("metricTile")
             tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(8, 8, 8, 8)
-            tile_layout.setSpacing(6)
+            tile_layout.setContentsMargins(12, 12, 12, 12)
+            tile_layout.setSpacing(8)
+            tile.setMinimumHeight(120)
             t_lbl = QLabel(title_text)
             t_lbl.setObjectName("tileTitle")
             badge_lbl = QLabel()
@@ -1629,7 +1735,10 @@ class MainWindow(QMainWindow):
             set_badge(badge_lbl, "gray", "Unknown")
             self.av_status_labels[key] = badge_lbl
             tile_layout.addWidget(t_lbl)
-            tile_layout.addWidget(badge_lbl)
+            badge_row = QHBoxLayout()
+            badge_row.addWidget(badge_lbl)
+            badge_row.addStretch(1)
+            tile_layout.addLayout(badge_row)
             tile_layout.addStretch(1)
             grid.addWidget(tile, idx // 3, idx % 3)
         insights_card.content_layout.addLayout(grid)
@@ -1644,6 +1753,9 @@ class MainWindow(QMainWindow):
         evidence_card.content_layout.addWidget(self.av_evidence)
         evidence_btn_row = QHBoxLayout()
         evidence_btn_row.addStretch(1)
+        self.btn_av_copy = QPushButton("Copy")
+        self.btn_av_copy.setObjectName("secondaryButton")
+        evidence_btn_row.addWidget(self.btn_av_copy)
         self.btn_av_clear = QPushButton("Clear")
         evidence_btn_row.addWidget(self.btn_av_clear)
         evidence_card.content_layout.addLayout(evidence_btn_row)
@@ -1651,10 +1763,15 @@ class MainWindow(QMainWindow):
 
         self.btn_av_refresh.clicked.connect(self.refresh_av_insights)
         self.btn_av_clear.clicked.connect(self.clear_av_evidence)
+        self.btn_av_copy.clicked.connect(self.copy_av_evidence)
         return widget
 
     def update_diag_status(self, text: str, state: str = "gray"):
         set_badge(self.diag_status_lbl, state, text)
+
+    def _set_diag_context(self, tool: str, target: str):
+        self.diag_tool_value.setText(tool or "-")
+        self.diag_target_value.setText(target or "-")
 
     def start_diag_worker(self, command: List[str], pre_status: str):
         if self.diag_worker and self.diag_worker.isRunning():
@@ -1673,6 +1790,7 @@ class MainWindow(QMainWindow):
         if not target:
             self.update_diag_status("Failed: Target required", "red")
             return
+        self._set_diag_context("Ping", target)
         cmd = [
             "ping",
             "-n",
@@ -1688,6 +1806,7 @@ class MainWindow(QMainWindow):
         if not target:
             self.update_diag_status("Failed: Target required", "red")
             return
+        self._set_diag_context("Traceroute", target)
         cmd = [
             "tracert",
             "-h",
@@ -1716,6 +1835,10 @@ class MainWindow(QMainWindow):
         self.btn_diag_ping.setEnabled(not running)
         self.btn_diag_traceroute.setEnabled(not running)
         self.btn_diag_stop.setEnabled(running)
+        if running:
+            set_badge(self.diag_running_badge, "blue", "Running", size="sm")
+        else:
+            set_badge(self.diag_running_badge, "gray", "Idle", size="sm")
 
     def on_diag_finished(self):
         self.diag_worker = None
@@ -1748,13 +1871,13 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def set_external_ip(self, ip: str):
-        self.external_ip_lbl.setText(f"External IP: {ip or 'Unavailable'}")
+        self.external_ip_lbl.setText(ip or "Unavailable")
 
     @Slot(bool)
     def set_connectivity_state(self, online: bool):
         state = "green" if online else "red"
         text = "Online" if online else "Offline"
-        set_badge(self.connectivity_lbl, state, f"Internet: {text}")
+        set_badge(self.connectivity_lbl, state, text, size="lg")
         self.connectivity_check_running = False
 
     def check_connectivity(self):
@@ -1807,9 +1930,9 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _style_status(self, lbl: QLabel, prefix: str, status: str, color_map: Dict[str, str]):
+    def _style_status(self, lbl: QLabel, prefix: str, status: str, color_map: Dict[str, str], badge_size: str = "lg"):
         badge_state = color_map.get(status.lower(), "gray")
-        set_badge(lbl, badge_state, f"{prefix}: {status}")
+        set_badge(lbl, badge_state, f"{prefix}: {status}", size=badge_size)
 
     def _contains_multicast_join(self, text: str) -> bool:
         for token in text.split():
@@ -1979,9 +2102,9 @@ class MainWindow(QMainWindow):
                 "limited/unavailable": "red",
                 "unknown": "yellow",
             }
-            self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic)
-            self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin)
-            self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp)
+            self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic, "sm")
+            self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin, "sm")
+            self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp, "sm")
         finally:
             self.env_check_running = False
 
@@ -2079,6 +2202,9 @@ class MainWindow(QMainWindow):
     def clear_av_evidence(self):
         self.av_evidence.clear()
 
+    def copy_av_evidence(self):
+        QApplication.clipboard().setText(self.av_evidence.toPlainText())
+
     def on_av_finished(self):
         self.av_check_running = False
 
@@ -2135,6 +2261,8 @@ class MainWindow(QMainWindow):
         fallback = "Unavailable" if unavailable else "N/A"
         for key, lbl in self.dhcp_value_labels.items():
             lbl.setText(info.get(key, "") or fallback)
+        self.client_ip_lbl.setText(info.get("ip", "") or fallback)
+        self.interface_lbl.setText(info.get("interface", "") or fallback)
 
     def _set_l2_refreshing_state(self):
         set_badge(self.lldp_status_lbl, "yellow", "LLDP: Refreshing...")
@@ -2149,16 +2277,38 @@ class MainWindow(QMainWindow):
         ]:
             lbl.setText("Refreshing...")
 
+    def _update_network_updated_label(self):
+        if not getattr(self, "network_updated_lbl", None):
+            return
+        if not self.network_last_updated_ts:
+            self.network_updated_lbl.setText("Last updated: -")
+            return
+        diff = int(time.time() - self.network_last_updated_ts)
+        if diff <= 1:
+            text = "Last updated: just now"
+        elif diff < 60:
+            text = f"Last updated: {diff}s ago"
+        else:
+            minutes = diff // 60
+            text = f"Last updated: {minutes}m ago"
+        self.network_updated_lbl.setText(text)
+
     def _set_network_refreshing_state(self):
-        self.external_ip_lbl.setText("External IP: Updating...")
-        set_badge(self.connectivity_lbl, "yellow", "Internet: Checking...")
+        self.external_ip_lbl.setText("Updating...")
+        self.client_ip_lbl.setText("Updating...")
+        self.interface_lbl.setText("Updating...")
+        set_badge(self.connectivity_lbl, "yellow", "Checking...", size="lg")
         for lbl in self.dhcp_value_labels.values():
             lbl.setText("Updating...")
         self._set_l2_refreshing_state()
 
     def _set_network_unavailable_state(self):
-        self.external_ip_lbl.setText("External IP: Unavailable")
-        set_badge(self.connectivity_lbl, "red", "Internet: Offline")
+        self.network_last_updated_ts = None
+        self._update_network_updated_label()
+        self.external_ip_lbl.setText("Unavailable")
+        self.client_ip_lbl.setText("Unavailable")
+        self.interface_lbl.setText("Unavailable")
+        set_badge(self.connectivity_lbl, "red", "Offline", size="lg")
         self._apply_dhcp_info({}, unavailable=True)
         set_badge(self.lldp_status_lbl, "gray", "LLDP: Unavailable")
         set_badge(self.vlan_status_badge, "gray", "VLANs: Unavailable")
@@ -2206,12 +2356,16 @@ class MainWindow(QMainWindow):
         }
 
         if not force and snapshot == self.last_network_snapshot:
+            self.network_last_updated_ts = time.time()
+            self._update_network_updated_label()
             return
 
         self.last_network_snapshot = snapshot
         self._set_network_refreshing_state()
         self._apply_dhcp_info(dhcp_info)
         self.av_iface_lbl.setText(f"Interface: {iface_name}")
+        self.network_last_updated_ts = time.time()
+        self._update_network_updated_label()
 
         self.fetch_external_ip()
         self.check_connectivity()
