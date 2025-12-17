@@ -1,16 +1,19 @@
-"""Adapter around the existing ``netscan.py`` module.
+"""Adapter around the legacy scan engine functions.
 
 This module keeps legacy scanning functionality intact while offering
 lightweight helpers that can be reused by the FastAPI host. Any
-behavioral changes should be implemented here rather than in the legacy
-file to avoid breaking the standalone GUI experience.
+behavioral changes should be implemented here rather than in the shared
+engine module to avoid breaking the standalone experience.
 """
 from __future__ import annotations
 
 import ipaddress
 from typing import Dict, List, Optional
 
-import netscan
+from scanner_host.engine.netscan_core import (
+    get_active_ipv4_interfaces,
+    ping,
+)
 
 
 class NetworkInterfaces:
@@ -18,7 +21,7 @@ class NetworkInterfaces:
 
     @staticmethod
     def active_ipv4() -> List[Dict[str, str]]:
-        return netscan.get_active_ipv4_interfaces()
+        return get_active_ipv4_interfaces()
 
 
 def ping_host(target: str) -> Optional[float]:
@@ -32,7 +35,7 @@ def ping_host(target: str) -> Optional[float]:
     """
 
     try:
-        rtt = netscan.ping(target, timeout=2)
+        rtt = ping(target, timeout=2)
     except Exception:
         return None
     if rtt is None:

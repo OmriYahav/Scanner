@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import Optional
 
 import uvicorn
@@ -60,6 +61,18 @@ class HostRuntime:
         if self._thread:
             self._thread.join(timeout=5)
         self._started = False
+
+    def run(self) -> None:
+        """Start the host and block the current thread until interrupted."""
+
+        self.start()
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            LOGGER.info("Interrupted; shutting down host")
+        finally:
+            self.stop()
 
 
 __all__ = ["HostRuntime"]
