@@ -17,7 +17,13 @@ import psutil
 import requests
 from ping3 import ping
 
-from scapy.all import ARP, Ether, IGMP, conf, sniff, srp  # type: ignore
+try:
+    from scapy.all import ARP, Ether, conf, sniff, srp  # type: ignore
+    from scapy.layers.inet import IP  # type: ignore
+    SCAPY_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency at runtime
+    ARP = Ether = conf = sniff = srp = IP = None  # type: ignore
+    SCAPY_AVAILABLE = False
 
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
@@ -192,6 +198,8 @@ def normalize_description(existing: Optional[str], new: Optional[str]) -> Option
 
 
 def is_npcap_available() -> bool:
+    if not SCAPY_AVAILABLE or conf is None:
+        return False
     try:
         sock = conf.L2socket()
         if sock:
@@ -516,9 +524,9 @@ class ScanWorker(QThread):
         return d
 
     def run(self):
-        original_iface = conf.iface
+        original_iface = conf.iface if conf else None
         try:
-            if self.iface_name:
+            if conf and self.iface_name:
                 conf.iface = self.iface_name
 
             devices: Dict[str, Device] = {}
@@ -526,7 +534,7 @@ class ScanWorker(QThread):
             npcap_available = is_npcap_available()
 
             # 1) ARP scan
-            if npcap_available:
+            if npcap_available and conf and Ether and ARP and srp:
                 for net in self.cidrs:
                     self.status.emit(f"Scanning {net} (ARP)...")
                     targets = [str(ip) for ip in net.hosts()]
@@ -545,6 +553,8 @@ class ScanWorker(QThread):
                         d = self._merge_device(devices, ip)
                         d.mac = rcv.hwsrc
                         d.protocols.add("ARP")
+            elif npcap_available:
+                self.status.emit("ARP disabled (scapy unavailable).")
             else:
                 self.status.emit("ARP disabled (Npcap not available).")
 
@@ -651,7 +661,8 @@ class ScanWorker(QThread):
         except Exception as e:
             self.status.emit(f"Error: {e}")
         finally:
-            conf.iface = original_iface
+            if conf is not None and original_iface is not None:
+                conf.iface = original_iface
 
 
 # -----------------------------
@@ -999,13 +1010,16 @@ class MainWindow(QMainWindow):
         return False
 
     def _passive_igmp_sniff(self, iface_name: Optional[str]) -> Optional[bool]:
-        if not iface_name:
+        if not iface_name or sniff is None or IP is None:
             return None
         try:
             packets = sniff(filter="igmp", iface=iface_name, timeout=2, store=True, count=5)
             for pkt in packets:
-                if pkt.haslayer(IGMP):
-                    return True
+                try:
+                    if pkt.haslayer(IP) and getattr(pkt[IP], "proto", None) == 2:
+                        return True
+                except Exception:
+                    continue
             return False if packets else False
         except Exception:
             return None
