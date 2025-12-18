@@ -877,10 +877,16 @@ class Card(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
         self.title_label: Optional[QLabel] = None
+        self.header_layout: Optional[QHBoxLayout] = None
         if title:
             self.title_label = QLabel(title)
             self.title_label.setObjectName("cardTitle")
-            layout.addWidget(self.title_label)
+            self.header_layout = QHBoxLayout()
+            self.header_layout.setContentsMargins(0, 0, 0, 0)
+            self.header_layout.setSpacing(8)
+            self.header_layout.addWidget(self.title_label)
+            self.header_layout.addStretch(1)
+            layout.addLayout(self.header_layout)
         self.content_layout = QVBoxLayout()
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(12)
@@ -1050,6 +1056,18 @@ QPushButton#dangerButton {{
 QPushButton#dangerButton:hover {{
     background: #DC2626;
     border-color: #DC2626;
+}}
+
+QPushButton#linkButton {{
+    background: transparent;
+    color: #2563EB;
+    border: none;
+    padding: 0px;
+    font-weight: 600;
+}}
+
+QPushButton#linkButton:hover {{
+    text-decoration: underline;
 }}
 
 QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
@@ -1324,11 +1342,13 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_csv)
         self.btn_install_npcap.clicked.connect(self.open_npcap_download)
         self.if_combo.currentIndexChanged.connect(self.on_interface_changed)
+        self.btn_network_refresh.clicked.connect(lambda: self.refresh_network_info(force=True))
         self.btn_env_refresh.clicked.connect(self.run_env_checks)
         self.btn_diag_ping.clicked.connect(self.run_diag_ping)
         self.btn_diag_traceroute.clicked.connect(self.run_diag_traceroute)
         self.btn_diag_stop.clicked.connect(self.stop_diag_worker)
         self.btn_l2_refresh.clicked.connect(self.run_l2_check)
+        self.l2_toggle_btn.clicked.connect(self.toggle_l2_debug)
 
         self.update_npcap_state()
         self.fetch_external_ip()
@@ -1363,10 +1383,10 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(16)
 
         header_row = QHBoxLayout()
-        header_row.setSpacing(8)
+        header_row.setSpacing(10)
         title = QLabel("Network Overview")
         title.setObjectName("pageTitle")
         header_row.addWidget(title)
@@ -1374,25 +1394,39 @@ class MainWindow(QMainWindow):
         self.network_updated_lbl = QLabel("Last updated: -")
         self.network_updated_lbl.setObjectName("hintLabel")
         header_row.addWidget(self.network_updated_lbl)
+        self.btn_network_refresh = QPushButton("Refresh all")
+        header_row.addWidget(self.btn_network_refresh)
         layout.addLayout(header_row)
 
         def make_label(text: str) -> QLabel:
             lbl = QLabel(text)
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setObjectName("keyLabel")
+            lbl.setMinimumWidth(130)
             return lbl
 
         def make_value_label() -> QLabel:
             val = QLabel("-")
             val.setObjectName("valueLabel")
             val.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            val.setWordWrap(True)
             return val
 
         connection_card = Card("Connection")
-        connection_card.setMaximumWidth(620)
         conn_layout = connection_card.content_layout
+        internet_row = QHBoxLayout()
+        internet_row.setSpacing(10)
+        internet_lbl = QLabel("Internet")
+        internet_lbl.setObjectName("keyLabel")
+        internet_row.addWidget(internet_lbl)
+        self.connectivity_lbl = QLabel()
+        set_badge(self.connectivity_lbl, "gray", "Checking...", size="lg")
+        internet_row.addWidget(self.connectivity_lbl)
+        internet_row.addStretch(1)
+        conn_layout.addLayout(internet_row)
+
         conn_grid = QGridLayout()
-        conn_grid.setHorizontalSpacing(18)
+        conn_grid.setHorizontalSpacing(16)
         conn_grid.setVerticalSpacing(8)
         conn_grid.setContentsMargins(0, 0, 0, 0)
 
@@ -1409,19 +1443,7 @@ class MainWindow(QMainWindow):
         conn_grid.addWidget(self.interface_lbl, 2, 1)
         conn_layout.addLayout(conn_grid)
 
-        internet_row = QHBoxLayout()
-        internet_row.setSpacing(8)
-        internet_lbl = QLabel("Internet")
-        internet_lbl.setObjectName("keyLabel")
-        internet_row.addWidget(internet_lbl)
-        self.connectivity_lbl = QLabel()
-        set_badge(self.connectivity_lbl, "gray", "Checking...", size="lg")
-        internet_row.addWidget(self.connectivity_lbl)
-        internet_row.addStretch(1)
-        conn_layout.addLayout(internet_row)
-
         dhcp_card = Card("DHCP")
-        dhcp_card.setMaximumWidth(620)
         dhcp_layout = dhcp_card.content_layout
         dhcp_labels = [
             ("DHCP Server", "dhcp_server"),
@@ -1433,7 +1455,7 @@ class MainWindow(QMainWindow):
         ]
 
         grid = QGridLayout()
-        grid.setHorizontalSpacing(18)
+        grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(8)
         grid.setContentsMargins(0, 0, 0, 0)
         self.dhcp_value_labels: Dict[str, QLabel] = {}
@@ -1446,17 +1468,16 @@ class MainWindow(QMainWindow):
         dhcp_layout.addLayout(grid)
 
         left_column = QVBoxLayout()
-        left_column.setSpacing(12)
+        left_column.setSpacing(14)
         left_column.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         left_column.addWidget(connection_card)
         left_column.addWidget(dhcp_card)
 
         right_column = QVBoxLayout()
-        right_column.setSpacing(12)
+        right_column.setSpacing(14)
         right_column.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
         self.env_group = Card("Environment Status")
-        self.env_group.setMaximumWidth(620)
         env_layout = self.env_group.content_layout
         env_rows = []
         self.npcap_status_lbl = QLabel()
@@ -1478,37 +1499,41 @@ class MainWindow(QMainWindow):
         arp_hint = QLabel("ARP may require Admin and/or Npcap for best results.")
         arp_hint.setObjectName("hintLabel")
         env_layout.addWidget(arp_hint)
-        env_btn_row = QHBoxLayout()
-        env_btn_row.addStretch(1)
-        self.btn_env_refresh = QPushButton("Refresh")
-        env_btn_row.addWidget(self.btn_env_refresh)
-        env_layout.addLayout(env_btn_row)
+        if self.env_group.header_layout:
+            self.btn_env_refresh = QPushButton("Refresh")
+            self.env_group.header_layout.addWidget(self.btn_env_refresh)
         right_column.addWidget(self.env_group)
 
         self.igmp_group = Card("Multicast / IGMP")
-        self.igmp_group.setMaximumWidth(620)
         igmp_layout = self.igmp_group.content_layout
-        igmp_row = QHBoxLayout()
-        igmp_row.setSpacing(8)
-        igmp_label = QLabel("IGMP Snooping")
-        igmp_label.setObjectName("keyLabel")
-        igmp_row.addWidget(igmp_label)
+        igmp_metrics = [
+            ("IGMP Snooping", "igmp_status_lbl"),
+            ("IGMP Querier", "igmp_querier_lbl"),
+        ]
+
         self.igmp_status_lbl = QLabel()
         self.igmp_status_lbl.setToolTip(
             "Best-effort inference; definitive snooping status requires switch/router access."
         )
-        set_badge(self.igmp_status_lbl, "gray", "Unknown")
-        igmp_row.addWidget(self.igmp_status_lbl)
-        igmp_layout.addLayout(igmp_row)
+        self.igmp_querier_lbl = QLabel()
+        for title_text, attr_name in igmp_metrics:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            label_widget = QLabel(title_text)
+            label_widget.setObjectName("keyLabel")
+            row.addWidget(label_widget)
+            badge_lbl = getattr(self, attr_name)
+            set_badge(badge_lbl, "gray", "Unknown")
+            row.addWidget(badge_lbl)
+            row.addStretch(1)
+            igmp_layout.addLayout(row)
         right_column.addWidget(self.igmp_group)
 
         l2_group = Card("Layer 2 Info")
-        l2_group.setMaximumWidth(620)
-        l2_layout = QFormLayout()
-        l2_layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        l2_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        l2_layout.setHorizontalSpacing(12)
+        l2_layout = QGridLayout()
+        l2_layout.setHorizontalSpacing(16)
         l2_layout.setVerticalSpacing(8)
+        l2_layout.setContentsMargins(0, 0, 0, 0)
 
         self.lldp_status_lbl = QLabel()
         set_badge(self.lldp_status_lbl, "gray", "LLDP: Unknown")
@@ -1521,14 +1546,22 @@ class MainWindow(QMainWindow):
         set_badge(self.vlan_status_badge, "gray", "VLANs: Unknown")
         self.vlan_lbl = make_value_label()
 
-        l2_layout.addRow(make_label("LLDP Status"), self.lldp_status_lbl)
-        l2_layout.addRow(make_label("Chassis ID"), self.lldp_chassis_lbl)
-        l2_layout.addRow(make_label("Port ID"), self.lldp_port_lbl)
-        l2_layout.addRow(make_label("System Name"), self.lldp_sysname_lbl)
-        l2_layout.addRow(make_label("Port Description"), self.lldp_portdesc_lbl)
-        l2_layout.addRow(make_label("Management Address"), self.lldp_mgmt_lbl)
-        l2_layout.addRow(make_label("VLAN Status"), self.vlan_status_badge)
-        l2_layout.addRow(make_label("VLAN Details"), self.vlan_lbl)
+        l2_layout.addWidget(make_label("LLDP Status"), 0, 0)
+        l2_layout.addWidget(self.lldp_status_lbl, 0, 1)
+        l2_layout.addWidget(make_label("Chassis ID"), 1, 0)
+        l2_layout.addWidget(self.lldp_chassis_lbl, 1, 1)
+        l2_layout.addWidget(make_label("Port ID"), 2, 0)
+        l2_layout.addWidget(self.lldp_port_lbl, 2, 1)
+        l2_layout.addWidget(make_label("System Name"), 3, 0)
+        l2_layout.addWidget(self.lldp_sysname_lbl, 3, 1)
+        l2_layout.addWidget(make_label("Port Description"), 4, 0)
+        l2_layout.addWidget(self.lldp_portdesc_lbl, 4, 1)
+        l2_layout.addWidget(make_label("Management Address"), 5, 0)
+        l2_layout.addWidget(self.lldp_mgmt_lbl, 5, 1)
+        l2_layout.addWidget(make_label("VLAN Status"), 6, 0)
+        l2_layout.addWidget(self.vlan_status_badge, 6, 1)
+        l2_layout.addWidget(make_label("VLAN Details"), 7, 0)
+        l2_layout.addWidget(self.vlan_lbl, 7, 1)
 
         self.l2_iface_hint = QLabel("Capture interface: -")
         self.l2_iface_hint.setObjectName("hintLabel")
@@ -1537,24 +1570,36 @@ class MainWindow(QMainWindow):
         self.l2_counts_hint = QLabel("LLDP frames: 0 | VLAN-tagged frames: 0")
         self.l2_counts_hint.setObjectName("hintLabel")
 
-        l2_btn_row = QHBoxLayout()
-        l2_btn_row.addStretch(1)
-        self.btn_l2_refresh = QPushButton("Refresh L2")
-        l2_btn_row.addWidget(self.btn_l2_refresh)
-        l2_layout.addRow(QLabel(""), l2_btn_row)
+        self.l2_debug_container = QWidget()
+        debug_layout = QVBoxLayout(self.l2_debug_container)
+        debug_layout.setContentsMargins(8, 8, 8, 8)
+        debug_layout.setSpacing(6)
+        debug_layout.addWidget(self.l2_iface_hint)
+        debug_layout.addWidget(self.l2_capture_hint)
+        debug_layout.addWidget(self.l2_counts_hint)
+        self.l2_debug_container.setVisible(False)
+
+        toggle_row = QHBoxLayout()
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+        toggle_row.addStretch(1)
+        self.l2_toggle_btn = QPushButton("Show capture details")
+        self.l2_toggle_btn.setObjectName("linkButton")
+        self.l2_toggle_btn.setCursor(Qt.PointingHandCursor)
+        toggle_row.addWidget(self.l2_toggle_btn)
 
         l2_group.content_layout.addLayout(l2_layout)
-        l2_group.content_layout.addWidget(self.l2_iface_hint)
-        l2_group.content_layout.addWidget(self.l2_capture_hint)
-        l2_group.content_layout.addWidget(self.l2_counts_hint)
+        l2_group.content_layout.addLayout(toggle_row)
+        l2_group.content_layout.addWidget(self.l2_debug_container)
+        if l2_group.header_layout:
+            self.btn_l2_refresh = QPushButton("Refresh")
+            l2_group.header_layout.addWidget(self.btn_l2_refresh)
         right_column.addWidget(l2_group)
 
         content_row = QHBoxLayout()
         content_row.setSpacing(24)
         content_row.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        content_row.addLayout(left_column)
-        content_row.addSpacing(24)
-        content_row.addLayout(right_column)
+        content_row.addLayout(left_column, 3)
+        content_row.addLayout(right_column, 2)
         content_row.addStretch(1)
         layout.addLayout(content_row)
         return widget
@@ -2429,6 +2474,11 @@ class MainWindow(QMainWindow):
             self.vlan_lbl,
         ]:
             lbl.setText("Unavailable")
+
+    def toggle_l2_debug(self):
+        visible = not self.l2_debug_container.isVisible()
+        self.l2_debug_container.setVisible(visible)
+        self.l2_toggle_btn.setText("Hide capture details" if visible else "Show capture details")
 
     def refresh_network_info(self, force: bool = False):
         active_ifaces = get_active_ipv4_interfaces()
