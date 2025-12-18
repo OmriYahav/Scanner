@@ -35,7 +35,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
     QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGroupBox,
-    QFormLayout, QTabWidget, QPlainTextEdit, QGridLayout
+    QFormLayout, QTabWidget, QPlainTextEdit, QGridLayout, QScrollArea,
+    QSplitter
 )
 
 
@@ -1381,7 +1382,18 @@ class MainWindow(QMainWindow):
 
     def build_network_info_tab(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        root_layout = QVBoxLayout(widget)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        root_layout.addWidget(scroll_area)
+
+        scroll_content = QWidget()
+        scroll_area.setWidget(scroll_content)
+
+        layout = QVBoxLayout(scroll_content)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(16)
 
@@ -1402,7 +1414,7 @@ class MainWindow(QMainWindow):
             lbl = QLabel(text)
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setObjectName("keyLabel")
-            lbl.setMinimumWidth(130)
+            lbl.setFixedWidth(150)
             return lbl
 
         def make_value_label() -> QLabel:
@@ -1467,13 +1479,17 @@ class MainWindow(QMainWindow):
             grid.addWidget(val_lbl, row, 1)
         dhcp_layout.addLayout(grid)
 
-        left_column = QVBoxLayout()
+        left_column_widget = QWidget()
+        left_column_widget.setMinimumWidth(520)
+        left_column = QVBoxLayout(left_column_widget)
         left_column.setSpacing(14)
         left_column.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         left_column.addWidget(connection_card)
         left_column.addWidget(dhcp_card)
 
-        right_column = QVBoxLayout()
+        right_column_widget = QWidget()
+        right_column_widget.setMinimumWidth(520)
+        right_column = QVBoxLayout(right_column_widget)
         right_column.setSpacing(14)
         right_column.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
@@ -1595,13 +1611,71 @@ class MainWindow(QMainWindow):
             l2_group.header_layout.addWidget(self.btn_l2_refresh)
         right_column.addWidget(l2_group)
 
-        content_row = QHBoxLayout()
-        content_row.setSpacing(24)
-        content_row.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        content_row.addLayout(left_column, 3)
-        content_row.addLayout(right_column, 2)
-        content_row.addStretch(1)
-        layout.addLayout(content_row)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        splitter.addWidget(left_column_widget)
+        splitter.addWidget(right_column_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        single_column_widget = QWidget()
+        single_column_layout = QVBoxLayout(single_column_widget)
+        single_column_layout.setSpacing(14)
+        single_column_layout.setContentsMargins(0, 0, 0, 0)
+        single_column_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        class ResponsiveContainer(QWidget):
+            def __init__(self, outer: "MainWindow"):
+                super().__init__()
+                self.outer = outer
+                self.breakpoint = 1100
+                self.left_cards = [connection_card, dhcp_card]
+                self.right_cards = [self.outer.env_group, self.outer.igmp_group, l2_group]
+                container_layout = QVBoxLayout(self)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(0)
+                container_layout.addWidget(splitter)
+                container_layout.addWidget(single_column_widget)
+                single_column_widget.hide()
+
+            def remove_widget_from_layout(self, layout_obj: QVBoxLayout, widget_obj: QWidget) -> None:
+                for idx in range(layout_obj.count()):
+                    item = layout_obj.itemAt(idx)
+                    if item and item.widget() is widget_obj:
+                        layout_obj.takeAt(idx)
+                        return
+
+            def move_widget_to_layout(self, layout_obj: QVBoxLayout, widget_obj: QWidget) -> None:
+                for maybe_layout in (left_column, right_column, single_column_layout):
+                    self.remove_widget_from_layout(maybe_layout, widget_obj)
+                layout_obj.addWidget(widget_obj)
+
+            def update_mode(self, width: int) -> None:
+                if width < self.breakpoint:
+                    if splitter.isVisible():
+                        splitter.hide()
+                    if not single_column_widget.isVisible():
+                        single_column_widget.show()
+                    for card in self.left_cards + self.right_cards:
+                        self.move_widget_to_layout(single_column_layout, card)
+                else:
+                    if not splitter.isVisible():
+                        splitter.show()
+                    if single_column_widget.isVisible():
+                        single_column_widget.hide()
+                    for card in self.left_cards:
+                        self.move_widget_to_layout(left_column, card)
+                    for card in self.right_cards:
+                        self.move_widget_to_layout(right_column, card)
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                self.update_mode(event.size().width())
+
+        responsive_container = ResponsiveContainer(self)
+        layout.addWidget(responsive_container)
+        responsive_container.update_mode(self.width())
         return widget
 
     def build_scan_tab(self) -> QWidget:
