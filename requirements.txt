@@ -1,0 +1,6 @@
+PySide6
+ping3
+psutil
+requests
+scapy
+zeroconf
