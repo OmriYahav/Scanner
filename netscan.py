@@ -2722,6 +2722,34 @@ class MainWindow(QMainWindow):
                 ])
         self.status_lbl.setText(f"Exported: {path}")
 
+    def closeEvent(self, event):  # type: ignore[override]
+        for timer in [
+            getattr(self, "connectivity_timer", None),
+            getattr(self, "igmp_timer", None),
+            getattr(self, "env_timer", None),
+            getattr(self, "network_monitor_timer", None),
+            getattr(self, "network_timestamp_timer", None),
+        ]:
+            if timer:
+                timer.stop()
+
+        if self.worker:
+            self.worker.stop()
+            if self.worker.isRunning():
+                self.worker.wait(1000)
+
+        if self.diag_worker:
+            self.diag_worker.stop()
+            if self.diag_worker.isRunning():
+                self.diag_worker.wait(1000)
+
+        for thread in [self.l2_worker, self.av_worker]:
+            if thread and thread.isRunning():
+                thread.requestInterruption()
+                thread.wait(1000)
+
+        super().closeEvent(event)
+
 
 def main():
     app = QApplication(sys.argv)
