@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 import ctypes
 import shutil
 import re
+import errno
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
     QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGroupBox,
-    QFormLayout, QTabWidget, QPlainTextEdit, QGridLayout, QScrollArea,
+    QTabWidget, QPlainTextEdit, QGridLayout, QScrollArea,
     QSplitter, QDoubleSpinBox
 )
 
@@ -57,6 +58,9 @@ class Device:
     sources: Set[str] = field(default_factory=set)
     description: Optional[str] = None
     last_seen_ts: float = field(default_factory=time.time)
+    alive: bool = False
+    evidence: Set[str] = field(default_factory=set)
+    last_alive_ts: Optional[float] = None
 
     # extra raw hints
     mdns_names: Set[str] = field(default_factory=set)
@@ -783,6 +787,9 @@ class ScanWorker(QThread):
             device.vendor,
             device.hostname,
             device.rtt_ms,
+            device.alive,
+            tuple(sorted(device.evidence)),
+            device.last_alive_ts,
             tuple(sorted(device.protocols)),
             tuple(sorted(device.sources)),
             device.description,
@@ -801,6 +808,14 @@ class ScanWorker(QThread):
                 self.partial.emit(list(self._partial_buffer))
                 self._partial_buffer.clear()
                 self._last_partial_emit = now
+
+    def _mark_alive(self, device: Device, evidence: str, rtt_ms: Optional[float] = None):
+        device.alive = True
+        device.last_alive_ts = time.time()
+        device.last_seen_ts = device.last_alive_ts
+        if rtt_ms is not None:
+            device.rtt_ms = rtt_ms if device.rtt_ms is None else min(device.rtt_ms, rtt_ms)
+        device.evidence.add(evidence)
 
     def _flush_pending(self, force: bool = False):
         # Maintained for backward compatibility; live updates handled via device_found.
@@ -907,19 +922,13 @@ class ScanWorker(QThread):
             tcp_ips: Set[str] = set()
             done_count = 0
 
-            # Phase 0: Neighbor cache import
+            # Phase 0: Neighbor cache snapshot (used later for enrichment only)
             self.status.emit("Importing neighbor cache...")
-            arp_table = parse_arp_table()
-            for ip, mac in arp_table.items():
-                if not ip_in_networks(ip, self.cidrs):
-                    continue
-                dev = self._merge_device(devices, ip)
-                if is_valid_mac(mac):
-                    dev.mac = mac
-                dev.protocols.add("NeighborCache")
-                dev.sources.add("NeighborCache")
-                self._queue_update(dev)
-            done_count = min(len(devices), total_targets)
+            neighbor_cache = {
+                ip: mac
+                for ip, mac in parse_arp_table().items()
+                if ip_in_networks(ip, self.cidrs)
+            }
             self.progress_update.emit(done_count, total_targets, "Neighbor cache")
 
             # Phase 1: ARP sweep
@@ -960,6 +969,7 @@ class ScanWorker(QThread):
                                     pass
                             d.protocols.add("ARP")
                             d.sources.add("ARP")
+                            self._mark_alive(d, "ARP_REPLY", d.rtt_ms)
                             arp_ips.add(ip)
                             self._queue_update(d)
                         done_count += len(batch)
@@ -1024,10 +1034,9 @@ class ScanWorker(QThread):
                             if res:
                                 ip, rtt = res
                                 d = self._merge_device(devices, ip)
-                                if rtt is not None:
-                                    d.rtt_ms = rtt if d.rtt_ms is None else min(d.rtt_ms, rtt)
                                 d.protocols.add("ICMP")
                                 d.sources.add("ICMP")
+                                self._mark_alive(d, "ICMP_REPLY", rtt)
                                 icmp_ips.add(ip)
                                 self._queue_update(d)
                             done_count += 1
@@ -1048,7 +1057,7 @@ class ScanWorker(QThread):
                 self.status.emit(f"Probing {len(remaining_for_tcp)} hosts (TCP)...")
                 ports = [80, 443, 445, 3389, 22]
 
-                def tcp_probe(ip: str) -> Optional[Tuple[str, Optional[int]]]:
+                def tcp_probe(ip: str) -> Optional[Tuple[str, Optional[int], str]]:
                     if self._should_stop():
                         return None
                     for port in ports:
@@ -1058,9 +1067,11 @@ class ScanWorker(QThread):
                             sock.settimeout(self.tcp_timeout)
                             r = sock.connect_ex((ip, port))
                             sock.close()
-                            if r in (0, 111):
-                                rtt_ms = (time.time() - start) * 1000
-                                return ip, int(rtt_ms)
+                            rtt_ms = (time.time() - start) * 1000
+                            if r == 0:
+                                return ip, int(rtt_ms), "TCP_OK"
+                            if r in (errno.ECONNREFUSED, 111, 10061):
+                                return ip, int(rtt_ms), "TCP_RST"
                         except Exception:
                             continue
                     return None
@@ -1075,12 +1086,11 @@ class ScanWorker(QThread):
                             return
                         res = fut.result()
                         if res:
-                            ip, rtt_ms = res
+                            ip, rtt_ms, evidence = res
                             d = self._merge_device(devices, ip)
-                            if rtt_ms is not None:
-                                d.rtt_ms = rtt_ms if d.rtt_ms is None else min(d.rtt_ms, rtt_ms)
                             d.protocols.add("TCP")
                             d.sources.add("TCP")
+                            self._mark_alive(d, evidence, rtt_ms)
                             tcp_ips.add(ip)
                             self._queue_update(d)
                         done_count += 1
@@ -1109,6 +1119,7 @@ class ScanWorker(QThread):
                     d.ssdp_usn = info.get("usn")
                     d.ssdp_location = info.get("location")
                     d.description = normalize_description(d.description, info.get("server"))
+                    self._mark_alive(d, "SSDP_REPLY")
                     self._queue_update(d)
 
                 if self.fetch_upnp_xml and not self._should_stop():
@@ -1157,6 +1168,7 @@ class ScanWorker(QThread):
                     if not d.hostname and name_set:
                         d.hostname = sorted(name_set)[0]
                     d.description = normalize_description(d.description, ", ".join(sorted(name_set)))
+                    self._mark_alive(d, "MDNS_RESOLVED")
                     self._queue_update(d)
 
                 for ip, svc_set in services.items():
@@ -1166,6 +1178,7 @@ class ScanWorker(QThread):
                     d.protocols.add("mDNS")
                     d.sources.add("mDNS")
                     d.description = normalize_description(d.description, f"Services: {', '.join(sorted(svc_set))}")
+                    self._mark_alive(d, "MDNS_RESOLVED")
                     self._queue_update(d)
                 self._flush_pending(force=True)
 
@@ -1199,6 +1212,17 @@ class ScanWorker(QThread):
                             dev.protocols.add("rDNS")
                             dev.sources.add("rDNS")
                             self._queue_update(dev)
+
+            if neighbor_cache and not self._should_stop():
+                for ip, mac in neighbor_cache.items():
+                    dev = devices.get(ip)
+                    if not dev or not is_valid_mac(mac):
+                        continue
+                    if not dev.mac:
+                        dev.mac = mac
+                    dev.protocols.add("NeighborCache")
+                    dev.sources.add("NeighborCache")
+                    self._queue_update(dev)
 
             self.status.emit(
                 f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
@@ -1257,7 +1281,13 @@ class BackgroundDiscoveryWorker(QThread):
                     rtt = None
                 if rtt is None:
                     continue
-                dev = Device(ip=ip, rtt_ms=rtt * 1000 if isinstance(rtt, (float, int)) else None)
+                dev = Device(
+                    ip=ip,
+                    rtt_ms=rtt * 1000 if isinstance(rtt, (float, int)) else None,
+                    alive=True,
+                    last_alive_ts=time.time(),
+                )
+                dev.evidence.add("ICMP_REPLY")
                 dev.sources.add("Background")
                 dev.protocols.add("ICMP")
                 self.device_found.emit(dev)
@@ -1709,8 +1739,8 @@ class MainWindow(QMainWindow):
     igmpStatusChanged = Signal(dict)
     envStatusChanged = Signal(dict)
 
-    ONLINE_TTL_SEC = 30
-    STALE_TTL_SEC = 120
+    ONLINE_TTL_SEC = 60
+    STALE_TTL_SEC = 180
     OFFLINE_AFTER_SEC = 300
 
     def __init__(self):
@@ -1785,6 +1815,7 @@ class MainWindow(QMainWindow):
         self.l2_toggle_btn.clicked.connect(self.toggle_l2_debug)
         self.cb_continuous.stateChanged.connect(self.on_continuous_changed)
         self.cb_online_only.stateChanged.connect(lambda _: self.flush_pending_updates())
+        self.cb_show_stale.stateChanged.connect(lambda _: self.flush_pending_updates())
 
         self.update_npcap_state()
         self.fetch_external_ip()
@@ -2125,14 +2156,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         controls_card = Card("Scan Controls")
+        controls_card.layout().setContentsMargins(12, 12, 12, 12)
+        controls_card.content_layout.setSpacing(8)
         controls_layout = controls_card.content_layout
 
-        header_bar = QHBoxLayout()
-        header_bar.setSpacing(10)
-        header_label = QLabel("Configure targets and run scans")
-        header_label.setObjectName("sectionTitle")
-        header_bar.addWidget(header_label)
-        header_bar.addStretch(1)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        row1.addWidget(QLabel("Interface"))
+        self.if_combo = QComboBox()
+        self.if_combo.setMinimumWidth(240)
+        row1.addWidget(self.if_combo, 1)
+        row1.addStretch(1)
         self.btn_scan = QPushButton("Start Scan")
         self.btn_stop = QPushButton("Stop Scan")
         self.btn_stop.setObjectName("dangerButton")
@@ -2142,154 +2181,141 @@ class MainWindow(QMainWindow):
         self.btn_install_npcap.setObjectName("ghostButton")
         self.btn_install_npcap.setVisible(False)
         self.btn_stop.setEnabled(False)
-        header_bar.addWidget(self.btn_scan)
-        header_bar.addWidget(self.btn_stop)
-        header_bar.addWidget(self.btn_export)
-        header_bar.addWidget(self.btn_install_npcap)
-        controls_layout.addLayout(header_bar)
+        row1.addWidget(self.btn_install_npcap)
+        row1.addWidget(self.btn_export)
+        row1.addWidget(self.btn_stop)
+        row1.addWidget(self.btn_scan)
+        grid.addLayout(row1, 0, 0)
 
-        config_form = QFormLayout()
-        config_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        config_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        config_form.setHorizontalSpacing(12)
-        config_form.setVerticalSpacing(8)
-
-        self.if_combo = QComboBox()
-        config_form.addRow(QLabel("Interface:"), self.if_combo)
-
-        check_row = QWidget()
-        check_layout = QHBoxLayout(check_row)
-        check_layout.setContentsMargins(0, 0, 0, 0)
-        check_layout.setSpacing(10)
-
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
         self.cb_ping = QCheckBox("Ping (ICMP)")
         self.cb_ping.setChecked(True)
-        check_layout.addWidget(self.cb_ping)
-
+        row2.addWidget(self.cb_ping)
         self.cb_mdns = QCheckBox("mDNS / Bonjour")
         self.cb_mdns.setChecked(True)
-        check_layout.addWidget(self.cb_mdns)
-
+        row2.addWidget(self.cb_mdns)
         self.cb_ssdp = QCheckBox("UPnP / SSDP")
         self.cb_ssdp.setChecked(True)
-        check_layout.addWidget(self.cb_ssdp)
-
+        row2.addWidget(self.cb_ssdp)
         self.cb_rdns = QCheckBox("Reverse DNS")
         self.cb_rdns.setChecked(False)
-        check_layout.addWidget(self.cb_rdns)
-
-        self.cb_upnp_xml = QCheckBox("Fetch UPnP XML (friendlyName)")
+        row2.addWidget(self.cb_rdns)
+        self.cb_upnp_xml = QCheckBox("Fetch UPnP XML")
         self.cb_upnp_xml.setChecked(False)
-        check_layout.addWidget(self.cb_upnp_xml)
-        self.cb_online_only = QCheckBox("Only show Online")
+        row2.addWidget(self.cb_upnp_xml)
+        row2.addSpacing(12)
+        self.cb_online_only = QCheckBox("Only show confirmed alive")
         self.cb_online_only.setChecked(True)
-        check_layout.addWidget(self.cb_online_only)
-        self.cb_continuous = QCheckBox("Continuous discovery (background)")
+        row2.addWidget(self.cb_online_only)
+        self.cb_show_stale = QCheckBox("Show unknown/offline")
+        self.cb_show_stale.setChecked(True)
+        row2.addWidget(self.cb_show_stale)
+        self.cb_continuous = QCheckBox("Continuous discovery")
         self.cb_continuous.setChecked(False)
-        check_layout.addWidget(self.cb_continuous)
-        check_layout.addStretch(1)
-        config_form.addRow(QLabel("Protocols:"), check_row)
+        row2.addWidget(self.cb_continuous)
+        row2.addStretch(1)
+        grid.addLayout(row2, 1, 0)
 
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        row3.addWidget(QLabel("Range"))
         self.range_input = QLineEdit()
         self.range_input.setPlaceholderText("192.168.1.0/24 or 192.168.1.10-192.168.1.50")
-        config_form.addRow(QLabel("Custom range (optional):"), self.range_input)
+        row3.addWidget(self.range_input, 1)
+        row3.addStretch(1)
+        self.advanced_toggle = QPushButton("Advanced ▾")
+        self.advanced_toggle.setObjectName("ghostButton")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setChecked(False)
+        row3.addWidget(self.advanced_toggle)
+        grid.addLayout(row3, 2, 0)
 
-        timing_row = QWidget()
-        timing_layout = QHBoxLayout(timing_row)
-        timing_layout.setContentsMargins(0, 0, 0, 0)
-        timing_layout.setSpacing(10)
+        controls_layout.addLayout(grid)
 
-        timing_layout.addWidget(QLabel("mDNS seconds:"))
+        advanced_container = QWidget()
+        advanced_container.setVisible(False)
+        advanced_grid = QGridLayout(advanced_container)
+        advanced_grid.setContentsMargins(4, 4, 4, 4)
+        advanced_grid.setHorizontalSpacing(8)
+        advanced_grid.setVerticalSpacing(6)
+
         self.sp_mdns = QSpinBox()
         self.sp_mdns.setRange(2, 20)
         self.sp_mdns.setValue(5)
-        timing_layout.addWidget(self.sp_mdns)
-
-        timing_layout.addWidget(QLabel("SSDP timeout:"))
         self.sp_ssdp = QSpinBox()
         self.sp_ssdp.setRange(1, 10)
         self.sp_ssdp.setValue(3)
-        timing_layout.addWidget(self.sp_ssdp)
-        timing_layout.addStretch(1)
-        config_form.addRow(QLabel("Timing:"), timing_row)
-
-        ttl_group = QGroupBox("Presence TTL (advanced)")
-        ttl_group.setCheckable(True)
-        ttl_group.setChecked(False)
-        ttl_layout = QHBoxLayout(ttl_group)
-        ttl_layout.setContentsMargins(8, 8, 8, 8)
-        ttl_layout.setSpacing(10)
-        ttl_layout.addWidget(QLabel("Online TTL (sec)"))
-        self.sp_online_ttl = QSpinBox()
-        self.sp_online_ttl.setRange(5, 600)
-        self.sp_online_ttl.setValue(self.ONLINE_TTL_SEC)
-        ttl_layout.addWidget(self.sp_online_ttl)
-        ttl_layout.addWidget(QLabel("Stale TTL (sec)"))
-        self.sp_stale_ttl = QSpinBox()
-        self.sp_stale_ttl.setRange(10, 1200)
-        self.sp_stale_ttl.setValue(self.STALE_TTL_SEC)
-        ttl_layout.addWidget(self.sp_stale_ttl)
-        ttl_layout.addWidget(QLabel("Offline after (sec)"))
-        self.sp_offline_ttl = QSpinBox()
-        self.sp_offline_ttl.setRange(30, 3600)
-        self.sp_offline_ttl.setValue(self.OFFLINE_AFTER_SEC)
-        ttl_layout.addWidget(self.sp_offline_ttl)
-        ttl_layout.addStretch(1)
-        config_form.addRow(QLabel("Presence smoothing:"), ttl_group)
-
-        advanced_row = QWidget()
-        advanced_layout = QGridLayout(advanced_row)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
-        advanced_layout.setHorizontalSpacing(10)
-        advanced_layout.setVerticalSpacing(6)
 
         self.sp_arp_timeout = QDoubleSpinBox()
-        self.sp_arp_timeout.setDecimals(1)
         self.sp_arp_timeout.setRange(0.2, 5.0)
+        self.sp_arp_timeout.setValue(0.6)
         self.sp_arp_timeout.setSingleStep(0.1)
-        self.sp_arp_timeout.setValue(1.5)
-
         self.sp_arp_retries = QSpinBox()
-        self.sp_arp_retries.setRange(0, 3)
+        self.sp_arp_retries.setRange(0, 5)
         self.sp_arp_retries.setValue(1)
 
         self.sp_icmp_timeout = QDoubleSpinBox()
-        self.sp_icmp_timeout.setDecimals(1)
         self.sp_icmp_timeout.setRange(0.2, 5.0)
-        self.sp_icmp_timeout.setSingleStep(0.1)
         self.sp_icmp_timeout.setValue(1.0)
-
+        self.sp_icmp_timeout.setSingleStep(0.1)
         self.sp_icmp_retries = QSpinBox()
-        self.sp_icmp_retries.setRange(0, 3)
+        self.sp_icmp_retries.setRange(0, 4)
         self.sp_icmp_retries.setValue(1)
 
         self.sp_tcp_timeout = QDoubleSpinBox()
-        self.sp_tcp_timeout.setDecimals(1)
-        self.sp_tcp_timeout.setRange(0.1, 2.0)
+        self.sp_tcp_timeout.setRange(0.1, 5.0)
+        self.sp_tcp_timeout.setValue(0.9)
         self.sp_tcp_timeout.setSingleStep(0.1)
-        self.sp_tcp_timeout.setValue(0.35)
 
         self.sp_concurrency = QSpinBox()
-        self.sp_concurrency.setRange(1, 256)
-        self.sp_concurrency.setValue(64)
+        self.sp_concurrency.setRange(1, 512)
+        self.sp_concurrency.setValue(128)
 
-        advanced_layout.addWidget(QLabel("ARP timeout (s)"), 0, 0)
-        advanced_layout.addWidget(self.sp_arp_timeout, 0, 1)
-        advanced_layout.addWidget(QLabel("ARP retries"), 0, 2)
-        advanced_layout.addWidget(self.sp_arp_retries, 0, 3)
-        advanced_layout.addWidget(QLabel("ICMP timeout (s)"), 1, 0)
-        advanced_layout.addWidget(self.sp_icmp_timeout, 1, 1)
-        advanced_layout.addWidget(QLabel("ICMP retries"), 1, 2)
-        advanced_layout.addWidget(self.sp_icmp_retries, 1, 3)
-        advanced_layout.addWidget(QLabel("TCP timeout (s)"), 2, 0)
-        advanced_layout.addWidget(self.sp_tcp_timeout, 2, 1)
-        advanced_layout.addWidget(QLabel("Concurrency"), 2, 2)
-        advanced_layout.addWidget(self.sp_concurrency, 2, 3)
+        self.sp_online_ttl = QSpinBox()
+        self.sp_online_ttl.setRange(5, 600)
+        self.sp_online_ttl.setValue(self.ONLINE_TTL_SEC)
+        self.sp_stale_ttl = QSpinBox()
+        self.sp_stale_ttl.setRange(10, 1800)
+        self.sp_stale_ttl.setValue(self.STALE_TTL_SEC)
+        self.sp_offline_ttl = QSpinBox()
+        self.sp_offline_ttl.setRange(60, 3600)
+        self.sp_offline_ttl.setValue(self.OFFLINE_AFTER_SEC)
 
-        config_form.addRow(QLabel("Performance:"), advanced_row)
+        advanced_grid.addWidget(QLabel("mDNS seconds"), 0, 0)
+        advanced_grid.addWidget(self.sp_mdns, 0, 1)
+        advanced_grid.addWidget(QLabel("SSDP timeout"), 0, 2)
+        advanced_grid.addWidget(self.sp_ssdp, 0, 3)
 
-        controls_layout.addLayout(config_form)
+        advanced_grid.addWidget(QLabel("ARP timeout (s)"), 1, 0)
+        advanced_grid.addWidget(self.sp_arp_timeout, 1, 1)
+        advanced_grid.addWidget(QLabel("ARP retries"), 1, 2)
+        advanced_grid.addWidget(self.sp_arp_retries, 1, 3)
 
+        advanced_grid.addWidget(QLabel("ICMP timeout (s)"), 2, 0)
+        advanced_grid.addWidget(self.sp_icmp_timeout, 2, 1)
+        advanced_grid.addWidget(QLabel("ICMP retries"), 2, 2)
+        advanced_grid.addWidget(self.sp_icmp_retries, 2, 3)
+
+        advanced_grid.addWidget(QLabel("TCP timeout (s)"), 3, 0)
+        advanced_grid.addWidget(self.sp_tcp_timeout, 3, 1)
+        advanced_grid.addWidget(QLabel("Concurrency"), 3, 2)
+        advanced_grid.addWidget(self.sp_concurrency, 3, 3)
+
+        advanced_grid.addWidget(QLabel("Online TTL (s)"), 4, 0)
+        advanced_grid.addWidget(self.sp_online_ttl, 4, 1)
+        advanced_grid.addWidget(QLabel("Stale TTL (s)"), 4, 2)
+        advanced_grid.addWidget(self.sp_stale_ttl, 4, 3)
+        advanced_grid.addWidget(QLabel("Offline after (s)"), 5, 0)
+        advanced_grid.addWidget(self.sp_offline_ttl, 5, 1)
+
+        controls_layout.addWidget(advanced_container)
+
+        def toggle_advanced(checked: bool):
+            advanced_container.setVisible(checked)
+            self.advanced_toggle.setText("Advanced ▴" if checked else "Advanced ▾")
+
+        self.advanced_toggle.toggled.connect(toggle_advanced)
         vendor_status = (
             f"Ready. Loaded {len(self.oui_map)} OUI prefixes."
             if self.oui_map
@@ -2340,20 +2366,20 @@ class MainWindow(QMainWindow):
             """
 QTableWidget {
     background-color: #ffffff;
-    color: #000000;
-    gridline-color: #d0d0d0;
+    color: #111827;
+    gridline-color: #cbd5e1;
     font-size: 13px;
 }
-QTableWidget::item { padding: 6px; }
+QTableWidget::item { padding: 6px; color: #111827; }
 QTableWidget::item:selected {
     background-color: #2f6fed;
     color: #ffffff;
 }
 QHeaderView::section {
-    background-color: #f2f2f2;
-    color: #000000;
+    background-color: #E5E7EB;
+    color: #111827;
     padding: 6px;
-    border: 1px solid #d0d0d0;
+    border: 1px solid #cbd5e1;
     font-weight: 600;
 }
 """
@@ -2361,7 +2387,7 @@ QHeaderView::section {
 
         table_card = Card("Scan Results")
         summary_row = QHBoxLayout()
-        self.presence_summary_lbl = QLabel("Online: 0 | Unknown: 0 | Offline: 0 | Total known: 0")
+        self.presence_summary_lbl = QLabel("Alive: 0 | Stale: 0 | Offline: 0 | Total known: 0")
         summary_row.addWidget(self.presence_summary_lbl)
         summary_row.addStretch(1)
         table_card.content_layout.addLayout(summary_row)
@@ -3237,6 +3263,12 @@ QHeaderView::section {
             if incoming.description:
                 target.description = normalize_description(target.description, incoming.description)
             target.mdns_names.update(incoming.mdns_names)
+            target.evidence.update(incoming.evidence)
+            if incoming.alive:
+                target.alive = True
+                target.last_alive_ts = max(target.last_alive_ts or 0, incoming.last_alive_ts or time.time())
+            elif target.last_alive_ts is None:
+                target.last_alive_ts = incoming.last_alive_ts
             if incoming.ssdp_server and not target.ssdp_server:
                 target.ssdp_server = incoming.ssdp_server
             if incoming.ssdp_st and not target.ssdp_st:
@@ -3257,24 +3289,33 @@ QHeaderView::section {
         online_ttl = int(self.sp_online_ttl.value()) if hasattr(self, "sp_online_ttl") else self.ONLINE_TTL_SEC
         stale_ttl = int(self.sp_stale_ttl.value()) if hasattr(self, "sp_stale_ttl") else self.STALE_TTL_SEC
         offline_ttl = int(self.sp_offline_ttl.value()) if hasattr(self, "sp_offline_ttl") else self.OFFLINE_AFTER_SEC
-        delta = now - d.last_seen_ts
-        if delta <= online_ttl:
-            return "Online"
-        if delta <= stale_ttl:
-            return "Unknown"
-        if delta <= offline_ttl:
-            return "Offline"
+        last_alive = d.last_alive_ts
+        if last_alive:
+            delta = now - last_alive
+            if delta <= online_ttl:
+                return "Alive"
+            if delta <= stale_ttl:
+                return "Stale"
+            if delta <= offline_ttl:
+                return "Offline"
         return "Offline"
 
     def _style_presence_item(self, item: QTableWidgetItem, state: str):
         colors = {
-            "online": (Qt.darkGreen, Qt.white),
-            "unknown": (Qt.darkYellow, Qt.black),
+            "alive": (Qt.darkGreen, Qt.white),
+            "stale": (Qt.darkYellow, Qt.black),
             "offline": (Qt.red, Qt.white),
         }
         fg, bg = colors.get(state.lower(), (Qt.black, Qt.white))
         item.setForeground(fg)
         item.setBackground(bg)
+
+    def _should_hide_state(self, state: str) -> bool:
+        if self.cb_online_only.isChecked():
+            return state != "Alive"
+        if not self.cb_show_stale.isChecked() and state != "Alive":
+            return True
+        return False
 
     def _toggle_live_feed(self):
         visible = self.live_feed_toggle.isChecked()
@@ -3359,8 +3400,7 @@ QHeaderView::section {
         self._set_table_item(row, 8, "|".join(sorted(d.protocols)), left_align)
         self._set_table_item(row, 9, d.description or "", left_align)
 
-        hide = self.cb_online_only.isChecked() and presence_state != "Online"
-        self.table.setRowHidden(row, hide)
+        self.table.setRowHidden(row, self._should_hide_state(presence_state))
 
     def _remove_device_row(self, key: str):
         row = self._row_by_key.pop(key, None)
@@ -3378,38 +3418,36 @@ QHeaderView::section {
 
     def flush_pending_updates(self):
         if not self._pending_updates:
+            for dev in self.devices_by_key.values():
+                key = dev.primary_key or dev.ip
+                row = self._row_by_key.get(key)
+                if row is not None:
+                    self.table.setRowHidden(row, self._should_hide_state(self._presence_state(dev)))
             return
         updates = list(self._pending_updates.values())
         self._pending_updates.clear()
         for dev in updates:
             self.upsert_device_row(dev)
         self._update_status_counts()
-        if not updates:
-            for dev in self.devices_by_key.values():
-                key = dev.primary_key or dev.ip
-                row = self._row_by_key.get(key)
-                if row is not None:
-                    hide = self.cb_online_only.isChecked() and self._presence_state(dev) != "Online"
-                    self.table.setRowHidden(row, hide)
 
     def _update_status_counts(self):
-        online = unknown = offline = 0
+        alive = stale = offline = 0
         for dev in self.devices_by_key.values():
             state = self._presence_state(dev)
-            if state == "Online":
-                online += 1
-            elif state == "Unknown":
-                unknown += 1
+            if state == "Alive":
+                alive += 1
+            elif state == "Stale":
+                stale += 1
             else:
                 offline += 1
         total = len(self.devices_by_key)
         self.presence_summary_lbl.setText(
-            f"Online: {online} | Unknown: {unknown} | Offline: {offline} | Total known: {total}"
+            f"Alive: {alive} | Stale: {stale} | Offline: {offline} | Total known: {total}"
         )
         if self.worker and self.worker.isRunning():
-            self.status_lbl.setText(f"Scanning... Found {total} devices (online: {online}).")
+            self.status_lbl.setText(f"Scanning... Found {total} devices (alive: {alive}).")
         else:
-            self.status_lbl.setText(f"Done. Found {total} devices (online: {online}).")
+            self.status_lbl.setText(f"Done. Found {total} devices (alive: {alive}).")
 
     def start_scan(self):
         self.update_npcap_state()
