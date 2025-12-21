@@ -160,6 +160,18 @@ def is_valid_mac(mac: Optional[str]) -> bool:
     return bool(re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", norm))
 
 
+def is_device_online(d: Device) -> bool:
+    if d.rtt_ms is not None:
+        return True
+    if d.protocols and any(p in d.protocols for p in ("ARP", "ICMP", "TCP")):
+        return True
+    if d.sources and any(s in d.sources for s in ("ARP", "ICMP", "TCP")):
+        return True
+    if d.mac and is_valid_mac(d.mac):
+        return True
+    return False
+
+
 def safe_gethostbyaddr(ip: str) -> Optional[str]:
     try:
         name, _, _ = socket.gethostbyaddr(ip)
@@ -706,6 +718,7 @@ class ScanWorker(QThread):
     status = Signal(str)
     finished_ok = Signal()
     batch_update = Signal(list)    # List[Device]
+    device_found = Signal(object)
     progress_update = Signal(int, int, str)
     scan_started = Signal(int, str)
 
@@ -749,8 +762,7 @@ class ScanWorker(QThread):
         self.concurrency = max(1, concurrency)
         self.oui_map = oui_map
         self._stop_event = threading.Event()
-        self.pending_updates: Dict[str, Device] = {}
-        self._last_flush = time.time()
+        self._last_emitted_state: Dict[str, Tuple] = {}
 
     def stop(self):
         self._stop_event.set()
@@ -761,16 +773,27 @@ class ScanWorker(QThread):
     def _queue_update(self, device: Device):
         if device.mac:
             device.vendor = vendor_from_mac(device.mac, self.oui_map)
-        self.pending_updates[device.ip] = device
-        self._flush_pending()
+        state = (
+            device.mac,
+            device.vendor,
+            device.hostname,
+            device.rtt_ms,
+            tuple(sorted(device.protocols)),
+            tuple(sorted(device.sources)),
+            device.description,
+            device.ssdp_server,
+            device.ssdp_st,
+            device.ssdp_usn,
+            device.ssdp_location,
+            tuple(sorted(device.mdns_names)),
+        )
+        if self._last_emitted_state.get(device.ip) != state:
+            self._last_emitted_state[device.ip] = state
+            self.device_found.emit(device)
 
     def _flush_pending(self, force: bool = False):
-        now = time.time()
-        if force or (now - self._last_flush >= 0.1):
-            if self.pending_updates:
-                self.batch_update.emit(list(self.pending_updates.values()))
-                self.pending_updates.clear()
-            self._last_flush = now
+        # Maintained for backward compatibility; live updates handled via device_found.
+        return
 
     def _deep_packet_inspection(self, devices: Dict[str, Device], npcap_available: bool):
         if (
@@ -885,7 +908,6 @@ class ScanWorker(QThread):
                 dev.protocols.add("NeighborCache")
                 dev.sources.add("NeighborCache")
                 self._queue_update(dev)
-            self._flush_pending(force=True)
             done_count = min(len(devices), total_targets)
             self.progress_update.emit(done_count, total_targets, "Neighbor cache")
 
@@ -930,7 +952,10 @@ class ScanWorker(QThread):
                             arp_ips.add(ip)
                             self._queue_update(d)
                         done_count += len(batch)
-                        self._flush_pending()
+                        pct = int((done_count / total_targets) * 100) if total_targets else 0
+                        self.status.emit(
+                            f"ARP sweep progress: {done_count}/{total_targets} ({pct}%)"
+                        )
                         self.progress_update.emit(done_count, total_targets, "ARP sweep")
                 self.status.emit(f"ARP replies: {len(arp_ips)}, Total unique: {len(devices)}")
             elif npcap_available:
@@ -1073,12 +1098,37 @@ class ScanWorker(QThread):
                     d.ssdp_usn = info.get("usn")
                     d.ssdp_location = info.get("location")
                     d.description = normalize_description(d.description, info.get("server"))
-                    if self.fetch_upnp_xml and info.get("location"):
-                        friendly = fetch_upnp_friendly_name(info.get("location"))
-                        if friendly:
-                            d.description = normalize_description(d.description, friendly)
                     self._queue_update(d)
-                self._flush_pending(force=True)
+
+                if self.fetch_upnp_xml and not self._should_stop():
+                    max_workers = 16
+
+                    def fetch_with_ip(ip: str, url: str) -> Optional[Tuple[str, str]]:
+                        if self._should_stop() or not url:
+                            return None
+                        friendly_name = fetch_upnp_friendly_name(url)
+                        if friendly_name:
+                            return ip, friendly_name
+                        return None
+
+                    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                        futures = {
+                            pool.submit(fetch_with_ip, ip, info.get("location"))
+                            for ip, info in ssdp.items()
+                            if info.get("location") and ip_in_networks(ip, self.cidrs)
+                        }
+                        for fut in as_completed(futures):
+                            if self._should_stop():
+                                for pending in futures:
+                                    pending.cancel()
+                                self.status.emit("Scan stopped.")
+                                return
+                            res = fut.result()
+                            if res:
+                                ip, friendly = res
+                                d = self._merge_device(devices, ip)
+                                d.description = normalize_description(d.description, friendly)
+                                self._queue_update(d)
 
             if self.do_mdns and not self._should_stop():
                 self.status.emit("Collecting mDNS / Bonjour advertisements...")
@@ -1123,9 +1173,11 @@ class ScanWorker(QThread):
                     return None
 
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    futures = {pool.submit(rdns_lookup, d.ip): d.ip for d in targets}
+                    futures = [pool.submit(rdns_lookup, d.ip) for d in targets]
                     for fut in as_completed(futures):
                         if self._should_stop():
+                            for pending in futures:
+                                pending.cancel()
                             self.status.emit("Scan stopped.")
                             return
                         res = fut.result()
@@ -1136,7 +1188,6 @@ class ScanWorker(QThread):
                             dev.protocols.add("rDNS")
                             dev.sources.add("rDNS")
                             self._queue_update(dev)
-                self._flush_pending(force=True)
 
             self.status.emit(
                 f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
@@ -1605,7 +1656,11 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
         self.devices_map: Dict[str, Device] = {}
-        self.ip_to_row: Dict[str, int] = {}
+        self._row_by_ip: Dict[str, int] = {}
+        self._pending_updates: Dict[str, Device] = {}
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(200)
+        self._update_timer.timeout.connect(self.flush_pending_updates)
         self.npcap_available = False
         self.last_connectivity_state: Optional[bool] = None
         self.last_connectivity_ts: float = 0.0
@@ -1675,6 +1730,7 @@ class MainWindow(QMainWindow):
         self.network_timestamp_timer.setInterval(1000)
         self.network_timestamp_timer.timeout.connect(self._update_network_updated_label)
         self.network_timestamp_timer.start()
+        self._update_timer.start()
         self.on_interface_changed(self.if_combo.currentIndex())
 
     def apply_stylesheet(self):
@@ -2169,6 +2225,29 @@ class MainWindow(QMainWindow):
         )
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setAlternatingRowColors(False)
+        self.table.setStyleSheet(
+            """
+QTableWidget {
+    background-color: #ffffff;
+    color: #000000;
+    gridline-color: #d0d0d0;
+    font-size: 13px;
+}
+QTableWidget::item { padding: 6px; }
+QTableWidget::item:selected {
+    background-color: #2f6fed;
+    color: #ffffff;
+}
+QHeaderView::section {
+    background-color: #f2f2f2;
+    color: #000000;
+    padding: 6px;
+    border: 1px solid #d0d0d0;
+    font-weight: 600;
+}
+"""
+        )
 
         table_card = Card("Scan Results")
         table_card.content_layout.addWidget(self.table)
@@ -2979,34 +3058,83 @@ class MainWindow(QMainWindow):
         self.refresh_av_insights(auto_trigger=True)
         self.run_l2_check()
 
-    def _set_table_item(self, row: int, col: int, text: str):
+    def _set_table_item(self, row: int, col: int, text: str, align: Qt.AlignmentFlag):
         item = self.table.item(row, col)
         if item is None:
             item = QTableWidgetItem(text)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setTextAlignment(align)
             self.table.setItem(row, col, item)
-        elif item.text() != text:
-            item.setText(text)
+        else:
+            if item.text() != text:
+                item.setText(text)
+            if item.textAlignment() != align:
+                item.setTextAlignment(align)
 
     def upsert_device_row(self, d: Device):
         if d.mac and not d.vendor:
             d.vendor = vendor_from_mac(d.mac, self.oui_map)
 
-        row = self.ip_to_row.get(d.ip)
+        if not is_device_online(d):
+            self._remove_device_row(d.ip)
+            return
+
+        row = self._row_by_ip.get(d.ip)
         if row is None:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.ip_to_row[d.ip] = row
+            self._row_by_ip[d.ip] = row
 
-        self._set_table_item(row, 0, d.ip)
-        self._set_table_item(row, 1, d.mac or "")
-        self._set_table_item(row, 2, d.vendor or "")
-        self._set_table_item(row, 3, d.hostname or "")
-        self._set_table_item(row, 4, "" if d.rtt_ms is None else f"{d.rtt_ms:.2f}")
+        left_align = Qt.AlignLeft | Qt.AlignVCenter
+        right_align = Qt.AlignRight | Qt.AlignVCenter
+
+        self._set_table_item(row, 0, d.ip, left_align)
+        self._set_table_item(row, 1, d.mac or "", left_align)
+        self._set_table_item(row, 2, d.vendor or "", left_align)
+        self._set_table_item(row, 3, d.hostname or "", left_align)
+        self._set_table_item(
+            row,
+            4,
+            "" if d.rtt_ms is None else f"{d.rtt_ms:.2f}",
+            right_align,
+        )
         found_by = d.sources or d.protocols
-        self._set_table_item(row, 5, "|".join(sorted(found_by)))
-        self._set_table_item(row, 6, "|".join(sorted(d.protocols)))
-        self._set_table_item(row, 7, d.description or "")
+        self._set_table_item(row, 5, "|".join(sorted(found_by)), left_align)
+        self._set_table_item(row, 6, "|".join(sorted(d.protocols)), left_align)
+        self._set_table_item(row, 7, d.description or "", left_align)
+
+    def _remove_device_row(self, ip: str):
+        row = self._row_by_ip.pop(ip, None)
+        if row is None:
+            return
+        self.table.removeRow(row)
+        for other_ip, other_row in list(self._row_by_ip.items()):
+            if other_row > row:
+                self._row_by_ip[other_ip] = other_row - 1
+
+    @Slot(object)
+    def on_device_found(self, device: Device):
+        if device.mac and not device.vendor:
+            device.vendor = vendor_from_mac(device.mac, self.oui_map)
+        self.devices_map[device.ip] = device
+        self._pending_updates[device.ip] = device
+
+    def flush_pending_updates(self):
+        if not self._pending_updates:
+            return
+        updates = list(self._pending_updates.values())
+        self._pending_updates.clear()
+        for dev in updates:
+            self.upsert_device_row(dev)
+        self._update_status_counts()
+
+    def _update_status_counts(self):
+        total = len(self.devices_map)
+        online = len(self._row_by_ip)
+        if self.worker and self.worker.isRunning():
+            self.status_lbl.setText(f"Scanning... Found {total} devices (online: {online}).")
+        else:
+            self.status_lbl.setText(f"Done. Found {total} devices (online: {online}).")
 
     def start_scan(self):
         self.update_npcap_state()
@@ -3043,7 +3171,8 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.devices = []
         self.devices_map = {}
-        self.ip_to_row = {}
+        self._row_by_ip = {}
+        self._pending_updates = {}
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.status_lbl.setText(f"Starting scan on {cidr_label} ...")
@@ -3070,10 +3199,11 @@ class MainWindow(QMainWindow):
         )
         self.worker.status.connect(self.status_lbl.setText)
         self.worker.result.connect(self.on_scan_finished)
-        self.worker.batch_update.connect(self.on_scan_batch_update)
+        self.worker.device_found.connect(self.on_device_found)
         self.worker.progress_update.connect(self.on_scan_progress)
         self.worker.scan_started.connect(self.on_scan_started)
         self.worker.finished_ok.connect(self.on_finished)
+        self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
 
     def stop_scan(self):
@@ -3086,7 +3216,11 @@ class MainWindow(QMainWindow):
     def on_finished(self):
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
-        self.status_lbl.setText(f"Done. Found {len(self.devices_map)} devices.")
+        self._update_status_counts()
+
+    def on_worker_finished(self):
+        self.flush_pending_updates()
+        self.table.setSortingEnabled(True)
 
     @Slot(int, str)
     def on_scan_started(self, total: int, cidr_label: str):
@@ -3101,10 +3235,11 @@ class MainWindow(QMainWindow):
     @Slot(int, int, str)
     def on_scan_progress(self, done: int, total: int, phase: str):
         found = len(self.devices_map)
+        online = len(self._row_by_ip)
         pct = int((done / total) * 100) if total else 0
         pct = min(max(pct, 0), 100)
         self.progress_lbl.setText(
-            f"Scanning: {done}/{total} ({pct}%) | Phase: {phase} | Found: {found}"
+            f"Scanning: {done}/{total} ({pct}%) | Phase: {phase} | Found: {found} (online: {online})"
         )
 
     @Slot(list)
@@ -3120,15 +3255,16 @@ class MainWindow(QMainWindow):
             self.devices = list(self.devices_map.values())
 
         # Rebuild table once at end for sorted view
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
-        self.ip_to_row = {}
+        self.flush_pending_updates()
         for d in self.devices:
             self.upsert_device_row(d)
 
         self.table.setSortingEnabled(True)
         self.table.sortItems(0, Qt.AscendingOrder)
-        self.progress_lbl.setText(f"Completed. Found {len(self.devices)} devices.")
+        self.progress_lbl.setText(
+            f"Completed. Found {len(self.devices)} devices (online: {len(self._row_by_ip)})."
+        )
+        self._update_status_counts()
 
     def export_csv(self):
         export_list = self.devices if self.devices else list(self.devices_map.values())
@@ -3171,6 +3307,7 @@ class MainWindow(QMainWindow):
             getattr(self, "env_timer", None),
             getattr(self, "network_monitor_timer", None),
             getattr(self, "network_timestamp_timer", None),
+            getattr(self, "_update_timer", None),
         ]:
             if timer:
                 timer.stop()
