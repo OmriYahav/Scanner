@@ -705,10 +705,14 @@ class ScanWorker(QThread):
     result = Signal(list)          # List[Device]
     status = Signal(str)
     finished_ok = Signal()
+    batch_update = Signal(list)    # List[Device]
+    progress_update = Signal(int, int, str)
+    scan_started = Signal(int, str)
 
     def __init__(
         self,
         cidrs: List[ipaddress.IPv4Network],
+        cidr_label: str,
         iface_name: Optional[str],
         do_ping: bool,
         do_mdns: bool,
@@ -723,10 +727,12 @@ class ScanWorker(QThread):
         icmp_retries: int,
         tcp_timeout: float,
         concurrency: int,
+        oui_map: Dict[str, str],
         parent=None
     ):
         super().__init__(parent)
         self.cidrs = cidrs
+        self.cidr_label = cidr_label
         self.iface_name = iface_name
         self.do_ping = do_ping
         self.do_mdns = do_mdns
@@ -741,14 +747,34 @@ class ScanWorker(QThread):
         self.icmp_retries = max(0, icmp_retries)
         self.tcp_timeout = max(0.1, tcp_timeout)
         self.concurrency = max(1, concurrency)
-        self._stop = False
+        self.oui_map = oui_map
+        self._stop_event = threading.Event()
+        self.pending_updates: Dict[str, Device] = {}
+        self._last_flush = time.time()
 
     def stop(self):
-        self._stop = True
+        self._stop_event.set()
+
+    def _should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+    def _queue_update(self, device: Device):
+        if device.mac:
+            device.vendor = vendor_from_mac(device.mac, self.oui_map)
+        self.pending_updates[device.ip] = device
+        self._flush_pending()
+
+    def _flush_pending(self, force: bool = False):
+        now = time.time()
+        if force or (now - self._last_flush >= 0.1):
+            if self.pending_updates:
+                self.batch_update.emit(list(self.pending_updates.values()))
+                self.pending_updates.clear()
+            self._last_flush = now
 
     def _deep_packet_inspection(self, devices: Dict[str, Device], npcap_available: bool):
         if (
-            self._stop
+            self._should_stop()
             or not npcap_available
             or not self.iface_name
             or not sniff
@@ -806,6 +832,7 @@ class ScanWorker(QThread):
                     dev.protocols.add("DPI")
                     dev.sources.add("DPI")
                     dev.description = normalize_description(dev.description, info)
+                    self._queue_update(dev)
 
         for ip, macs in ip_to_macs.items():
             if len(macs) > 1:
@@ -816,6 +843,7 @@ class ScanWorker(QThread):
                 dev.protocols.add("DPI")
                 dev.sources.add("DPI")
                 dev.description = normalize_description(dev.description, info)
+                self._queue_update(dev)
 
     def _merge_device(self, devices: Dict[str, Device], ip: str) -> Device:
         d = devices.get(ip)
@@ -838,22 +866,41 @@ class ScanWorker(QThread):
             for net in self.cidrs:
                 target_ips.extend(str(ip) for ip in net.hosts())
 
+            total_targets = len(target_ips)
+            self.scan_started.emit(total_targets, self.cidr_label)
             arp_ips: Set[str] = set()
             icmp_ips: Set[str] = set()
             tcp_ips: Set[str] = set()
+            done_count = 0
 
-            # 1) ARP scan (primary)
+            # Phase 0: Neighbor cache import
+            self.status.emit("Importing neighbor cache...")
+            arp_table = parse_arp_table()
+            for ip, mac in arp_table.items():
+                if not ip_in_networks(ip, self.cidrs):
+                    continue
+                dev = self._merge_device(devices, ip)
+                if is_valid_mac(mac):
+                    dev.mac = mac
+                dev.protocols.add("NeighborCache")
+                dev.sources.add("NeighborCache")
+                self._queue_update(dev)
+            self._flush_pending(force=True)
+            done_count = min(len(devices), total_targets)
+            self.progress_update.emit(done_count, total_targets, "Neighbor cache")
+
+            # Phase 1: ARP sweep
             if npcap_available and conf and Ether and ARP and srp:
                 conf.verb = 0
                 for net in self.cidrs:
-                    if self._stop:
+                    if self._should_stop():
                         self.status.emit("Scan stopped.")
                         return
                     self.status.emit(f"Scanning {net} (ARP sweep)...")
                     targets = [str(ip) for ip in net.hosts()]
-                    batch_size = 256
+                    batch_size = 256 if net.prefixlen >= 24 else 512
                     for i in range(0, len(targets), batch_size):
-                        if self._stop:
+                        if self._should_stop():
                             self.status.emit("Scan stopped.")
                             return
                         batch = targets[i:i + batch_size]
@@ -862,7 +909,7 @@ class ScanWorker(QThread):
                             pkt,
                             timeout=self.arp_timeout,
                             retry=self.arp_retries,
-                            inter=0.02,
+                            inter=0.005,
                         )
                         for snd, rcv in ans:
                             ip = getattr(rcv, "psrc", None)
@@ -881,123 +928,141 @@ class ScanWorker(QThread):
                             d.protocols.add("ARP")
                             d.sources.add("ARP")
                             arp_ips.add(ip)
+                            self._queue_update(d)
+                        done_count += len(batch)
+                        self._flush_pending()
+                        self.progress_update.emit(done_count, total_targets, "ARP sweep")
                 self.status.emit(f"ARP replies: {len(arp_ips)}, Total unique: {len(devices)}")
             elif npcap_available:
                 self.status.emit("ARP disabled (scapy unavailable).")
             else:
                 self.status.emit("ARP disabled (Npcap not available).")
 
-            # 1b) ICMP (secondary)
+            # Phase 2: ICMP (conditional)
             remaining_for_icmp = [ip for ip in target_ips if ip not in devices]
-            if self.do_ping and remaining_for_icmp and not self._stop:
-                self.status.emit(f"Pinging {len(remaining_for_icmp)} hosts (ICMP)...")
+            icmp_skipped = False
+            if self.do_ping and remaining_for_icmp and not self._should_stop():
+                if total_targets > 1024 and len(devices) > int(0.15 * total_targets):
+                    icmp_skipped = True
+                    self.status.emit("ICMP skipped (enough hosts found).")
+                    done_count += len(remaining_for_icmp)
+                    self.progress_update.emit(done_count, total_targets, "ICMP skipped")
+                else:
+                    self.status.emit(f"Pinging {len(remaining_for_icmp)} hosts (ICMP)...")
 
-                def icmp_probe(ip: str) -> Optional[Tuple[str, Optional[float]]]:
-                    if self._stop:
-                        return None
-                    rtt_val: Optional[float] = None
-                    try:
-                        for _ in range(self.icmp_retries + 1):
-                            r = ping(ip, timeout=self.icmp_timeout, unit="ms")
-                            if r is not None:
-                                rtt_val = float(r)
-                                return ip, rtt_val
-                    except PermissionError:
-                        pass
-                    except Exception:
-                        pass
-
-                    # Fallback to system ping
-                    try:
-                        if os.name == "nt":
-                            cmd = ["ping", "-n", "1", "-w", str(int(self.icmp_timeout * 1000)), ip]
-                        else:
-                            cmd = ["ping", "-c", "1", "-W", str(int(max(1.0, self.icmp_timeout))), ip]
-                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.icmp_timeout + 1)
-                        if proc.returncode == 0:
-                            return ip, None
-                    except Exception:
-                        return None
-                    return None
-
-                with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-                    futures = {pool.submit(icmp_probe, ip): ip for ip in remaining_for_icmp}
-                    for fut in as_completed(futures):
-                        if self._stop:
-                            break
-                        res = fut.result()
-                        if not res:
-                            continue
-                        ip, rtt_val = res
-                        if not ip_in_networks(ip, self.cidrs):
-                            continue
-                        d = self._merge_device(devices, ip)
-                        if rtt_val is not None:
-                            d.rtt_ms = rtt_val if d.rtt_ms is None else min(d.rtt_ms, rtt_val)
-                        d.protocols.add("ICMP")
-                        d.sources.add("ICMP")
-                        icmp_ips.add(ip)
-                self.status.emit(
-                    f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, Total unique: {len(devices)}"
-                )
-
-            # 1c) TCP quick probe (tertiary)
-            tcp_targets = [ip for ip in target_ips if ip not in devices]
-            probe_ports = [80, 443, 22, 445, 3389, 554, 8080, 8443, 5357]
-            if tcp_targets and not self._stop:
-                self.status.emit(f"Probing {len(tcp_targets)} hosts via TCP (quick)...")
-
-                def tcp_probe(ip: str) -> Optional[str]:
-                    if self._stop:
-                        return None
-                    for port in probe_ports:
+                    def icmp_probe(ip: str) -> Optional[Tuple[str, Optional[float]]]:
+                        if self._should_stop():
+                            return None
+                        rtt_val: Optional[float] = None
                         try:
-                            with socket.create_connection((ip, port), timeout=self.tcp_timeout):
-                                return ip
-                        except ConnectionRefusedError:
-                            return ip  # Fast RST implies host is alive
-                        except socket.timeout:
-                            continue
+                            for _ in range(self.icmp_retries + 1):
+                                r = ping(ip, timeout=self.icmp_timeout, unit="ms")
+                                if r is not None:
+                                    rtt_val = float(r)
+                                    return ip, rtt_val
+                        except PermissionError:
+                            pass
+                        except Exception:
+                            pass
+
+                        try:
+                            if os.name == "nt":
+                                cmd = ["ping", "-n", "1", "-w", str(int(self.icmp_timeout * 1000)), ip]
+                            else:
+                                cmd = ["ping", "-c", "1", "-W", str(int(max(1.0, self.icmp_timeout))), ip]
+                            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.icmp_timeout + 1)
+                            if proc.returncode == 0:
+                                return ip, None
+                        except Exception:
+                            return None
+                        return None
+
+                    last_prog = time.time()
+                    with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+                        futures = {pool.submit(icmp_probe, ip): ip for ip in remaining_for_icmp}
+                        for fut in as_completed(futures):
+                            if self._should_stop():
+                                self.status.emit("Scan stopped.")
+                                return
+                            res = fut.result()
+                            if res:
+                                ip, rtt = res
+                                d = self._merge_device(devices, ip)
+                                if rtt is not None:
+                                    d.rtt_ms = rtt if d.rtt_ms is None else min(d.rtt_ms, rtt)
+                                d.protocols.add("ICMP")
+                                d.sources.add("ICMP")
+                                icmp_ips.add(ip)
+                                self._queue_update(d)
+                            done_count += 1
+                            now = time.time()
+                            if now - last_prog > 0.1:
+                                self.progress_update.emit(done_count, total_targets, "ICMP")
+                                last_prog = now
+                    self.progress_update.emit(done_count, total_targets, "ICMP")
+                    self.status.emit(f"ICMP reachable: {len(icmp_ips)}, Total unique: {len(devices)}")
+            elif self.do_ping and not remaining_for_icmp:
+                self.status.emit("Skipping ICMP: all targets already identified via ARP.")
+            else:
+                icmp_skipped = not self.do_ping
+
+            # Phase 3: TCP quick probe
+            remaining_for_tcp = [ip for ip in target_ips if ip not in devices]
+            if (not self.do_ping or icmp_skipped) and remaining_for_tcp and not self._should_stop():
+                self.status.emit(f"Probing {len(remaining_for_tcp)} hosts (TCP)...")
+                ports = [80, 443, 445, 3389, 22]
+
+                def tcp_probe(ip: str) -> Optional[Tuple[str, Optional[int]]]:
+                    if self._should_stop():
+                        return None
+                    for port in ports:
+                        try:
+                            start = time.time()
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock.settimeout(self.tcp_timeout)
+                            r = sock.connect_ex((ip, port))
+                            sock.close()
+                            if r in (0, 111):
+                                rtt_ms = (time.time() - start) * 1000
+                                return ip, int(rtt_ms)
                         except Exception:
                             continue
                     return None
 
-                with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-                    futures = {pool.submit(tcp_probe, ip): ip for ip in tcp_targets}
+                last_prog = time.time()
+                max_workers = min(128, self.concurrency * 2)
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {pool.submit(tcp_probe, ip): ip for ip in remaining_for_tcp}
                     for fut in as_completed(futures):
-                        if self._stop:
-                            break
-                        ip = fut.result()
-                        if not ip:
-                            continue
-                        if not ip_in_networks(ip, self.cidrs):
-                            continue
-                        d = self._merge_device(devices, ip)
-                        d.protocols.add("TCP")
-                        d.sources.add("TCP")
-                        tcp_ips.add(ip)
-                self.status.emit(
-                    f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
-                )
+                        if self._should_stop():
+                            self.status.emit("Scan stopped.")
+                            return
+                        res = fut.result()
+                        if res:
+                            ip, rtt_ms = res
+                            d = self._merge_device(devices, ip)
+                            if rtt_ms is not None:
+                                d.rtt_ms = rtt_ms if d.rtt_ms is None else min(d.rtt_ms, rtt_ms)
+                            d.protocols.add("TCP")
+                            d.sources.add("TCP")
+                            tcp_ips.add(ip)
+                            self._queue_update(d)
+                        done_count += 1
+                        now = time.time()
+                        if now - last_prog > 0.1:
+                            self.progress_update.emit(done_count, total_targets, "TCP")
+                            last_prog = now
+                self.progress_update.emit(done_count, total_targets, "TCP")
+                self.status.emit(f"TCP responsive: {len(tcp_ips)}, Total unique: {len(devices)}")
 
-            # 1d) OS ARP table enrichment
-            arp_table = parse_arp_table()
-            if arp_table:
-                for ip, mac in arp_table.items():
-                    if ip in devices and not devices[ip].mac and is_valid_mac(mac):
-                        devices[ip].mac = mac
-            self.status.emit(
-                f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
-            )
+            self._flush_pending(force=True)
 
-            # 2) SSDP / UPnP
-            if self.do_ssdp and not self._stop:
-                self.status.emit(f"Discovering UPnP/SSDP (timeout {self.ssdp_timeout_s}s)...")
-                ssdp = ssdp_discover(timeout_s=self.ssdp_timeout_s, mx=2)
+            # Phase 4: Enrichment (for found devices only)
+            if self.do_ssdp and not self._should_stop():
+                self.status.emit("Discovering UPnP / SSDP devices...")
+                self.progress_update.emit(done_count, total_targets, "SSDP")
+                ssdp = ssdp_discover(timeout_s=self.ssdp_timeout_s)
                 for ip, info in ssdp.items():
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
                     if not ip_in_networks(ip, self.cidrs):
                         continue
                     d = self._merge_device(devices, ip)
@@ -1007,90 +1072,71 @@ class ScanWorker(QThread):
                     d.ssdp_st = info.get("st")
                     d.ssdp_usn = info.get("usn")
                     d.ssdp_location = info.get("location")
+                    d.description = normalize_description(d.description, info.get("server"))
+                    if self.fetch_upnp_xml and info.get("location"):
+                        friendly = fetch_upnp_friendly_name(info.get("location"))
+                        if friendly:
+                            d.description = normalize_description(d.description, friendly)
+                    self._queue_update(d)
+                self._flush_pending(force=True)
 
-                    # Basic description from SSDP headers
-                    desc_bits = []
-                    if d.ssdp_st:
-                        desc_bits.append(d.ssdp_st)
-                    if d.ssdp_server:
-                        desc_bits.append(d.ssdp_server)
-                    if desc_bits:
-                        d.description = normalize_description(d.description, "UPnP: " + " | ".join(desc_bits[:2]))
+            if self.do_mdns and not self._should_stop():
+                self.status.emit("Collecting mDNS / Bonjour advertisements...")
+                self.progress_update.emit(done_count, total_targets, "mDNS")
+                mdns = MDNSCollector(duration_s=self.mdns_duration_s)
+                names, services = mdns.run()
 
-                # Optional: Fetch UPnP XML for friendlyName
-                if self.fetch_upnp_xml and not self._stop:
-                    self.status.emit("Fetching UPnP device descriptions (XML)...")
-                    for ip, d in list(devices.items()):
-                        if self._stop:
-                            self.status.emit("Scan stopped.")
-                            return
-                        if not d.ssdp_location:
-                            continue
-                        pretty = fetch_upnp_friendly_name(d.ssdp_location, timeout_s=1.5)
-                        if pretty:
-                            d.description = normalize_description(d.description, pretty)
-
-            # 3) mDNS / Bonjour
-            if self.do_mdns and not self._stop:
-                self.status.emit(f"Discovering mDNS/Bonjour (listening {self.mdns_duration_s}s)...")
-                collector = MDNSCollector(duration_s=self.mdns_duration_s)
-                ip_to_names, ip_to_services = collector.run()
-
-                for ip, names in ip_to_names.items():
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
+                for ip, name_set in names.items():
                     if not ip_in_networks(ip, self.cidrs):
                         continue
                     d = self._merge_device(devices, ip)
                     d.protocols.add("mDNS")
                     d.sources.add("mDNS")
-                    for n in names:
-                        d.mdns_names.add(n)
-                    # Prefer hostname from mDNS if empty
-                    if not d.hostname and d.mdns_names:
-                        # pick a deterministic one
-                        d.hostname = sorted(d.mdns_names)[0]
+                    d.mdns_names.update(name_set)
+                    if not d.hostname and name_set:
+                        d.hostname = sorted(name_set)[0]
+                    d.description = normalize_description(d.description, ", ".join(sorted(name_set)))
+                    self._queue_update(d)
 
-                    # Add services to description
-                    svcs = ip_to_services.get(ip, set())
-                    if svcs:
-                        d.description = normalize_description(d.description, "mDNS: " + ",".join(sorted(svcs)[:6]))
-
-            # 4) Deep packet inspection for conflicting mappings
-            self._deep_packet_inspection(devices, npcap_available)
-
-            # 5) Ping RTT
-            if self.do_ping and not self._stop:
-                self.status.emit("Measuring latency (ICMP ping)...")
-                # Ping known devices first; optional: you can ping all hosts but it's heavy
-                for ip, d in list(devices.items()):
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
-                    try:
-                        r = ping(ip, timeout=1.0, unit="ms")
-                        if r is not None:
-                            d.rtt_ms = float(r)
-                            d.protocols.add("ICMP")
-                            d.sources.add("ICMP")
-                    except Exception:
-                        pass
-
-            # 6) Reverse DNS
-            if self.do_rdns and not self._stop:
-                self.status.emit("Resolving hostnames (Reverse DNS)...")
-                for ip, d in list(devices.items()):
-                    if self._stop:
-                        self.status.emit("Scan stopped.")
-                        return
-                    if d.hostname:
+                for ip, svc_set in services.items():
+                    if not ip_in_networks(ip, self.cidrs):
                         continue
+                    d = self._merge_device(devices, ip)
+                    d.protocols.add("mDNS")
+                    d.sources.add("mDNS")
+                    d.description = normalize_description(d.description, f"Services: {', '.join(sorted(svc_set))}")
+                    self._queue_update(d)
+                self._flush_pending(force=True)
+
+            if self.do_rdns and not self._should_stop():
+                self.status.emit("Resolving hostnames (Reverse DNS)...")
+                self.progress_update.emit(done_count, total_targets, "rDNS")
+                targets = [d for d in devices.values() if not d.hostname]
+                max_workers = min(64, max(4, self.concurrency))
+
+                def rdns_lookup(ip: str) -> Optional[Tuple[str, str]]:
+                    if self._should_stop():
+                        return None
                     name = safe_gethostbyaddr(ip)
                     if name:
-                        d.hostname = name
-                        d.protocols.add("rDNS")
-                        d.sources.add("rDNS")
+                        return ip, name
+                    return None
+
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {pool.submit(rdns_lookup, d.ip): d.ip for d in targets}
+                    for fut in as_completed(futures):
+                        if self._should_stop():
+                            self.status.emit("Scan stopped.")
+                            return
+                        res = fut.result()
+                        if res:
+                            ip, name = res
+                            dev = self._merge_device(devices, ip)
+                            dev.hostname = name
+                            dev.protocols.add("rDNS")
+                            dev.sources.add("rDNS")
+                            self._queue_update(dev)
+                self._flush_pending(force=True)
 
             self.status.emit(
                 f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
@@ -1558,6 +1604,8 @@ class MainWindow(QMainWindow):
         self.oui_map = load_oui_map("oui.csv")
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
+        self.devices_map: Dict[str, Device] = {}
+        self.ip_to_row: Dict[str, int] = {}
         self.npcap_available = False
         self.last_connectivity_state: Optional[bool] = None
         self.last_connectivity_ts: float = 0.0
@@ -2093,6 +2141,17 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.status_lbl)
         status_row.addStretch(1)
         controls_layout.addLayout(status_row)
+
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(8)
+        progress_label = QLabel("Progress")
+        progress_label.setObjectName("keyLabel")
+        progress_row.addWidget(progress_label)
+        self.progress_lbl = QLabel("Idle")
+        self.progress_lbl.setObjectName("valueLabel")
+        progress_row.addWidget(self.progress_lbl)
+        progress_row.addStretch(1)
+        controls_layout.addLayout(progress_row)
         layout.addWidget(controls_card)
 
         self.table = QTableWidget(0, 8)
@@ -2919,6 +2978,36 @@ class MainWindow(QMainWindow):
         self.run_igmp_check()
         self.refresh_av_insights(auto_trigger=True)
         self.run_l2_check()
+
+    def _set_table_item(self, row: int, col: int, text: str):
+        item = self.table.item(row, col)
+        if item is None:
+            item = QTableWidgetItem(text)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, col, item)
+        elif item.text() != text:
+            item.setText(text)
+
+    def upsert_device_row(self, d: Device):
+        if d.mac and not d.vendor:
+            d.vendor = vendor_from_mac(d.mac, self.oui_map)
+
+        row = self.ip_to_row.get(d.ip)
+        if row is None:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.ip_to_row[d.ip] = row
+
+        self._set_table_item(row, 0, d.ip)
+        self._set_table_item(row, 1, d.mac or "")
+        self._set_table_item(row, 2, d.vendor or "")
+        self._set_table_item(row, 3, d.hostname or "")
+        self._set_table_item(row, 4, "" if d.rtt_ms is None else f"{d.rtt_ms:.2f}")
+        found_by = d.sources or d.protocols
+        self._set_table_item(row, 5, "|".join(sorted(found_by)))
+        self._set_table_item(row, 6, "|".join(sorted(d.protocols)))
+        self._set_table_item(row, 7, d.description or "")
+
     def start_scan(self):
         self.update_npcap_state()
         it = self.if_combo.currentData()
@@ -2950,14 +3039,19 @@ class MainWindow(QMainWindow):
 
         cidr_label = ", ".join(str(n) for n in cidrs)
 
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self.devices = []
+        self.devices_map = {}
+        self.ip_to_row = {}
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.status_lbl.setText(f"Starting scan on {cidr_label} ...")
+        self.progress_lbl.setText("Initializing...")
 
         self.worker = ScanWorker(
             cidrs=cidrs,
+            cidr_label=cidr_label,
             iface_name=it["name"],
             do_ping=self.cb_ping.isChecked(),
             do_mdns=self.cb_mdns.isChecked(),
@@ -2972,9 +3066,13 @@ class MainWindow(QMainWindow):
             icmp_retries=int(self.sp_icmp_retries.value()),
             tcp_timeout=float(self.sp_tcp_timeout.value()),
             concurrency=int(self.sp_concurrency.value()),
+            oui_map=self.oui_map,
         )
         self.worker.status.connect(self.status_lbl.setText)
-        self.worker.result.connect(self.on_results)
+        self.worker.result.connect(self.on_scan_finished)
+        self.worker.batch_update.connect(self.on_scan_batch_update)
+        self.worker.progress_update.connect(self.on_scan_progress)
+        self.worker.scan_started.connect(self.on_scan_started)
         self.worker.finished_ok.connect(self.on_finished)
         self.worker.start()
 
@@ -2983,47 +3081,58 @@ class MainWindow(QMainWindow):
             self.worker.stop()
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
+        self.progress_lbl.setText("Stopping...")
 
     def on_finished(self):
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
-        self.status_lbl.setText(f"Done. Found {len(self.devices)} devices.")
+        self.status_lbl.setText(f"Done. Found {len(self.devices_map)} devices.")
 
-    def on_results(self, devices: list):
-        self.devices = devices
+    @Slot(int, str)
+    def on_scan_started(self, total: int, cidr_label: str):
+        self.progress_lbl.setText(f"Scanning {cidr_label} ({total} targets)...")
 
-        # enrich vendor
-        for d in self.devices:
-            d.vendor = vendor_from_mac(d.mac, self.oui_map)
+    @Slot(list)
+    def on_scan_batch_update(self, devices: List[Device]):
+        for d in devices:
+            self.devices_map[d.ip] = d
+            self.upsert_device_row(d)
 
-        # Stable order: by IP
+    @Slot(int, int, str)
+    def on_scan_progress(self, done: int, total: int, phase: str):
+        found = len(self.devices_map)
+        pct = int((done / total) * 100) if total else 0
+        pct = min(max(pct, 0), 100)
+        self.progress_lbl.setText(
+            f"Scanning: {done}/{total} ({pct}%) | Phase: {phase} | Found: {found}"
+        )
+
+    @Slot(list)
+    def on_scan_finished(self, devices: list):
+        for d in devices:
+            if d.mac and not d.vendor:
+                d.vendor = vendor_from_mac(d.mac, self.oui_map)
+            self.devices_map[d.ip] = d
+
         try:
-            self.devices.sort(key=lambda x: ipaddress.IPv4Address(x.ip))
+            self.devices = sorted(self.devices_map.values(), key=lambda x: ipaddress.IPv4Address(x.ip))
         except Exception:
-            pass
+            self.devices = list(self.devices_map.values())
 
+        # Rebuild table once at end for sorted view
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self.devices))
-
-        for row, d in enumerate(self.devices):
-            self.table.setItem(row, 0, QTableWidgetItem(d.ip))
-            self.table.setItem(row, 1, QTableWidgetItem(d.mac or ""))
-            self.table.setItem(row, 2, QTableWidgetItem(d.vendor or ""))
-            self.table.setItem(row, 3, QTableWidgetItem(d.hostname or ""))
-            self.table.setItem(row, 4, QTableWidgetItem("" if d.rtt_ms is None else f"{d.rtt_ms:.2f}"))
-            found_by = d.sources or d.protocols
-            self.table.setItem(row, 5, QTableWidgetItem("|".join(sorted(found_by))))
-            self.table.setItem(row, 6, QTableWidgetItem("|".join(sorted(d.protocols))))
-            self.table.setItem(row, 7, QTableWidgetItem(d.description or ""))
-
-            for col in range(8):
-                item = self.table.item(row, col)
-                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+        self.table.setRowCount(0)
+        self.ip_to_row = {}
+        for d in self.devices:
+            self.upsert_device_row(d)
 
         self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.AscendingOrder)
+        self.progress_lbl.setText(f"Completed. Found {len(self.devices)} devices.")
 
     def export_csv(self):
-        if not self.devices:
+        export_list = self.devices if self.devices else list(self.devices_map.values())
+        if not export_list:
             self.status_lbl.setText("Nothing to export.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "devices.csv", "CSV Files (*.csv)")
@@ -3041,7 +3150,7 @@ class MainWindow(QMainWindow):
                 "Protocols",
                 "Description",
             ])
-            for d in self.devices:
+            for d in export_list:
                 w.writerow([
                     d.ip,
                     d.mac or "",
