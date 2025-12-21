@@ -10,6 +10,8 @@ import subprocess
 import xml.etree.ElementTree as ET
 import ctypes
 import shutil
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
 
@@ -37,7 +39,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
     QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGroupBox,
     QFormLayout, QTabWidget, QPlainTextEdit, QGridLayout, QScrollArea,
-    QSplitter
+    QSplitter, QDoubleSpinBox
 )
 
 
@@ -52,6 +54,7 @@ class Device:
     hostname: Optional[str] = None
     rtt_ms: Optional[float] = None
     protocols: Set[str] = field(default_factory=set)
+    sources: Set[str] = field(default_factory=set)
     description: Optional[str] = None
     last_seen_ts: float = field(default_factory=time.time)
 
@@ -148,6 +151,15 @@ def vendor_from_mac(mac: Optional[str], oui_map: Dict[str, str]) -> Optional[str
     return oui_map.get(key)
 
 
+def is_valid_mac(mac: Optional[str]) -> bool:
+    if not mac:
+        return False
+    norm = mac.replace("-", ":").lower()
+    if norm in {"ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"}:
+        return False
+    return bool(re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", norm))
+
+
 def safe_gethostbyaddr(ip: str) -> Optional[str]:
     try:
         name, _, _ = socket.gethostbyaddr(ip)
@@ -165,6 +177,24 @@ def ip_in_networks(ip: str, networks: List[ipaddress.IPv4Network]) -> bool:
         if addr in net:
             return True
     return False
+
+
+def parse_arp_table() -> Dict[str, str]:
+    try:
+        output = subprocess.check_output(["arp", "-a"], text=True, errors="ignore")
+    except Exception:
+        return {}
+
+    entries: Dict[str, str] = {}
+    for line in output.splitlines():
+        match = re.search(r"((?:\d{1,3}\.){3}\d{1,3})\s+([0-9a-fA-F:-]{12,17})", line)
+        if not match:
+            continue
+        ip = match.group(1)
+        mac = match.group(2).replace("-", ":").lower()
+        if is_valid_mac(mac):
+            entries[ip] = mac
+    return entries
 
 
 def parse_manual_range(text: str) -> List[ipaddress.IPv4Network]:
@@ -687,6 +717,12 @@ class ScanWorker(QThread):
         fetch_upnp_xml: bool,
         mdns_duration_s: int,
         ssdp_timeout_s: int,
+        arp_timeout: float,
+        arp_retries: int,
+        icmp_timeout: float,
+        icmp_retries: int,
+        tcp_timeout: float,
+        concurrency: int,
         parent=None
     ):
         super().__init__(parent)
@@ -699,6 +735,12 @@ class ScanWorker(QThread):
         self.fetch_upnp_xml = fetch_upnp_xml
         self.mdns_duration_s = mdns_duration_s
         self.ssdp_timeout_s = ssdp_timeout_s
+        self.arp_timeout = max(0.2, arp_timeout)
+        self.arp_retries = max(0, arp_retries)
+        self.icmp_timeout = max(0.2, icmp_timeout)
+        self.icmp_retries = max(0, icmp_retries)
+        self.tcp_timeout = max(0.1, tcp_timeout)
+        self.concurrency = max(1, concurrency)
         self._stop = False
 
     def stop(self):
@@ -762,6 +804,7 @@ class ScanWorker(QThread):
                     if not dev.mac:
                         dev.mac = mac
                     dev.protocols.add("DPI")
+                    dev.sources.add("DPI")
                     dev.description = normalize_description(dev.description, info)
 
         for ip, macs in ip_to_macs.items():
@@ -771,6 +814,7 @@ class ScanWorker(QThread):
                 if not dev.mac:
                     dev.mac = sorted(macs)[0]
                 dev.protocols.add("DPI")
+                dev.sources.add("DPI")
                 dev.description = normalize_description(dev.description, info)
 
     def _merge_device(self, devices: Dict[str, Device], ip: str) -> Device:
@@ -790,31 +834,161 @@ class ScanWorker(QThread):
             devices: Dict[str, Device] = {}
 
             npcap_available = is_npcap_available()
+            target_ips: List[str] = []
+            for net in self.cidrs:
+                target_ips.extend(str(ip) for ip in net.hosts())
 
-            # 1) ARP scan
+            arp_ips: Set[str] = set()
+            icmp_ips: Set[str] = set()
+            tcp_ips: Set[str] = set()
+
+            # 1) ARP scan (primary)
             if npcap_available and conf and Ether and ARP and srp:
+                conf.verb = 0
                 for net in self.cidrs:
-                    self.status.emit(f"Scanning {net} (ARP)...")
+                    if self._stop:
+                        self.status.emit("Scan stopped.")
+                        return
+                    self.status.emit(f"Scanning {net} (ARP sweep)...")
                     targets = [str(ip) for ip in net.hosts()]
-
-                    conf.verb = 0
-                    pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=targets)
-
-                    ans, _ = srp(pkt, timeout=2, retry=1)
-                    for _, rcv in ans:
+                    batch_size = 256
+                    for i in range(0, len(targets), batch_size):
                         if self._stop:
                             self.status.emit("Scan stopped.")
                             return
-                        ip = rcv.psrc
-                        if not ip_in_networks(ip, self.cidrs):
-                            continue
-                        d = self._merge_device(devices, ip)
-                        d.mac = rcv.hwsrc
-                        d.protocols.add("ARP")
+                        batch = targets[i:i + batch_size]
+                        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=batch)
+                        ans, _ = srp(
+                            pkt,
+                            timeout=self.arp_timeout,
+                            retry=self.arp_retries,
+                            inter=0.02,
+                        )
+                        for snd, rcv in ans:
+                            ip = getattr(rcv, "psrc", None)
+                            mac = getattr(rcv, "hwsrc", None)
+                            if not ip or not ip_in_networks(ip, self.cidrs):
+                                continue
+                            d = self._merge_device(devices, ip)
+                            if is_valid_mac(mac):
+                                d.mac = mac
+                            if hasattr(rcv, "time") and hasattr(snd, "sent_time"):
+                                try:
+                                    rtt_ms = max(0.0, (float(rcv.time) - float(snd.sent_time)) * 1000)
+                                    d.rtt_ms = rtt_ms if d.rtt_ms is None else min(d.rtt_ms, rtt_ms)
+                                except Exception:
+                                    pass
+                            d.protocols.add("ARP")
+                            d.sources.add("ARP")
+                            arp_ips.add(ip)
+                self.status.emit(f"ARP replies: {len(arp_ips)}, Total unique: {len(devices)}")
             elif npcap_available:
                 self.status.emit("ARP disabled (scapy unavailable).")
             else:
                 self.status.emit("ARP disabled (Npcap not available).")
+
+            # 1b) ICMP (secondary)
+            remaining_for_icmp = [ip for ip in target_ips if ip not in devices]
+            if self.do_ping and remaining_for_icmp and not self._stop:
+                self.status.emit(f"Pinging {len(remaining_for_icmp)} hosts (ICMP)...")
+
+                def icmp_probe(ip: str) -> Optional[Tuple[str, Optional[float]]]:
+                    if self._stop:
+                        return None
+                    rtt_val: Optional[float] = None
+                    try:
+                        for _ in range(self.icmp_retries + 1):
+                            r = ping(ip, timeout=self.icmp_timeout, unit="ms")
+                            if r is not None:
+                                rtt_val = float(r)
+                                return ip, rtt_val
+                    except PermissionError:
+                        pass
+                    except Exception:
+                        pass
+
+                    # Fallback to system ping
+                    try:
+                        if os.name == "nt":
+                            cmd = ["ping", "-n", "1", "-w", str(int(self.icmp_timeout * 1000)), ip]
+                        else:
+                            cmd = ["ping", "-c", "1", "-W", str(int(max(1.0, self.icmp_timeout))), ip]
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.icmp_timeout + 1)
+                        if proc.returncode == 0:
+                            return ip, None
+                    except Exception:
+                        return None
+                    return None
+
+                with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+                    futures = {pool.submit(icmp_probe, ip): ip for ip in remaining_for_icmp}
+                    for fut in as_completed(futures):
+                        if self._stop:
+                            break
+                        res = fut.result()
+                        if not res:
+                            continue
+                        ip, rtt_val = res
+                        if not ip_in_networks(ip, self.cidrs):
+                            continue
+                        d = self._merge_device(devices, ip)
+                        if rtt_val is not None:
+                            d.rtt_ms = rtt_val if d.rtt_ms is None else min(d.rtt_ms, rtt_val)
+                        d.protocols.add("ICMP")
+                        d.sources.add("ICMP")
+                        icmp_ips.add(ip)
+                self.status.emit(
+                    f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, Total unique: {len(devices)}"
+                )
+
+            # 1c) TCP quick probe (tertiary)
+            tcp_targets = [ip for ip in target_ips if ip not in devices]
+            probe_ports = [80, 443, 22, 445, 3389, 554, 8080, 8443, 5357]
+            if tcp_targets and not self._stop:
+                self.status.emit(f"Probing {len(tcp_targets)} hosts via TCP (quick)...")
+
+                def tcp_probe(ip: str) -> Optional[str]:
+                    if self._stop:
+                        return None
+                    for port in probe_ports:
+                        try:
+                            with socket.create_connection((ip, port), timeout=self.tcp_timeout):
+                                return ip
+                        except ConnectionRefusedError:
+                            return ip  # Fast RST implies host is alive
+                        except socket.timeout:
+                            continue
+                        except Exception:
+                            continue
+                    return None
+
+                with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+                    futures = {pool.submit(tcp_probe, ip): ip for ip in tcp_targets}
+                    for fut in as_completed(futures):
+                        if self._stop:
+                            break
+                        ip = fut.result()
+                        if not ip:
+                            continue
+                        if not ip_in_networks(ip, self.cidrs):
+                            continue
+                        d = self._merge_device(devices, ip)
+                        d.protocols.add("TCP")
+                        d.sources.add("TCP")
+                        tcp_ips.add(ip)
+                self.status.emit(
+                    f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
+                )
+
+            # 1d) OS ARP table enrichment
+            arp_table = parse_arp_table()
+            if arp_table:
+                for ip, mac in arp_table.items():
+                    if ip in devices and not devices[ip].mac and is_valid_mac(mac):
+                        devices[ip].mac = mac
+            self.status.emit(
+                f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
+            )
 
             # 2) SSDP / UPnP
             if self.do_ssdp and not self._stop:
@@ -828,6 +1002,7 @@ class ScanWorker(QThread):
                         continue
                     d = self._merge_device(devices, ip)
                     d.protocols.add("SSDP")
+                    d.sources.add("SSDP")
                     d.ssdp_server = info.get("server")
                     d.ssdp_st = info.get("st")
                     d.ssdp_usn = info.get("usn")
@@ -869,6 +1044,7 @@ class ScanWorker(QThread):
                         continue
                     d = self._merge_device(devices, ip)
                     d.protocols.add("mDNS")
+                    d.sources.add("mDNS")
                     for n in names:
                         d.mdns_names.add(n)
                     # Prefer hostname from mDNS if empty
@@ -897,6 +1073,7 @@ class ScanWorker(QThread):
                         if r is not None:
                             d.rtt_ms = float(r)
                             d.protocols.add("ICMP")
+                            d.sources.add("ICMP")
                     except Exception:
                         pass
 
@@ -913,7 +1090,11 @@ class ScanWorker(QThread):
                     if name:
                         d.hostname = name
                         d.protocols.add("rDNS")
+                        d.sources.add("rDNS")
 
+            self.status.emit(
+                f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
+            )
             self.result.emit(list(devices.values()))
             self.finished_ok.emit()
 
@@ -1844,6 +2025,57 @@ class MainWindow(QMainWindow):
         timing_layout.addStretch(1)
         config_form.addRow(QLabel("Timing:"), timing_row)
 
+        advanced_row = QWidget()
+        advanced_layout = QGridLayout(advanced_row)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setHorizontalSpacing(10)
+        advanced_layout.setVerticalSpacing(6)
+
+        self.sp_arp_timeout = QDoubleSpinBox()
+        self.sp_arp_timeout.setDecimals(1)
+        self.sp_arp_timeout.setRange(0.2, 5.0)
+        self.sp_arp_timeout.setSingleStep(0.1)
+        self.sp_arp_timeout.setValue(1.5)
+
+        self.sp_arp_retries = QSpinBox()
+        self.sp_arp_retries.setRange(0, 3)
+        self.sp_arp_retries.setValue(1)
+
+        self.sp_icmp_timeout = QDoubleSpinBox()
+        self.sp_icmp_timeout.setDecimals(1)
+        self.sp_icmp_timeout.setRange(0.2, 5.0)
+        self.sp_icmp_timeout.setSingleStep(0.1)
+        self.sp_icmp_timeout.setValue(1.0)
+
+        self.sp_icmp_retries = QSpinBox()
+        self.sp_icmp_retries.setRange(0, 3)
+        self.sp_icmp_retries.setValue(1)
+
+        self.sp_tcp_timeout = QDoubleSpinBox()
+        self.sp_tcp_timeout.setDecimals(1)
+        self.sp_tcp_timeout.setRange(0.1, 2.0)
+        self.sp_tcp_timeout.setSingleStep(0.1)
+        self.sp_tcp_timeout.setValue(0.35)
+
+        self.sp_concurrency = QSpinBox()
+        self.sp_concurrency.setRange(1, 256)
+        self.sp_concurrency.setValue(64)
+
+        advanced_layout.addWidget(QLabel("ARP timeout (s)"), 0, 0)
+        advanced_layout.addWidget(self.sp_arp_timeout, 0, 1)
+        advanced_layout.addWidget(QLabel("ARP retries"), 0, 2)
+        advanced_layout.addWidget(self.sp_arp_retries, 0, 3)
+        advanced_layout.addWidget(QLabel("ICMP timeout (s)"), 1, 0)
+        advanced_layout.addWidget(self.sp_icmp_timeout, 1, 1)
+        advanced_layout.addWidget(QLabel("ICMP retries"), 1, 2)
+        advanced_layout.addWidget(self.sp_icmp_retries, 1, 3)
+        advanced_layout.addWidget(QLabel("TCP timeout (s)"), 2, 0)
+        advanced_layout.addWidget(self.sp_tcp_timeout, 2, 1)
+        advanced_layout.addWidget(QLabel("Concurrency"), 2, 2)
+        advanced_layout.addWidget(self.sp_concurrency, 2, 3)
+
+        config_form.addRow(QLabel("Performance:"), advanced_row)
+
         controls_layout.addLayout(config_form)
 
         vendor_status = (
@@ -1863,9 +2095,18 @@ class MainWindow(QMainWindow):
         controls_layout.addLayout(status_row)
         layout.addWidget(controls_card)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["IP", "MAC Address", "MAC Vendor", "Hostname", "Ping (ms)", "Protocols", "Description"]
+            [
+                "IP",
+                "MAC Address",
+                "MAC Vendor",
+                "Hostname",
+                "Ping (ms)",
+                "Found By",
+                "Protocols",
+                "Description",
+            ]
         )
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -2725,6 +2966,12 @@ class MainWindow(QMainWindow):
             fetch_upnp_xml=(self.cb_ssdp.isChecked() and self.cb_upnp_xml.isChecked()),
             mdns_duration_s=int(self.sp_mdns.value()),
             ssdp_timeout_s=int(self.sp_ssdp.value()),
+            arp_timeout=float(self.sp_arp_timeout.value()),
+            arp_retries=int(self.sp_arp_retries.value()),
+            icmp_timeout=float(self.sp_icmp_timeout.value()),
+            icmp_retries=int(self.sp_icmp_retries.value()),
+            tcp_timeout=float(self.sp_tcp_timeout.value()),
+            concurrency=int(self.sp_concurrency.value()),
         )
         self.worker.status.connect(self.status_lbl.setText)
         self.worker.result.connect(self.on_results)
@@ -2764,10 +3011,12 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 2, QTableWidgetItem(d.vendor or ""))
             self.table.setItem(row, 3, QTableWidgetItem(d.hostname or ""))
             self.table.setItem(row, 4, QTableWidgetItem("" if d.rtt_ms is None else f"{d.rtt_ms:.2f}"))
-            self.table.setItem(row, 5, QTableWidgetItem("|".join(sorted(d.protocols))))
-            self.table.setItem(row, 6, QTableWidgetItem(d.description or ""))
+            found_by = d.sources or d.protocols
+            self.table.setItem(row, 5, QTableWidgetItem("|".join(sorted(found_by))))
+            self.table.setItem(row, 6, QTableWidgetItem("|".join(sorted(d.protocols))))
+            self.table.setItem(row, 7, QTableWidgetItem(d.description or ""))
 
-            for col in range(7):
+            for col in range(8):
                 item = self.table.item(row, col)
                 item.setFlags(item.flags() ^ Qt.ItemIsEditable)
 
@@ -2782,7 +3031,16 @@ class MainWindow(QMainWindow):
             return
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["IP", "MAC", "Vendor", "Hostname", "Ping_ms", "Protocols", "Description"])
+            w.writerow([
+                "IP",
+                "MAC",
+                "Vendor",
+                "Hostname",
+                "Ping_ms",
+                "Found_By",
+                "Protocols",
+                "Description",
+            ])
             for d in self.devices:
                 w.writerow([
                     d.ip,
@@ -2790,9 +3048,11 @@ class MainWindow(QMainWindow):
                     d.vendor or "",
                     d.hostname or "",
                     "" if d.rtt_ms is None else f"{d.rtt_ms:.2f}",
+                    "|".join(sorted(d.sources or d.protocols)),
                     "|".join(sorted(d.protocols)),
-                    d.description or ""
+                    d.description or "",
                 ])
+
         self.status_lbl.setText(f"Exported: {path}")
 
     def closeEvent(self, event):  # type: ignore[override]
