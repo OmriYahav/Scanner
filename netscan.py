@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
 
 import psutil
+from collections import defaultdict
 import requests
 from ping3 import ping
 
@@ -703,6 +704,75 @@ class ScanWorker(QThread):
     def stop(self):
         self._stop = True
 
+    def _deep_packet_inspection(self, devices: Dict[str, Device], npcap_available: bool):
+        if (
+            self._stop
+            or not npcap_available
+            or not self.iface_name
+            or not sniff
+            or not ARP
+            or not SCAPY_AVAILABLE
+        ):
+            return
+
+        try:
+            resolved_iface = resolve_capture_interface(self.iface_name)
+        except Exception:
+            resolved_iface = self.iface_name
+
+        if not resolved_iface:
+            return
+
+        self.status.emit("Inspecting packets for duplicate IP/MAC mappings...")
+
+        mac_to_ips: Dict[str, Set[str]] = defaultdict(set)
+        ip_to_macs: Dict[str, Set[str]] = defaultdict(set)
+
+        def record(ip: Optional[str], mac: Optional[str]):
+            if not ip or not mac:
+                return
+            if not ip_in_networks(ip, self.cidrs):
+                return
+            mac_to_ips[mac].add(ip)
+            ip_to_macs[ip].add(mac)
+
+        for d in devices.values():
+            record(d.ip, d.mac)
+
+        try:
+            packets = sniff(filter="arp", iface=resolved_iface, timeout=2, store=True, promisc=True)
+        except Exception:
+            packets = []
+
+        for pkt in packets:
+            try:
+                arp_layer = pkt[ARP] if pkt.haslayer(ARP) else None
+                if not arp_layer:
+                    continue
+                record(getattr(arp_layer, "psrc", None), getattr(arp_layer, "hwsrc", None))
+                record(getattr(arp_layer, "pdst", None), getattr(arp_layer, "hwdst", None))
+            except Exception:
+                continue
+
+        for mac, ips in mac_to_ips.items():
+            if len(ips) > 1:
+                info = f"MAC {mac} seen on multiple IPs: {', '.join(sorted(ips))}"
+                for ip in ips:
+                    dev = self._merge_device(devices, ip)
+                    if not dev.mac:
+                        dev.mac = mac
+                    dev.protocols.add("DPI")
+                    dev.description = normalize_description(dev.description, info)
+
+        for ip, macs in ip_to_macs.items():
+            if len(macs) > 1:
+                info = f"IP {ip} associated with multiple MACs: {', '.join(sorted(macs))}"
+                dev = self._merge_device(devices, ip)
+                if not dev.mac:
+                    dev.mac = sorted(macs)[0]
+                dev.protocols.add("DPI")
+                dev.description = normalize_description(dev.description, info)
+
     def _merge_device(self, devices: Dict[str, Device], ip: str) -> Device:
         d = devices.get(ip)
         if not d:
@@ -811,7 +881,10 @@ class ScanWorker(QThread):
                     if svcs:
                         d.description = normalize_description(d.description, "mDNS: " + ",".join(sorted(svcs)[:6]))
 
-            # 4) Ping RTT
+            # 4) Deep packet inspection for conflicting mappings
+            self._deep_packet_inspection(devices, npcap_available)
+
+            # 5) Ping RTT
             if self.do_ping and not self._stop:
                 self.status.emit("Measuring latency (ICMP ping)...")
                 # Ping known devices first; optional: you can ping all hosts but it's heavy
@@ -827,7 +900,7 @@ class ScanWorker(QThread):
                     except Exception:
                         pass
 
-            # 5) Reverse DNS
+            # 6) Reverse DNS
             if self.do_rdns and not self._stop:
                 self.status.emit("Resolving hostnames (Reverse DNS)...")
                 for ip, d in list(devices.items()):
