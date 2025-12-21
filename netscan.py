@@ -65,6 +65,8 @@ class Device:
     ssdp_usn: Optional[str] = None
     ssdp_location: Optional[str] = None
     open_tcp_ports: List[int] = field(default_factory=list)
+    primary_key: Optional[str] = None
+    ips_seen: Set[str] = field(default_factory=set)
 
 
 # -----------------------------
@@ -721,6 +723,7 @@ class ScanWorker(QThread):
     device_found = Signal(object)
     progress_update = Signal(int, int, str)
     scan_started = Signal(int, str)
+    partial = Signal(list)
 
     def __init__(
         self,
@@ -763,6 +766,8 @@ class ScanWorker(QThread):
         self.oui_map = oui_map
         self._stop_event = threading.Event()
         self._last_emitted_state: Dict[str, Tuple] = {}
+        self._partial_buffer: List[Device] = []
+        self._last_partial_emit = time.time()
 
     def stop(self):
         self._stop_event.set()
@@ -790,6 +795,12 @@ class ScanWorker(QThread):
         if self._last_emitted_state.get(device.ip) != state:
             self._last_emitted_state[device.ip] = state
             self.device_found.emit(device)
+            self._partial_buffer.append(device)
+            now = time.time()
+            if now - self._last_partial_emit > 0.25:
+                self.partial.emit(list(self._partial_buffer))
+                self._partial_buffer.clear()
+                self._last_partial_emit = now
 
     def _flush_pending(self, force: bool = False):
         # Maintained for backward compatibility; live updates handled via device_found.
@@ -1192,6 +1203,9 @@ class ScanWorker(QThread):
             self.status.emit(
                 f"ARP replies: {len(arp_ips)}, ICMP: {len(icmp_ips)}, TCP: {len(tcp_ips)}, Total unique: {len(devices)}"
             )
+            if self._partial_buffer:
+                self.partial.emit(list(self._partial_buffer))
+                self._partial_buffer.clear()
             self.result.emit(list(devices.values()))
             self.finished_ok.emit()
 
@@ -1202,6 +1216,55 @@ class ScanWorker(QThread):
         finally:
             if conf is not None and original_iface is not None:
                 conf.iface = original_iface
+
+
+class BackgroundDiscoveryWorker(QThread):
+    device_found = Signal(object)
+    status = Signal(str)
+
+    def __init__(self, cidrs: List[ipaddress.IPv4Network], known_ips: List[str]):
+        super().__init__()
+        self.cidrs = cidrs
+        self.known_ips = known_ips
+        self._stop_event = threading.Event()
+        self._index = 0
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _iter_hosts(self) -> List[str]:
+        sample: List[str] = []
+        for net in self.cidrs:
+            hosts = list(net.hosts())
+            if not hosts:
+                continue
+            start = self._index % len(hosts)
+            chunk = hosts[start:start + 32]
+            sample.extend(str(ip) for ip in chunk)
+            self._index += 32
+            break
+        return sample
+
+    def run(self):
+        while not self._stop_event.is_set():
+            targets = list(self.known_ips) + self._iter_hosts()
+            for ip in targets:
+                if self._stop_event.is_set():
+                    break
+                try:
+                    rtt = ping(ip, timeout=1)
+                except Exception:
+                    rtt = None
+                if rtt is None:
+                    continue
+                dev = Device(ip=ip, rtt_ms=rtt * 1000 if isinstance(rtt, (float, int)) else None)
+                dev.sources.add("Background")
+                dev.protocols.add("ICMP")
+                self.device_found.emit(dev)
+            for _ in range(10):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(0.2)
 
 
 # -----------------------------
@@ -1646,6 +1709,10 @@ class MainWindow(QMainWindow):
     igmpStatusChanged = Signal(dict)
     envStatusChanged = Signal(dict)
 
+    ONLINE_TTL_SEC = 30
+    STALE_TTL_SEC = 120
+    OFFLINE_AFTER_SEC = 300
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Local Network Device Discovery (Windows)")
@@ -1656,7 +1723,9 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ScanWorker] = None
         self.devices: List[Device] = []
         self.devices_map: Dict[str, Device] = {}
-        self._row_by_ip: Dict[str, int] = {}
+        self.devices_by_key: Dict[str, Device] = {}
+        self.ip_to_key: Dict[str, str] = {}
+        self._row_by_key: Dict[str, int] = {}
         self._pending_updates: Dict[str, Device] = {}
         self._update_timer = QTimer(self)
         self._update_timer.setInterval(200)
@@ -1673,6 +1742,13 @@ class MainWindow(QMainWindow):
         self.diag_worker: Optional[DiagnosticsWorker] = None
         self.l2_worker: Optional[Layer2InfoWorker] = None
         self.av_worker: Optional[AVInsightsWorker] = None
+        self.presence_timer = QTimer(self)
+        self.presence_timer.setInterval(1000)
+        self.presence_timer.timeout.connect(self._tick_presence)
+        self.presence_timer.start()
+        self.live_feed_lines: List[str] = []
+        self.continuous_worker: Optional['BackgroundDiscoveryWorker'] = None
+        self._last_presence_state: Dict[str, str] = {}
 
         self.externalIpChanged.connect(self.set_external_ip)
         self.internetStatusChanged.connect(self.set_connectivity_state)
@@ -1707,6 +1783,8 @@ class MainWindow(QMainWindow):
         self.btn_diag_stop.clicked.connect(self.stop_diag_worker)
         self.btn_l2_refresh.clicked.connect(self.run_l2_check)
         self.l2_toggle_btn.clicked.connect(self.toggle_l2_debug)
+        self.cb_continuous.stateChanged.connect(self.on_continuous_changed)
+        self.cb_online_only.stateChanged.connect(lambda _: self.flush_pending_updates())
 
         self.update_npcap_state()
         self.fetch_external_ip()
@@ -2103,6 +2181,12 @@ class MainWindow(QMainWindow):
         self.cb_upnp_xml = QCheckBox("Fetch UPnP XML (friendlyName)")
         self.cb_upnp_xml.setChecked(False)
         check_layout.addWidget(self.cb_upnp_xml)
+        self.cb_online_only = QCheckBox("Only show Online")
+        self.cb_online_only.setChecked(True)
+        check_layout.addWidget(self.cb_online_only)
+        self.cb_continuous = QCheckBox("Continuous discovery (background)")
+        self.cb_continuous.setChecked(False)
+        check_layout.addWidget(self.cb_continuous)
         check_layout.addStretch(1)
         config_form.addRow(QLabel("Protocols:"), check_row)
 
@@ -2128,6 +2212,30 @@ class MainWindow(QMainWindow):
         timing_layout.addWidget(self.sp_ssdp)
         timing_layout.addStretch(1)
         config_form.addRow(QLabel("Timing:"), timing_row)
+
+        ttl_group = QGroupBox("Presence TTL (advanced)")
+        ttl_group.setCheckable(True)
+        ttl_group.setChecked(False)
+        ttl_layout = QHBoxLayout(ttl_group)
+        ttl_layout.setContentsMargins(8, 8, 8, 8)
+        ttl_layout.setSpacing(10)
+        ttl_layout.addWidget(QLabel("Online TTL (sec)"))
+        self.sp_online_ttl = QSpinBox()
+        self.sp_online_ttl.setRange(5, 600)
+        self.sp_online_ttl.setValue(self.ONLINE_TTL_SEC)
+        ttl_layout.addWidget(self.sp_online_ttl)
+        ttl_layout.addWidget(QLabel("Stale TTL (sec)"))
+        self.sp_stale_ttl = QSpinBox()
+        self.sp_stale_ttl.setRange(10, 1200)
+        self.sp_stale_ttl.setValue(self.STALE_TTL_SEC)
+        ttl_layout.addWidget(self.sp_stale_ttl)
+        ttl_layout.addWidget(QLabel("Offline after (sec)"))
+        self.sp_offline_ttl = QSpinBox()
+        self.sp_offline_ttl.setRange(30, 3600)
+        self.sp_offline_ttl.setValue(self.OFFLINE_AFTER_SEC)
+        ttl_layout.addWidget(self.sp_offline_ttl)
+        ttl_layout.addStretch(1)
+        config_form.addRow(QLabel("Presence smoothing:"), ttl_group)
 
         advanced_row = QWidget()
         advanced_layout = QGridLayout(advanced_row)
@@ -2210,10 +2318,12 @@ class MainWindow(QMainWindow):
         controls_layout.addLayout(progress_row)
         layout.addWidget(controls_card)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
             [
                 "IP",
+                "IPs (seen)",
+                "Presence",
                 "MAC Address",
                 "MAC Vendor",
                 "Hostname",
@@ -2250,6 +2360,23 @@ QHeaderView::section {
         )
 
         table_card = Card("Scan Results")
+        summary_row = QHBoxLayout()
+        self.presence_summary_lbl = QLabel("Online: 0 | Unknown: 0 | Offline: 0 | Total known: 0")
+        summary_row.addWidget(self.presence_summary_lbl)
+        summary_row.addStretch(1)
+        table_card.content_layout.addLayout(summary_row)
+        self.live_feed_toggle = QPushButton("Show Live Feed")
+        self.live_feed_toggle.setObjectName("ghostButton")
+        self.live_feed_toggle.setCheckable(True)
+        self.live_feed_toggle.setChecked(False)
+        self.live_feed_toggle.clicked.connect(self._toggle_live_feed)
+        self.live_feed = QPlainTextEdit()
+        self.live_feed.setReadOnly(True)
+        self.live_feed.setObjectName("console")
+        self.live_feed.setMaximumBlockCount(200)
+        self.live_feed.setVisible(False)
+        table_card.content_layout.addWidget(self.live_feed_toggle)
+        table_card.content_layout.addWidget(self.live_feed)
         table_card.content_layout.addWidget(self.table)
         layout.addWidget(table_card, 1)
         return widget
@@ -3071,53 +3198,183 @@ QHeaderView::section {
             if item.textAlignment() != align:
                 item.setTextAlignment(align)
 
+    def _compute_identity_key(self, d: Device) -> str:
+        if is_valid_mac(d.mac):
+            return d.mac.replace("-", ":").lower()
+        if d.hostname:
+            return d.hostname.lower()
+        return d.ip
+
+    def _merge_identity(self, incoming: Device) -> Device:
+        incoming.last_seen_ts = time.time()
+        key = self._compute_identity_key(incoming)
+        existing_key = self.ip_to_key.get(incoming.ip)
+        if existing_key and existing_key != key and is_valid_mac(incoming.mac):
+            key = incoming.mac.replace("-", ":").lower()
+
+        target = self.devices_by_key.get(key)
+        if target is None:
+            target = incoming
+            target.primary_key = key
+            target.ips_seen.add(incoming.ip)
+            self.devices_by_key[key] = target
+        else:
+            target.primary_key = key
+            target.last_seen_ts = incoming.last_seen_ts
+            target.ips_seen.add(incoming.ip)
+            if incoming.ip != target.ip:
+                target.ip = incoming.ip
+            if incoming.mac and not target.mac:
+                target.mac = incoming.mac
+            if incoming.vendor and not target.vendor:
+                target.vendor = incoming.vendor
+            if incoming.hostname and not target.hostname:
+                target.hostname = incoming.hostname
+            if incoming.rtt_ms is not None:
+                target.rtt_ms = incoming.rtt_ms
+            target.protocols.update(incoming.protocols)
+            target.sources.update(incoming.sources)
+            if incoming.description:
+                target.description = normalize_description(target.description, incoming.description)
+            target.mdns_names.update(incoming.mdns_names)
+            if incoming.ssdp_server and not target.ssdp_server:
+                target.ssdp_server = incoming.ssdp_server
+            if incoming.ssdp_st and not target.ssdp_st:
+                target.ssdp_st = incoming.ssdp_st
+            if incoming.ssdp_usn and not target.ssdp_usn:
+                target.ssdp_usn = incoming.ssdp_usn
+            if incoming.ssdp_location and not target.ssdp_location:
+                target.ssdp_location = incoming.ssdp_location
+
+        self.ip_to_key[incoming.ip] = key
+        for ip in target.ips_seen:
+            self.ip_to_key[ip] = key
+        self.devices_map[incoming.ip] = target
+        return target
+
+    def _presence_state(self, d: Device) -> str:
+        now = time.time()
+        online_ttl = int(self.sp_online_ttl.value()) if hasattr(self, "sp_online_ttl") else self.ONLINE_TTL_SEC
+        stale_ttl = int(self.sp_stale_ttl.value()) if hasattr(self, "sp_stale_ttl") else self.STALE_TTL_SEC
+        offline_ttl = int(self.sp_offline_ttl.value()) if hasattr(self, "sp_offline_ttl") else self.OFFLINE_AFTER_SEC
+        delta = now - d.last_seen_ts
+        if delta <= online_ttl:
+            return "Online"
+        if delta <= stale_ttl:
+            return "Unknown"
+        if delta <= offline_ttl:
+            return "Offline"
+        return "Offline"
+
+    def _style_presence_item(self, item: QTableWidgetItem, state: str):
+        colors = {
+            "online": (Qt.darkGreen, Qt.white),
+            "unknown": (Qt.darkYellow, Qt.black),
+            "offline": (Qt.red, Qt.white),
+        }
+        fg, bg = colors.get(state.lower(), (Qt.black, Qt.white))
+        item.setForeground(fg)
+        item.setBackground(bg)
+
+    def _toggle_live_feed(self):
+        visible = self.live_feed_toggle.isChecked()
+        self.live_feed.setVisible(visible)
+        self.live_feed_toggle.setText("Hide Live Feed" if visible else "Show Live Feed")
+
+    def _append_feed(self, text: str):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {text}"
+        self.live_feed_lines.append(line)
+        self.live_feed_lines = self.live_feed_lines[-200:]
+        if self.live_feed.isVisible():
+            self.live_feed.setPlainText("\n".join(self.live_feed_lines))
+            self.live_feed.verticalScrollBar().setValue(self.live_feed.verticalScrollBar().maximum())
+
+    def _tick_presence(self):
+        changed: List[Device] = []
+        for key, dev in self.devices_by_key.items():
+            prev = self._last_presence_state.get(key)
+            state = self._presence_state(dev)
+            if prev and prev != state:
+                self._append_feed(f"STATE {dev.ip} -> {state}")
+            self._last_presence_state[key] = state
+            if state != prev:
+                changed.append(dev)
+        for dev in changed:
+            self.upsert_device_row(dev)
+        if changed:
+            self._update_status_counts()
+
     def upsert_device_row(self, d: Device):
         if d.mac and not d.vendor:
             d.vendor = vendor_from_mac(d.mac, self.oui_map)
 
-        if not is_device_online(d):
-            self._remove_device_row(d.ip)
-            return
-
-        row = self._row_by_ip.get(d.ip)
+        key = d.primary_key or self._compute_identity_key(d)
+        d.primary_key = key
+        row = self._row_by_key.get(key)
         if row is None:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self._row_by_ip[d.ip] = row
+            self._row_by_key[key] = row
 
         left_align = Qt.AlignLeft | Qt.AlignVCenter
         right_align = Qt.AlignRight | Qt.AlignVCenter
 
+        ip_list = sorted(d.ips_seen) if d.ips_seen else [d.ip]
+        extra = max(0, len(ip_list) - 1)
+        ips_label = d.ip if not extra else f"{d.ip} (+{extra})"
         self._set_table_item(row, 0, d.ip, left_align)
-        self._set_table_item(row, 1, d.mac or "", left_align)
-        self._set_table_item(row, 2, d.vendor or "", left_align)
-        self._set_table_item(row, 3, d.hostname or "", left_align)
+        item_ips = self.table.item(row, 1)
+        if item_ips is None:
+            item_ips = QTableWidgetItem(ips_label)
+            item_ips.setFlags(item_ips.flags() & ~Qt.ItemIsEditable)
+            item_ips.setToolTip("\n".join(ip_list))
+            self.table.setItem(row, 1, item_ips)
+        else:
+            item_ips.setText(ips_label)
+            item_ips.setToolTip("\n".join(ip_list))
+
+        presence_state = self._presence_state(d)
+        presence_item = self.table.item(row, 2)
+        if presence_item is None:
+            presence_item = QTableWidgetItem(presence_state)
+            presence_item.setFlags(presence_item.flags() & ~Qt.ItemIsEditable)
+            presence_item.setTextAlignment(left_align)
+            self.table.setItem(row, 2, presence_item)
+        else:
+            presence_item.setText(presence_state)
+        self._style_presence_item(presence_item, presence_state)
+
+        self._set_table_item(row, 3, d.mac or "", left_align)
+        self._set_table_item(row, 4, d.vendor or "", left_align)
+        self._set_table_item(row, 5, d.hostname or "", left_align)
         self._set_table_item(
             row,
-            4,
+            6,
             "" if d.rtt_ms is None else f"{d.rtt_ms:.2f}",
             right_align,
         )
         found_by = d.sources or d.protocols
-        self._set_table_item(row, 5, "|".join(sorted(found_by)), left_align)
-        self._set_table_item(row, 6, "|".join(sorted(d.protocols)), left_align)
-        self._set_table_item(row, 7, d.description or "", left_align)
+        self._set_table_item(row, 7, "|".join(sorted(found_by)), left_align)
+        self._set_table_item(row, 8, "|".join(sorted(d.protocols)), left_align)
+        self._set_table_item(row, 9, d.description or "", left_align)
 
-    def _remove_device_row(self, ip: str):
-        row = self._row_by_ip.pop(ip, None)
+        hide = self.cb_online_only.isChecked() and presence_state != "Online"
+        self.table.setRowHidden(row, hide)
+
+    def _remove_device_row(self, key: str):
+        row = self._row_by_key.pop(key, None)
         if row is None:
             return
         self.table.removeRow(row)
-        for other_ip, other_row in list(self._row_by_ip.items()):
+        for other_key, other_row in list(self._row_by_key.items()):
             if other_row > row:
-                self._row_by_ip[other_ip] = other_row - 1
+                self._row_by_key[other_key] = other_row - 1
 
     @Slot(object)
     def on_device_found(self, device: Device):
-        if device.mac and not device.vendor:
-            device.vendor = vendor_from_mac(device.mac, self.oui_map)
-        self.devices_map[device.ip] = device
-        self._pending_updates[device.ip] = device
+        merged = self._merge_identity(device)
+        self._pending_updates[merged.primary_key or merged.ip] = merged
 
     def flush_pending_updates(self):
         if not self._pending_updates:
@@ -3127,10 +3384,28 @@ QHeaderView::section {
         for dev in updates:
             self.upsert_device_row(dev)
         self._update_status_counts()
+        if not updates:
+            for dev in self.devices_by_key.values():
+                key = dev.primary_key or dev.ip
+                row = self._row_by_key.get(key)
+                if row is not None:
+                    hide = self.cb_online_only.isChecked() and self._presence_state(dev) != "Online"
+                    self.table.setRowHidden(row, hide)
 
     def _update_status_counts(self):
-        total = len(self.devices_map)
-        online = len(self._row_by_ip)
+        online = unknown = offline = 0
+        for dev in self.devices_by_key.values():
+            state = self._presence_state(dev)
+            if state == "Online":
+                online += 1
+            elif state == "Unknown":
+                unknown += 1
+            else:
+                offline += 1
+        total = len(self.devices_by_key)
+        self.presence_summary_lbl.setText(
+            f"Online: {online} | Unknown: {unknown} | Offline: {offline} | Total known: {total}"
+        )
         if self.worker and self.worker.isRunning():
             self.status_lbl.setText(f"Scanning... Found {total} devices (online: {online}).")
         else:
@@ -3171,8 +3446,11 @@ QHeaderView::section {
         self.table.setRowCount(0)
         self.devices = []
         self.devices_map = {}
-        self._row_by_ip = {}
+        self.devices_by_key = {}
+        self.ip_to_key = {}
+        self._row_by_key = {}
         self._pending_updates = {}
+        self._last_presence_state = {}
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.status_lbl.setText(f"Starting scan on {cidr_label} ...")
@@ -3200,11 +3478,13 @@ QHeaderView::section {
         self.worker.status.connect(self.status_lbl.setText)
         self.worker.result.connect(self.on_scan_finished)
         self.worker.device_found.connect(self.on_device_found)
+        self.worker.partial.connect(self.on_partial_results)
         self.worker.progress_update.connect(self.on_scan_progress)
         self.worker.scan_started.connect(self.on_scan_started)
         self.worker.finished_ok.connect(self.on_finished)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
+        self._stop_continuous_worker()
 
     def stop_scan(self):
         if self.worker:
@@ -3217,6 +3497,37 @@ QHeaderView::section {
         self.btn_stop.setEnabled(False)
         self.btn_scan.setEnabled(True)
         self._update_status_counts()
+        if self.cb_continuous.isChecked():
+            self._start_continuous_worker()
+
+    def _start_continuous_worker(self):
+        if self.worker and self.worker.isRunning():
+            return
+        if self.continuous_worker and self.continuous_worker.isRunning():
+            return
+        cidrs: List[ipaddress.IPv4Network] = []
+        data = self.if_combo.currentData()
+        if isinstance(data, dict) and data.get("cidr"):
+            try:
+                cidrs.append(ipaddress.IPv4Network(data["cidr"], strict=False))
+            except Exception:
+                pass
+        known_ips = [dev.ip for dev in self.devices_by_key.values()]
+        self.continuous_worker = BackgroundDiscoveryWorker(cidrs, known_ips)
+        self.continuous_worker.device_found.connect(self.on_device_found)
+        self.continuous_worker.start()
+
+    def _stop_continuous_worker(self):
+        if self.continuous_worker:
+            self.continuous_worker.stop()
+            self.continuous_worker.wait(500)
+            self.continuous_worker = None
+
+    def on_continuous_changed(self, state: int):
+        if state:
+            self._start_continuous_worker()
+        else:
+            self._stop_continuous_worker()
 
     def on_worker_finished(self):
         self.flush_pending_updates()
@@ -3232,10 +3543,17 @@ QHeaderView::section {
             self.devices_map[d.ip] = d
             self.upsert_device_row(d)
 
+    @Slot(list)
+    def on_partial_results(self, devices: List[Device]):
+        for d in devices:
+            merged = self._merge_identity(d)
+            self._pending_updates[merged.primary_key or merged.ip] = merged
+        self.flush_pending_updates()
+
     @Slot(int, int, str)
     def on_scan_progress(self, done: int, total: int, phase: str):
         found = len(self.devices_map)
-        online = len(self._row_by_ip)
+        online = len(self._row_by_key)
         pct = int((done / total) * 100) if total else 0
         pct = min(max(pct, 0), 100)
         self.progress_lbl.setText(
@@ -3247,27 +3565,19 @@ QHeaderView::section {
         for d in devices:
             if d.mac and not d.vendor:
                 d.vendor = vendor_from_mac(d.mac, self.oui_map)
-            self.devices_map[d.ip] = d
+            merged = self._merge_identity(d)
+            self._pending_updates[merged.primary_key or merged.ip] = merged
 
-        try:
-            self.devices = sorted(self.devices_map.values(), key=lambda x: ipaddress.IPv4Address(x.ip))
-        except Exception:
-            self.devices = list(self.devices_map.values())
-
-        # Rebuild table once at end for sorted view
         self.flush_pending_updates()
-        for d in self.devices:
-            self.upsert_device_row(d)
-
         self.table.setSortingEnabled(True)
         self.table.sortItems(0, Qt.AscendingOrder)
         self.progress_lbl.setText(
-            f"Completed. Found {len(self.devices)} devices (online: {len(self._row_by_ip)})."
+            f"Completed. Found {len(self.devices_by_key)} devices."
         )
         self._update_status_counts()
 
     def export_csv(self):
-        export_list = self.devices if self.devices else list(self.devices_map.values())
+        export_list = list(self.devices_by_key.values()) if self.devices_by_key else (self.devices if self.devices else list(self.devices_map.values()))
         if not export_list:
             self.status_lbl.setText("Nothing to export.")
             return
@@ -3278,6 +3588,7 @@ QHeaderView::section {
             w = csv.writer(f)
             w.writerow([
                 "IP",
+                "IPs_Seen",
                 "MAC",
                 "Vendor",
                 "Hostname",
@@ -3287,8 +3598,10 @@ QHeaderView::section {
                 "Description",
             ])
             for d in export_list:
+                ips_seen = ",".join(sorted(d.ips_seen)) if getattr(d, "ips_seen", None) else d.ip
                 w.writerow([
                     d.ip,
+                    ips_seen,
                     d.mac or "",
                     d.vendor or "",
                     d.hostname or "",
@@ -3308,6 +3621,7 @@ QHeaderView::section {
             getattr(self, "network_monitor_timer", None),
             getattr(self, "network_timestamp_timer", None),
             getattr(self, "_update_timer", None),
+            getattr(self, "presence_timer", None),
         ]:
             if timer:
                 timer.stop()
@@ -3326,6 +3640,8 @@ QHeaderView::section {
             if thread and thread.isRunning():
                 thread.requestInterruption()
                 thread.wait(1000)
+
+        self._stop_continuous_worker()
 
         super().closeEvent(event)
 
