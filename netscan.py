@@ -14,6 +14,7 @@ import re
 import errno
 import json
 import base64
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple, Any
@@ -22,6 +23,13 @@ import psutil
 from collections import defaultdict
 import requests
 from ping3 import ping
+
+try:  # type: ignore  # pragma: no cover - platform-specific
+    import winreg
+    from ctypes import wintypes
+except Exception:  # pragma: no cover - fallback for non-Windows
+    winreg = None
+    wintypes = None
 
 try:
     from scapy.all import ARP, Ether, Dot1Q, conf, sniff, srp, get_if_list  # type: ignore
@@ -2059,6 +2067,8 @@ class MainWindow(QMainWindow):
     internetStatusChanged = Signal(bool)
     igmpStatusChanged = Signal(dict)
     envStatusChanged = Signal(dict)
+    npcapInstallStatus = Signal(str)
+    npcapInstallResult = Signal(dict)
 
     ONLINE_TTL_SEC = 60
     STALE_TTL_SEC = 180
@@ -2109,6 +2119,8 @@ class MainWindow(QMainWindow):
         self.internetStatusChanged.connect(self.set_connectivity_state)
         self.igmpStatusChanged.connect(self.apply_igmp_status)
         self.envStatusChanged.connect(self.apply_env_status)
+        self.npcapInstallStatus.connect(self.set_env_message)
+        self.npcapInstallResult.connect(self.apply_npcap_install_result)
         self.connectivity_check_running = False
 
         tabs = QTabWidget()
@@ -2129,7 +2141,7 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.start_scan)
         self.btn_stop.clicked.connect(self.stop_scan)
         self.btn_export.clicked.connect(self.export_csv)
-        self.btn_install_npcap.clicked.connect(self.open_npcap_download)
+        self.btn_install_npcap.clicked.connect(self.install_npcap)
         self.if_combo.currentIndexChanged.connect(self.on_interface_changed)
         self.btn_network_refresh.clicked.connect(lambda: self.refresh_network_info(force=True))
         self.btn_env_refresh.clicked.connect(self.run_env_checks)
@@ -2169,6 +2181,7 @@ class MainWindow(QMainWindow):
         self.network_timestamp_timer.start()
         self._update_timer.start()
         self.on_interface_changed(self.if_combo.currentIndex())
+        self.run_env_checks()
 
     def apply_stylesheet(self):
         app = QApplication.instance()
@@ -2310,6 +2323,10 @@ class MainWindow(QMainWindow):
         arp_hint = QLabel("ARP may require Admin and/or Npcap for best results.")
         arp_hint.setObjectName("hintLabel")
         env_layout.addWidget(arp_hint)
+        self.env_message_lbl = QLabel()
+        self.env_message_lbl.setObjectName("hintLabel")
+        self.env_message_lbl.setWordWrap(True)
+        env_layout.addWidget(self.env_message_lbl)
         if self.env_group.header_layout:
             self.btn_env_refresh = QPushButton("Refresh")
             self.env_group.header_layout.addWidget(self.btn_env_refresh)
@@ -2542,6 +2559,7 @@ class MainWindow(QMainWindow):
         self.btn_install_npcap = QPushButton("Install Npcap")
         self.btn_install_npcap.setObjectName("ghostButton")
         self.btn_install_npcap.setVisible(False)
+        self.btn_install_npcap.setToolTip("Required for ARP, LLDP and advanced Layer-2 features")
         self.btn_stop.setEnabled(False)
         row1.addWidget(self.btn_install_npcap)
         row1.addWidget(self.btn_export)
@@ -3021,17 +3039,165 @@ QHeaderView::section {
     def on_diag_finished(self):
         self.diag_worker = None
 
+    def set_env_message(self, text: str):
+        if hasattr(self, "env_message_lbl") and self.env_message_lbl:
+            self.env_message_lbl.setText(text or "")
+
     def update_npcap_state(self):
-        self.npcap_available = is_npcap_available()
-        self.btn_install_npcap.setVisible(not self.npcap_available)
+        installed_state = self._check_npcap_installed()
+        self.npcap_available = installed_state is True
+        self.btn_install_npcap.setVisible(not self.npcap_available and os.name == "nt")
         if self.npcap_available:
             if self.status_lbl.text().startswith("Npcap is not installed"):
                 self.status_lbl.setText("Ready.")
-        else:
+        elif installed_state is False:
             self.status_lbl.setText("Npcap is not installed. ARP (MAC discovery) is disabled.")
+        else:
+            self.status_lbl.setText("Npcap status unknown. Some features may be unavailable.")
+        self._update_feature_availability()
 
     def open_npcap_download(self):
         webbrowser.open("https://npcap.com/#download")
+
+    def _download_npcap_installer(self) -> str:
+        url = "https://npcap.com/dist/npcap-1.79.exe"
+        temp_dir = tempfile.gettempdir()
+        installer_path = os.path.join(temp_dir, "npcap-1.79.exe")
+        self.npcapInstallStatus.emit("Downloading Npcap installer...")
+        with requests.get(url, stream=True, timeout=20) as resp:
+            resp.raise_for_status()
+            with open(installer_path, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 64):
+                    if chunk:
+                        fh.write(chunk)
+        return installer_path
+
+    def _shell_execute_elevated(self, target: str, params: str, cwd: Optional[str] = None) -> Tuple[bool, Optional[int], Optional[str]]:
+        if os.name != "nt" or not wintypes:
+            return False, None, "Elevation is only supported on Windows."
+
+        SEE_MASK_NOCLOSEPROCESS = 0x00000040
+        SW_SHOW = 5
+
+        class SHELLEXECUTEINFO(ctypes.Structure):  # type: ignore
+            _fields_ = [
+                ("cbSize", ctypes.c_ulong),
+                ("fMask", ctypes.c_ulong),
+                ("hwnd", wintypes.HWND),
+                ("lpVerb", wintypes.LPCWSTR),
+                ("lpFile", wintypes.LPCWSTR),
+                ("lpParameters", wintypes.LPCWSTR),
+                ("lpDirectory", wintypes.LPCWSTR),
+                ("nShow", ctypes.c_int),
+                ("hInstApp", ctypes.c_void_p),
+                ("lpIDList", ctypes.c_void_p),
+                ("lpClass", wintypes.LPCWSTR),
+                ("hkeyClass", ctypes.c_void_p),
+                ("dwHotKey", ctypes.c_ulong),
+                ("hIcon", ctypes.c_void_p),
+                ("hProcess", ctypes.c_void_p),
+            ]
+
+        sei = SHELLEXECUTEINFO()
+        sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS
+        sei.hwnd = None
+        sei.lpVerb = "runas"
+        sei.lpFile = target
+        sei.lpParameters = params
+        sei.lpDirectory = cwd or os.getcwd()
+        sei.nShow = SW_SHOW
+        sei.hInstApp = None
+        sei.lpIDList = None
+        sei.lpClass = None
+        sei.hkeyClass = None
+        sei.dwHotKey = 0
+        sei.hIcon = None
+        sei.hProcess = None
+
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+            err = ctypes.GetLastError()
+            if err == 1223:  # ERROR_CANCELLED
+                return False, None, "User cancelled the UAC prompt."
+            return False, None, str(ctypes.WinError(err))
+
+        exit_code: Optional[int] = None
+        if sei.hProcess:
+            ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 0xFFFFFFFF)
+            code = wintypes.DWORD()
+            ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+            exit_code = int(code.value)
+
+        return True, exit_code, None
+
+    def _launch_npcap_installer(self, installer_path: str) -> dict:
+        cwd = os.path.dirname(installer_path) or None
+        self.npcapInstallStatus.emit("Launching installer (UAC)...")
+        ok, exit_code, err = self._shell_execute_elevated(installer_path, "/S", cwd)
+        result = {"success": False, "message": "Npcap installation failed.", "cancelled": False}
+        if not ok:
+            result["message"] = err or "Npcap installation was cancelled."
+            result["cancelled"] = True if err and "cancel" in err.lower() else False
+            return result
+
+        if exit_code not in (None, 0):
+            result["message"] = f"Npcap installer exited with code {exit_code}."
+            return result
+
+        result["success"] = True
+        result["message"] = "Npcap installation completed. Please restart the application."
+        return result
+
+    def install_npcap(self):
+        if os.name != "nt":
+            QMessageBox.information(self, "Npcap", "Npcap installation is only supported on Windows.")
+            return
+
+        confirmation = QMessageBox.question(
+            self,
+            "Install Npcap",
+            "Npcap is required for ARP, LLDP and advanced Layer-2 features.\n\nDownload and install Npcap 1.79 now?",
+        )
+        if confirmation != QMessageBox.Yes:
+            self.set_env_message("Npcap installation cancelled by user.")
+            return
+
+        self.btn_install_npcap.setEnabled(False)
+        self.set_env_message("Preparing Npcap installation...")
+
+        def worker():
+            result: dict
+            try:
+                installer_path = self._download_npcap_installer()
+                result = self._launch_npcap_installer(installer_path)
+            except Exception as exc:
+                result = {"success": False, "message": f"Npcap installation failed: {exc}", "cancelled": False}
+            self.npcapInstallResult.emit(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(dict)
+    def apply_npcap_install_result(self, result: dict):
+        self.btn_install_npcap.setEnabled(True)
+        message = result.get("message") or "Npcap installation completed."
+        self.set_env_message(message)
+        self.run_env_checks()
+        if result.get("success"):
+            restart = QMessageBox.question(
+                self,
+                "Restart required",
+                "Npcap installation succeeded. Restart the application now to enable Layer-2 features?",
+            )
+            if restart == QMessageBox.Yes:
+                self._restart_application(elevated=bool(self.is_admin))
+            else:
+                QMessageBox.information(self, "Npcap", "Restart later to enable Layer-2 capabilities.")
+        else:
+            if result.get("cancelled"):
+                QMessageBox.information(self, "Npcap", message)
+            else:
+                QMessageBox.warning(self, "Npcap", message)
 
     def fetch_external_ip(self):
         def worker():
@@ -3202,6 +3368,32 @@ QHeaderView::section {
             self.igmp_check_running = False
 
     def _check_npcap_installed(self) -> Optional[bool]:
+        if os.name != "nt":
+            return False
+
+        def _check_registry() -> bool:
+            if not winreg:
+                return False
+            for key_name in (r"SOFTWARE\\Npcap", r"SOFTWARE\\WOW6432Node\\Npcap"):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name):
+                        return True
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    return False
+            return False
+
+        def _check_installers() -> bool:
+            paths = []
+            for env_key in ("ProgramFiles", "ProgramFiles(x86)"):
+                base_dir = os.environ.get(env_key)
+                if base_dir:
+                    paths.append(os.path.join(base_dir, "Npcap", "NPFInstall.exe"))
+            system_root = os.environ.get("SystemRoot", "C:\\Windows")
+            paths.append(os.path.join(system_root, "System32", "Npcap", "NPFInstall.exe"))
+            return any(os.path.exists(p) for p in paths)
+
         try:
             proc = subprocess.run(["sc", "query", "npcap"], capture_output=True, text=True, timeout=3)
             if proc.returncode == 0 and proc.stdout:
@@ -3210,6 +3402,9 @@ QHeaderView::section {
             pass
         except Exception:
             return None
+
+        if _check_registry() or _check_installers():
+            return True
 
         system_root = os.environ.get("SystemRoot", "C:\\Windows")
         for dll in ["wpcap.dll", "Packet.dll"]:
@@ -3288,8 +3483,19 @@ QHeaderView::section {
             self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic, "sm")
             self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin, "sm")
             self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp, "sm")
+            self._update_feature_availability()
         finally:
             self.env_check_running = False
+
+    def _update_feature_availability(self):
+        self.btn_restart_admin.setVisible(os.name == "nt" and self.is_admin is False)
+        l2_ready = bool(self.is_admin and self.npcap_available)
+        if hasattr(self, "btn_l2_refresh"):
+            self.btn_l2_refresh.setEnabled(l2_ready)
+        if hasattr(self, "l2_toggle_btn"):
+            self.l2_toggle_btn.setEnabled(l2_ready)
+        if hasattr(self, "btn_install_npcap"):
+            self.btn_install_npcap.setVisible(os.name == "nt" and not self.npcap_available)
 
     def run_l2_check(self):
         if self.l2_check_running:
@@ -3298,6 +3504,14 @@ QHeaderView::section {
         iface_name = data.get("name") if isinstance(data, dict) else None
         if not iface_name:
             self._update_l2_ui({"lldp": {"status": "Unknown"}, "vlans": {"status": "Unknown", "vlans": []}})
+            return
+
+        if not self.npcap_available:
+            self._update_l2_ui({"lldp": {"status": "Unavailable", "error": "Npcap not installed"}, "vlans": {"status": "Unknown", "vlans": []}, "meta": {"iface": iface_name, "error": "Npcap not installed"}})
+            return
+
+        if not self.is_admin:
+            self._update_l2_ui({"lldp": {"status": "Unavailable", "error": "Administrator privileges required"}, "vlans": {"status": "Unknown", "vlans": []}, "meta": {"iface": iface_name, "error": "Administrator privileges required"}})
             return
 
         self.l2_check_running = True
@@ -3420,7 +3634,7 @@ QHeaderView::section {
             if not neighbors:
                 self.lldp_neighbors_combo.clear()
                 self.lldp_neighbors_combo.addItem("Unavailable", None)
-            self.lldp_error_hint.setText("Run application as Administrator to enable LLDP discovery")
+            self.lldp_error_hint.setText(lldp.get("error") or "Run application as Administrator to enable LLDP discovery")
         elif lldp.get("error"):
             self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
         elif meta_error:
@@ -3456,23 +3670,28 @@ QHeaderView::section {
             text = "\n".join(lines)
         QApplication.clipboard().setText(text)
 
+    def _restart_application(self, elevated: bool = False):
+        params = " ".join(f'"{arg}"' for arg in sys.argv)
+        if elevated and os.name == "nt":
+            ok, _, err = self._shell_execute_elevated(sys.executable, params, os.getcwd())
+            if not ok:
+                QMessageBox.warning(self, "Restart failed", err or "Unable to request elevation.")
+                return
+        else:
+            try:
+                subprocess.Popen([sys.executable, *sys.argv], cwd=os.getcwd())
+            except Exception as exc:
+                QMessageBox.warning(self, "Restart failed", str(exc))
+                return
+
+        QApplication.instance().quit()
+
     def restart_as_admin(self):
         if os.name != "nt":
             QMessageBox.information(self, "Restart", "Restart as Administrator is only available on Windows.")
             return
 
-        params = " ".join(f'"{arg}"' for arg in sys.argv)
-        try:
-            res = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-        except Exception as e:
-            QMessageBox.warning(self, "Restart failed", str(e))
-            return
-
-        if res <= 32:
-            QMessageBox.warning(self, "Restart failed", "Unable to request elevation.")
-            return
-
-        QApplication.instance().quit()
+        self._restart_application(elevated=True)
 
     def refresh_av_insights(self, auto_trigger: bool = False):
         if self.av_check_running:
