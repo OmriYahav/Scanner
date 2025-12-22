@@ -15,6 +15,8 @@ import errno
 import json
 import base64
 import tempfile
+import logging
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple, Any
@@ -136,6 +138,22 @@ def get_active_ipv4_interfaces() -> List[dict]:
 DEFAULT_OUI_URL = "https://raw.githubusercontent.com/oui-lookup/ieee-oui/master/oui.csv"
 
 
+def setup_logging():
+    log_dir = Path.home() / ".scanner" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_dir / "scanner.log"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+logger = logging.getLogger(__name__)
+
+
 def build_oui_map(path: str) -> Dict[str, str]:
     """
     CSV format: OUI,Vendor
@@ -166,11 +184,14 @@ def load_oui_map(path: str = "oui.csv", url: str = DEFAULT_OUI_URL) -> Dict[str,
     if not os.path.exists(path):
         try:
             resp = requests.get(url, timeout=10)
-            if resp.status_code == 200 and resp.text:
+            resp.raise_for_status()
+            if resp.text:
                 with open(path, "w", encoding="utf-8", errors="ignore") as f:
                     f.write(resp.text)
+        except requests.RequestException as e:
+            logger.error("Failed to download OUI data from %s: %s", url, e)
         except Exception:
-            pass
+            logger.exception("Unexpected error while downloading OUI data")
 
     return build_oui_map(path)
 
@@ -2099,6 +2120,7 @@ class MainWindow(QMainWindow):
     ONLINE_TTL_SEC = 60
     STALE_TTL_SEC = 180
     OFFLINE_AFTER_SEC = 300
+    STALE_DEVICE_MAX_AGE_HOURS = 24
 
     def __init__(self):
         super().__init__()
@@ -2113,6 +2135,7 @@ class MainWindow(QMainWindow):
         self.devices_by_key: Dict[str, Device] = {}
         self.ip_to_key: Dict[str, str] = {}
         self._row_by_key: Dict[str, int] = {}
+        self._pending_lock = threading.Lock()
         self._pending_updates: Dict[str, Device] = {}
         self._update_timer = QTimer(self)
         self._update_timer.setInterval(200)
@@ -4225,6 +4248,7 @@ QHeaderView::section {
             self.live_feed.verticalScrollBar().setValue(self.live_feed.verticalScrollBar().maximum())
 
     def _tick_presence(self):
+        self._cleanup_stale_devices()
         changed: List[Device] = []
         for key, dev in self.devices_by_key.items():
             prev = self._last_presence_state.get(key)
@@ -4237,6 +4261,24 @@ QHeaderView::section {
         for dev in changed:
             self.upsert_device_row(dev)
         if changed:
+            self._update_status_counts()
+
+    def _cleanup_stale_devices(self):
+        max_age = self.STALE_DEVICE_MAX_AGE_HOURS * 3600
+        now = time.time()
+        stale_entries: List[Tuple[str, Device]] = []
+        for key, dev in list(self.devices_by_key.items()):
+            if now - dev.last_seen_ts > max_age:
+                stale_entries.append((key, dev))
+
+        for key, dev in stale_entries:
+            self._remove_device_row(key)
+            self.devices_by_key.pop(key, None)
+            self._last_presence_state.pop(key, None)
+            for ip in {dev.ip, *dev.ips_seen}:
+                self.devices_map.pop(ip, None)
+                self.ip_to_key.pop(ip, None)
+        if stale_entries:
             self._update_status_counts()
 
     def upsert_device_row(self, d: Device):
@@ -4304,21 +4346,31 @@ QHeaderView::section {
             if other_row > row:
                 self._row_by_key[other_key] = other_row - 1
 
+    def _queue_pending_update(self, device: Device):
+        key = device.primary_key or device.ip
+        with self._pending_lock:
+            self._pending_updates[key] = device
+
     @Slot(object)
     def on_device_found(self, device: Device):
         merged = self._merge_identity(device)
-        self._pending_updates[merged.primary_key or merged.ip] = merged
+        self._queue_pending_update(merged)
 
     def flush_pending_updates(self):
-        if not self._pending_updates:
+        with self._pending_lock:
+            if not self._pending_updates:
+                updates: List[Device] = []
+            else:
+                updates = list(self._pending_updates.values())
+                self._pending_updates.clear()
+
+        if not updates:
             for dev in self.devices_by_key.values():
                 key = dev.primary_key or dev.ip
                 row = self._row_by_key.get(key)
                 if row is not None:
                     self.table.setRowHidden(row, self._should_hide_state(self._presence_state(dev)))
             return
-        updates = list(self._pending_updates.values())
-        self._pending_updates.clear()
         for dev in updates:
             self.upsert_device_row(dev)
         self._update_status_counts()
@@ -4380,7 +4432,8 @@ QHeaderView::section {
         self.devices_by_key = {}
         self.ip_to_key = {}
         self._row_by_key = {}
-        self._pending_updates = {}
+        with self._pending_lock:
+            self._pending_updates.clear()
         self._last_presence_state = {}
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -4478,7 +4531,7 @@ QHeaderView::section {
     def on_partial_results(self, devices: List[Device]):
         for d in devices:
             merged = self._merge_identity(d)
-            self._pending_updates[merged.primary_key or merged.ip] = merged
+            self._queue_pending_update(merged)
         self.flush_pending_updates()
 
     @Slot(int, int, str)
@@ -4497,7 +4550,7 @@ QHeaderView::section {
             if d.mac and not d.vendor:
                 d.vendor = vendor_from_mac(d.mac, self.oui_map)
             merged = self._merge_identity(d)
-            self._pending_updates[merged.primary_key or merged.ip] = merged
+            self._queue_pending_update(merged)
 
         self.flush_pending_updates()
         self.table.setSortingEnabled(True)
@@ -4578,6 +4631,7 @@ QHeaderView::section {
 
 
 def main():
+    setup_logging()
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
