@@ -15,7 +15,7 @@ import errno
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional, Set, List, Dict, Tuple
+from typing import Optional, Set, List, Dict, Tuple, Any
 
 import psutil
 from collections import defaultdict
@@ -172,6 +172,181 @@ def is_running_as_admin() -> Optional[bool]:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return None
+
+
+LLDP_TIMEOUT_SECONDS = 8
+
+
+def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple[List[dict], dict]:
+    start_ts = time.monotonic()
+    neighbors: List[dict] = []
+    meta: Dict[str, Any] = {
+        "command": None,
+        "exit_code": None,
+        "stdout_len": None,
+        "stderr_len": None,
+        "elapsed_ms": None,
+        "timeout": False,
+        "error": None,
+        "source": "PowerShell",
+    }
+
+    if os.name != "nt":
+        meta["error"] = "PowerShell LLDP unavailable on non-Windows"
+        meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        return neighbors, meta
+
+    ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    if not ps_exe:
+        meta["error"] = "PowerShell not found"
+        meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        return neighbors, meta
+
+    iface_filter = ""
+    if interface_name_or_alias:
+        safe_iface = str(interface_name_or_alias).replace("'", "''")
+        iface_filter = (
+            f"$capture = $capture | Where-Object {{ $_.Interface -eq '{safe_iface}' "
+            f"-or $_.InterfaceAlias -eq '{safe_iface}' }}"
+        )
+
+    script_lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "$VerbosePreference = 'SilentlyContinue'",
+        "$InformationPreference = 'SilentlyContinue'",
+        "$capture = Invoke-DiscoveryProtocolCapture -Type LLDP -Force | Get-DiscoveryProtocolData",
+        "if ($null -eq $capture) { $capture = @() }",
+    ]
+
+    if iface_filter:
+        script_lines.append(iface_filter)
+
+    script_lines.extend(
+        [
+            "$result = $capture | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer",
+            "if ($null -eq $result) { $result = @() }",
+            "$json = $result | ConvertTo-Json -Depth 6",
+            "if (-not $json) { $json = '[]' }",
+            "Write-Output $json",
+        ]
+    )
+
+    ps_script = (
+        "try { "
+        + "; ".join(script_lines)
+        + " } catch { $msg = $_.Exception.Message; [Console]::Error.WriteLine($msg); exit 1 }"
+    )
+
+    cmd = [
+        ps_exe,
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        ps_script,
+    ]
+    meta["command"] = " ".join(cmd)
+
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":  # pragma: no cover - Windows only
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        except AttributeError:
+            creationflags = 0
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+    except Exception as e:
+        meta["error"] = str(e)
+        meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        return neighbors, meta
+
+    try:
+        stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        meta["timeout"] = True
+        meta["error"] = f"LLDP PowerShell capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        if os.name == "nt":  # pragma: no cover - Windows only
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=1)
+        except Exception:
+            stdout, stderr = "", ""
+    except Exception as e:
+        meta["error"] = str(e)
+        stdout, stderr = "", ""
+
+    exit_code = proc.returncode if proc.returncode is not None else -1
+    meta["exit_code"] = exit_code
+    meta["stdout_len"] = len(stdout or "")
+    meta["stderr_len"] = len(stderr or "")
+    meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+
+    stderr_clean = (stderr or "").strip() or None
+    if meta.get("error") or exit_code not in (0, None):
+        meta["error"] = meta.get("error") or stderr_clean or "PowerShell execution failed"
+        return neighbors, meta
+
+    output = (stdout or "").strip()
+    if not output:
+        return neighbors, meta
+
+    try:
+        data = json.loads(output)
+    except Exception as e:
+        meta["error"] = f"Failed to parse PowerShell output: {e}"
+        return neighbors, meta
+
+    entries = data if isinstance(data, list) else [data]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        mgmt_addr = entry.get("ManagementAddress") or entry.get("IPAddress")
+        if isinstance(mgmt_addr, list):
+            mgmt_addr = mgmt_addr[0] if mgmt_addr else None
+
+        def norm(value: Optional[str]) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, list):
+                return str(value[0]) if value else None
+            return str(value)
+
+        neighbor = {
+            "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
+            "chassis_id": norm(entry.get("ChassisId")),
+            "port_id": norm(entry.get("Port") or entry.get("PortId")),
+            "port_description": None,
+            "management_address": norm(mgmt_addr),
+            "raw": entry,
+        }
+        neighbors.append(neighbor)
+
+    return neighbors, meta
 
 
 def is_device_online(d: Device) -> bool:
@@ -1669,144 +1844,6 @@ class Layer2InfoWorker(QThread):
                 return neighbor
         return neighbors[0]
 
-    def run_powershell_lldp(self, iface_name: Optional[str]) -> dict:
-        if os.name != "nt":
-            return {
-                "status": "Unavailable",
-                "error": "PowerShell LLDP unavailable on non-Windows",
-                "neighbors": [],
-                "captured": 0,
-                "lldp_frames": 0,
-                "source": None,
-            }
-
-        ps_exe = shutil.which("powershell") or shutil.which("pwsh")
-        if not ps_exe:
-            return {
-                "status": "Unavailable",
-                "error": "PowerShell not found",
-                "neighbors": [],
-                "captured": 0,
-                "lldp_frames": 0,
-                "source": None,
-            }
-
-        iface_filter = ""
-        if iface_name:
-            safe_iface = str(iface_name).replace("'", "''")
-            iface_filter = f" | Where-Object {{ $_.Interface -eq '{safe_iface}' -or $_.InterfaceAlias -eq '{safe_iface}' }}"
-
-        ps_command = (
-            "Invoke-DiscoveryProtocolCapture -Type LLDP -Force | "
-            "Get-DiscoveryProtocolData"
-            f"{iface_filter}"
-            " | Select-Object Port,PortDescription,SystemName,SystemDescription,ChassisId,ManagementAddress,TimeToLive,Interface,MacAddress,IPAddress"
-            " | ConvertTo-Json -Depth 6 -Compress"
-        )
-
-        try:
-            proc = subprocess.run(
-                [
-                    ps_exe,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    ps_command,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=8,
-            )
-        except Exception as e:
-            return {
-                "status": "Unavailable",
-                "error": str(e),
-                "neighbors": [],
-                "captured": 0,
-                "lldp_frames": 0,
-                "source": None,
-            }
-
-        stderr = proc.stderr.strip() or None
-        clean_stderr = stderr.splitlines()[0] if stderr else None
-        stdout = proc.stdout.strip()
-        if proc.returncode != 0:
-            err_text = clean_stderr or f"PowerShell exit code {proc.returncode}"
-            lower = (clean_stderr or "").lower()
-            if any(t in lower for t in ["admin", "elevat", "privilege", "permission"]):
-                err_text = "Requires Administrator privileges"
-            return {
-                "status": "Unavailable",
-                "error": err_text,
-                "neighbors": [],
-                "captured": 0,
-                "lldp_frames": 0,
-                "source": None,
-            }
-
-        if not stdout:
-            return {
-                "status": "Not detected",
-                "error": clean_stderr,
-                "neighbors": [],
-                "captured": 0,
-                "lldp_frames": 0,
-                "source": "PowerShell",
-            }
-
-        try:
-            data = json.loads(stdout)
-        except Exception as e:
-            return {
-                "status": "Unavailable",
-                "error": f"Failed to parse PowerShell output: {e}",
-                "neighbors": [],
-                "captured": 0,
-                "lldp_frames": 0,
-                "source": None,
-            }
-
-        entries = data if isinstance(data, list) else [data]
-        neighbors: List[dict] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            mgmt_addr = entry.get("ManagementAddress")
-            ip_addr = entry.get("IPAddress")
-            if isinstance(ip_addr, list) and ip_addr:
-                mgmt_fallback = ip_addr[0]
-            else:
-                mgmt_fallback = ip_addr
-
-            def norm(value: Optional[str]) -> Optional[str]:
-                if value is None:
-                    return None
-                if isinstance(value, list):
-                    return str(value[0]) if value else None
-                return str(value)
-
-            neighbor = {
-                "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
-                "chassis_id": norm(entry.get("ChassisId")),
-                "port_id": norm(entry.get("Port") or entry.get("PortId")),
-                "port_description": norm(entry.get("PortDescription")),
-                "management_address": norm(mgmt_addr or mgmt_fallback),
-                "raw": entry,
-            }
-            neighbors.append(neighbor)
-
-        status = "Detected" if neighbors else "Not detected"
-        return {
-            "status": status,
-            "error": stderr,
-            "neighbors": neighbors,
-            "captured": len(neighbors),
-            "lldp_frames": len(neighbors),
-            "source": "PowerShell",
-        }
-
     def run(self):
         admin_state = self.is_admin if self.is_admin is not None else is_running_as_admin()
         admin_text = "Yes" if admin_state else ("No" if admin_state is False else "Unknown")
@@ -1839,20 +1876,24 @@ class Layer2InfoWorker(QThread):
             self.result.emit(payload)
             return
 
-        ps_result = self.run_powershell_lldp(self.iface_name)
-        lldp_neighbors_cache = ps_result.get("neighbors", []) if ps_result else []
+        neighbors, ps_meta = run_lldp_powershell_capture(self.iface_name)
+        lldp_neighbors_cache = list(neighbors)
+        lldp_status = "Detected" if lldp_neighbors_cache else "Not detected"
+        if ps_meta.get("error"):
+            lldp_status = "Unavailable"
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
-        payload["lldp"]["status"] = ps_result.get("status", "Unknown") if ps_result else "Unknown"
-        payload["lldp"]["source"] = ps_result.get("source") if ps_result else None
-        payload["lldp"]["error"] = ps_result.get("error") if ps_result else None
+        payload["lldp"]["status"] = lldp_status
+        payload["lldp"]["source"] = ps_meta.get("source")
+        payload["lldp"]["error"] = ps_meta.get("error")
         if payload["lldp"]["primary"]:
             payload["lldp"].update(payload["lldp"]["primary"])
-        payload["meta"]["captured"] = ps_result.get("captured", 0) if ps_result else 0
-        payload["meta"]["lldp_frames"] = ps_result.get("lldp_frames", 0) if ps_result else 0
+        payload["meta"]["captured"] = len(lldp_neighbors_cache)
+        payload["meta"]["lldp_frames"] = len(lldp_neighbors_cache)
         payload["meta"]["lldp_source"] = payload["lldp"].get("source")
-        if ps_result and ps_result.get("error"):
-            payload["meta"]["error"] = ps_result.get("error")
+        payload["meta"]["lldp_debug"] = ps_meta
+        if ps_meta.get("error"):
+            payload["meta"]["error"] = ps_meta.get("error")
 
         allow_lldp_from_scapy = (
             admin_state is True
