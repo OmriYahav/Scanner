@@ -449,8 +449,19 @@ def normalize_description(existing: Optional[str], new: Optional[str]) -> Option
 
 
 def is_npcap_available() -> bool:
+    if os.name != "nt":
+        return False
     if not SCAPY_AVAILABLE or conf is None:
         return False
+    try:
+        for svc in ("npcap", "npf"):
+            proc = subprocess.run(["sc", "query", svc], capture_output=True, text=True, timeout=2)
+            if proc.returncode == 0 and "RUNNING" in (proc.stdout or "").upper():
+                break
+        else:
+            return False
+    except Exception:
+        pass
     try:
         sock = conf.L2socket()
         if sock:
@@ -2092,6 +2103,9 @@ class MainWindow(QMainWindow):
         self._update_timer.setInterval(200)
         self._update_timer.timeout.connect(self.flush_pending_updates)
         self.npcap_available = False
+        self.npcap_installed_state: Optional[bool] = None
+        self.npf_driver_running: Optional[bool] = None
+        self.capture_provider_available: Optional[bool] = None
         self.last_connectivity_state: Optional[bool] = None
         self.last_connectivity_ts: float = 0.0
         self.igmp_check_running = False
@@ -2305,9 +2319,13 @@ class MainWindow(QMainWindow):
         env_layout = self.env_group.content_layout
         env_rows = []
         self.npcap_status_lbl = QLabel()
+        self.npf_status_lbl = QLabel()
+        self.pcap_status_lbl = QLabel()
         self.admin_status_lbl = QLabel()
         self.arp_status_lbl = QLabel()
         env_rows.append(("Npcap", self.npcap_status_lbl))
+        env_rows.append(("Npcap Driver", self.npf_status_lbl))
+        env_rows.append(("Pcap Provider", self.pcap_status_lbl))
         env_rows.append(("Administrator", self.admin_status_lbl))
         env_rows.append(("ARP", self.arp_status_lbl))
         for title_text, lbl in env_rows:
@@ -2320,7 +2338,9 @@ class MainWindow(QMainWindow):
             row.addWidget(lbl)
             row.addStretch(1)
             env_layout.addLayout(row)
-        arp_hint = QLabel("ARP may require Admin and/or Npcap for best results.")
+        arp_hint = QLabel(
+            "Npcap + Administrator privileges enable ARP/LLDP capture. Install with WinPcap API support and restart as Admin if capture shows unavailable."
+        )
         arp_hint.setObjectName("hintLabel")
         env_layout.addWidget(arp_hint)
         self.env_message_lbl = QLabel()
@@ -3045,13 +3065,22 @@ QHeaderView::section {
 
     def update_npcap_state(self):
         installed_state = self._check_npcap_installed()
-        self.npcap_available = installed_state is True
+        driver_present, driver_running, driver_detail = self._check_npf_driver_status()
+        pcap_state, pcap_detail = self._check_pcap_provider_available()
+        self.npcap_installed_state = installed_state
+        self.npf_driver_running = driver_running
+        self.capture_provider_available = pcap_state is True
+        self.npcap_available = bool(installed_state and driver_running and self.capture_provider_available)
         self.btn_install_npcap.setVisible(not self.npcap_available and os.name == "nt")
         if self.npcap_available:
             if self.status_lbl.text().startswith("Npcap is not installed"):
                 self.status_lbl.setText("Ready.")
         elif installed_state is False:
             self.status_lbl.setText("Npcap is not installed. ARP (MAC discovery) is disabled.")
+        elif driver_present is False or driver_running is False:
+            self.status_lbl.setText(driver_detail or "Npcap driver not running.")
+        elif pcap_state is False:
+            self.status_lbl.setText(pcap_detail or "No libpcap provider available. Capture disabled.")
         else:
             self.status_lbl.setText("Npcap status unknown. Some features may be unavailable.")
         self._update_feature_availability()
@@ -3070,79 +3099,41 @@ QHeaderView::section {
                 for chunk in resp.iter_content(chunk_size=1024 * 64):
                     if chunk:
                         fh.write(chunk)
+
+        size_bytes = os.path.getsize(installer_path)
+        header = b""
+        with open(installer_path, "rb") as fh:
+            header = fh.read(2)
+        print(f"[Npcap] Downloaded installer to {installer_path} (size={size_bytes} bytes, magic={header!r})")
+        if size_bytes < 2 * 1024 * 1024 or header != b"MZ":
+            raise ValueError("Installer download failed (not an EXE)")
+        self.npcapInstallStatus.emit(f"Installer downloaded ({size_bytes // 1024 // 1024} MB).")
         return installer_path
 
     def _shell_execute_elevated(self, target: str, params: str, cwd: Optional[str] = None) -> Tuple[bool, Optional[int], Optional[str]]:
         if os.name != "nt" or not wintypes:
             return False, None, "Elevation is only supported on Windows."
 
-        SEE_MASK_NOCLOSEPROCESS = 0x00000040
+        ShellExecuteW = ctypes.windll.shell32.ShellExecuteW  # type: ignore
         SW_SHOW = 5
-
-        class SHELLEXECUTEINFO(ctypes.Structure):  # type: ignore
-            _fields_ = [
-                ("cbSize", ctypes.c_ulong),
-                ("fMask", ctypes.c_ulong),
-                ("hwnd", wintypes.HWND),
-                ("lpVerb", wintypes.LPCWSTR),
-                ("lpFile", wintypes.LPCWSTR),
-                ("lpParameters", wintypes.LPCWSTR),
-                ("lpDirectory", wintypes.LPCWSTR),
-                ("nShow", ctypes.c_int),
-                ("hInstApp", ctypes.c_void_p),
-                ("lpIDList", ctypes.c_void_p),
-                ("lpClass", wintypes.LPCWSTR),
-                ("hkeyClass", ctypes.c_void_p),
-                ("dwHotKey", ctypes.c_ulong),
-                ("hIcon", ctypes.c_void_p),
-                ("hProcess", ctypes.c_void_p),
-            ]
-
-        sei = SHELLEXECUTEINFO()
-        sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS
-        sei.hwnd = None
-        sei.lpVerb = "runas"
-        sei.lpFile = target
-        sei.lpParameters = params
-        sei.lpDirectory = cwd or os.getcwd()
-        sei.nShow = SW_SHOW
-        sei.hInstApp = None
-        sei.lpIDList = None
-        sei.lpClass = None
-        sei.hkeyClass = None
-        sei.dwHotKey = 0
-        sei.hIcon = None
-        sei.hProcess = None
-
-        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        cwd_to_use = cwd or os.getcwd()
+        print(f"[Npcap] Requesting elevation for {target} with params '{params}' (cwd={cwd_to_use})")
+        result = ShellExecuteW(None, "runas", target, params, cwd_to_use, SW_SHOW)
+        if result <= 32:
             err = ctypes.GetLastError()
-            if err == 1223:  # ERROR_CANCELLED
+            if err == 1223:
                 return False, None, "User cancelled the UAC prompt."
             return False, None, str(ctypes.WinError(err))
-
-        exit_code: Optional[int] = None
-        if sei.hProcess:
-            ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 0xFFFFFFFF)
-            code = wintypes.DWORD()
-            ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
-            ctypes.windll.kernel32.CloseHandle(sei.hProcess)
-            exit_code = int(code.value)
-
-        return True, exit_code, None
+        return True, None, None
 
     def _launch_npcap_installer(self, installer_path: str) -> dict:
         cwd = os.path.dirname(installer_path) or None
         self.npcapInstallStatus.emit("Launching installer (UAC)...")
-        ok, exit_code, err = self._shell_execute_elevated(installer_path, "/S", cwd)
+        ok, exit_code, err = self._shell_execute_elevated(installer_path, "", cwd)
         result = {"success": False, "message": "Npcap installation failed.", "cancelled": False}
         if not ok:
             result["message"] = err or "Npcap installation was cancelled."
             result["cancelled"] = True if err and "cancel" in err.lower() else False
-            return result
-
-        if exit_code not in (None, 0):
-            result["message"] = f"Npcap installer exited with code {exit_code}."
             return result
 
         result["success"] = True
@@ -3395,9 +3386,11 @@ QHeaderView::section {
             return any(os.path.exists(p) for p in paths)
 
         try:
-            proc = subprocess.run(["sc", "query", "npcap"], capture_output=True, text=True, timeout=3)
-            if proc.returncode == 0 and proc.stdout:
-                return True
+            for svc in ("npcap", "npf"):
+                proc = subprocess.run(["sc", "query", svc], capture_output=True, text=True, timeout=3)
+                if proc.returncode == 0 and proc.stdout:
+                    print(f"[Npcap] Service {svc} detected during install check")
+                    return True
         except FileNotFoundError:
             pass
         except Exception:
@@ -3412,6 +3405,60 @@ QHeaderView::section {
             if os.path.exists(dll_path):
                 return True
         return False
+
+    def _check_npf_driver_status(self) -> Tuple[Optional[bool], Optional[bool], str]:
+        if os.name != "nt":
+            return False, False, "Not a Windows platform"
+
+        try:
+            subprocess.run(["sc"], capture_output=True, timeout=2)
+        except FileNotFoundError:
+            return None, None, "Service control (sc) not available"
+        except Exception as exc:
+            return None, None, str(exc)
+
+        for svc in ("npcap", "npf"):
+            try:
+                proc = subprocess.run(["sc", "query", svc], capture_output=True, text=True, timeout=3)
+            except Exception as exc:
+                return None, None, str(exc)
+
+            output = (proc.stdout or "").lower()
+            if proc.returncode == 0 and output:
+                running = "running" in output
+                print(f"[Npcap] Service {svc} present. Running={running}")
+                return True, running, f"Service {svc} {'running' if running else 'stopped'}"
+
+        return False, False, "Npcap/NPF service not found"
+
+    def _check_pcap_provider_available(self) -> Tuple[Optional[bool], str]:
+        if os.name != "nt":
+            return False, "Npcap required only on Windows"
+        if not SCAPY_AVAILABLE or conf is None:
+            return None, "Scapy is not available"
+
+        provider = getattr(conf, "pcap_provider", None)
+        use_pcap = getattr(conf, "use_pcap", None)
+        detail_parts = []
+        if provider:
+            detail_parts.append(f"provider={provider}")
+        if use_pcap is not None:
+            detail_parts.append(f"use_pcap={use_pcap}")
+
+        try:
+            sock = conf.L2socket()
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                detail_parts.append("L2socket opened successfully")
+                return True, "; ".join(detail_parts)
+        except Exception as exc:
+            detail_parts.append(f"L2socket error: {exc}")
+
+        detail = "; ".join(detail_parts) or "No libpcap provider available"
+        return False, detail
 
     def _check_is_admin(self) -> Optional[bool]:
         if self.is_admin is not None:
@@ -3435,6 +3482,8 @@ QHeaderView::section {
 
     def detect_env_status(self) -> dict:
         npcap_state = self._check_npcap_installed()
+        driver_present, driver_running, driver_detail = self._check_npf_driver_status()
+        pcap_state, pcap_detail = self._check_pcap_provider_available()
         admin_state = self._check_is_admin()
         arp_state = self._check_arp_available()
 
@@ -3445,8 +3494,25 @@ QHeaderView::section {
                 return false_text
             return "Unknown"
 
+        def driver_text(present: Optional[bool], running: Optional[bool]) -> str:
+            if running is True:
+                return "Running"
+            if present is True:
+                return "Present (stopped)"
+            if present is False:
+                return "Not found"
+            return "Unknown"
+
         return {
             "npcap": to_text(npcap_state, "Installed", "Not installed"),
+            "npcap_raw": npcap_state,
+            "driver": driver_text(driver_present, driver_running),
+            "driver_present": driver_present,
+            "driver_running": driver_running,
+            "driver_detail": driver_detail,
+            "pcap": to_text(pcap_state, "Available", "Unavailable"),
+            "pcap_raw": pcap_state,
+            "pcap_detail": pcap_detail,
             "admin": to_text(admin_state, "Admin", "Not Admin"),
             "arp": to_text(arp_state, "Available", "Limited/Unavailable"),
         }
@@ -3460,7 +3526,19 @@ QHeaderView::section {
             try:
                 result = self.detect_env_status()
             except Exception:
-                result = {"npcap": "Unknown", "admin": "Unknown", "arp": "Unknown"}
+                result = {
+                    "npcap": "Unknown",
+                    "npcap_raw": None,
+                    "driver": "Unknown",
+                    "driver_present": None,
+                    "driver_running": None,
+                    "driver_detail": "",
+                    "pcap": "Unknown",
+                    "pcap_raw": None,
+                    "pcap_detail": "",
+                    "admin": "Unknown",
+                    "arp": "Unknown",
+                }
             self.envStatusChanged.emit(result)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3475,21 +3553,44 @@ QHeaderView::section {
                 "limited/unavailable": "red",
                 "unknown": "yellow",
             }
+            color_map_driver = {
+                "running": "green",
+                "present (stopped)": "yellow",
+                "not found": "red",
+                "unknown": "yellow",
+            }
+            color_map_pcap = {"available": "green", "unavailable": "red", "unknown": "yellow"}
             admin_text = str(payload.get("admin", "Unknown"))
             if admin_text.lower() == "admin":
                 self.is_admin = True
             elif admin_text.lower() == "not admin":
                 self.is_admin = False
+            self.npcap_installed_state = payload.get("npcap_raw")
+            self.npf_driver_running = payload.get("driver_running")
+            self.capture_provider_available = payload.get("pcap_raw") is True
+            self.npcap_available = bool(self.npcap_installed_state and self.npf_driver_running and self.capture_provider_available)
             self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic, "sm")
+            self._style_status(self.npf_status_lbl, "Npcap Driver", payload.get("driver", "Unknown"), color_map_driver, "sm")
+            self._style_status(self.pcap_status_lbl, "Pcap Provider", payload.get("pcap", "Unknown"), color_map_pcap, "sm")
             self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin, "sm")
             self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp, "sm")
+            env_message = ""
+            if payload.get("npcap_raw") is False:
+                env_message = "Npcap is not installed. Use Install Npcap to enable Layer-2 features."
+            elif payload.get("driver_running") is False:
+                env_message = "Npcap driver is not running. Reinstall Npcap (WinPcap API mode) and restart as Administrator."
+            elif payload.get("pcap_raw") is False:
+                env_message = "No libpcap provider available. Reinstall Npcap with WinPcap API-compatible mode and restart as Administrator."
+            elif admin_text.lower() != "admin":
+                env_message = "Restart as Administrator to enable capture features."
+            self.set_env_message(env_message)
             self._update_feature_availability()
         finally:
             self.env_check_running = False
 
     def _update_feature_availability(self):
         self.btn_restart_admin.setVisible(os.name == "nt" and self.is_admin is False)
-        l2_ready = bool(self.is_admin and self.npcap_available)
+        l2_ready = bool(self.is_admin and self.capture_provider_available)
         if hasattr(self, "btn_l2_refresh"):
             self.btn_l2_refresh.setEnabled(l2_ready)
         if hasattr(self, "l2_toggle_btn"):
@@ -3508,6 +3609,10 @@ QHeaderView::section {
 
         if not self.npcap_available:
             self._update_l2_ui({"lldp": {"status": "Unavailable", "error": "Npcap not installed"}, "vlans": {"status": "Unknown", "vlans": []}, "meta": {"iface": iface_name, "error": "Npcap not installed"}})
+            return
+
+        if not self.capture_provider_available:
+            self._update_l2_ui({"lldp": {"status": "Unavailable", "error": "No libpcap provider available"}, "vlans": {"status": "Unknown", "vlans": []}, "meta": {"iface": iface_name, "error": "No libpcap provider available"}})
             return
 
         if not self.is_admin:
@@ -3671,15 +3776,25 @@ QHeaderView::section {
         QApplication.clipboard().setText(text)
 
     def _restart_application(self, elevated: bool = False):
-        params = " ".join(f'"{arg}"' for arg in sys.argv)
+        cwd = os.getcwd()
+        args = sys.argv[1:]
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            params_list = args
+        else:
+            script_path = os.path.abspath(sys.argv[0])
+            executable = sys.executable
+            params_list = [script_path, *args]
+
         if elevated and os.name == "nt":
-            ok, _, err = self._shell_execute_elevated(sys.executable, params, os.getcwd())
+            params = subprocess.list2cmdline(params_list)
+            ok, _, err = self._shell_execute_elevated(executable, params, cwd)
             if not ok:
                 QMessageBox.warning(self, "Restart failed", err or "Unable to request elevation.")
                 return
         else:
             try:
-                subprocess.Popen([sys.executable, *sys.argv], cwd=os.getcwd())
+                subprocess.Popen([executable, *params_list], cwd=cwd)
             except Exception as exc:
                 QMessageBox.warning(self, "Restart failed", str(exc))
                 return
