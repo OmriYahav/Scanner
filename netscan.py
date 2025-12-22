@@ -13,6 +13,7 @@ import shutil
 import re
 import errno
 import json
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple, Any
@@ -177,66 +178,71 @@ def is_running_as_admin() -> Optional[bool]:
 LLDP_TIMEOUT_SECONDS = 8
 
 
+def build_encoded_ps(script: str) -> str:
+    """Return a Base64 UTF-16LE encoded PowerShell command string."""
+
+    encoded = script.encode("utf-16le")
+    return base64.b64encode(encoded).decode("ascii")
+
+
 def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple[List[dict], dict]:
     start_ts = time.monotonic()
     neighbors: List[dict] = []
     meta: Dict[str, Any] = {
-        "command": None,
-        "exit_code": None,
-        "stdout_len": None,
-        "stderr_len": None,
+        "used_cmd": None,
+        "exit_code": -1,
+        "stdout_preview": "",
+        "stderr_preview": "",
         "elapsed_ms": None,
         "timeout": False,
         "error": None,
+        "parse_error": None,
         "source": "PowerShell",
     }
+
+    def finalize():
+        if meta.get("elapsed_ms") is None:
+            meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        if meta.get("error") and "error_short" not in meta:
+            err = str(meta.get("error") or "")
+            meta["error_short"] = (err.splitlines()[0] if err else "Unknown error")[:200]
+        return neighbors, meta
 
     if os.name != "nt":
         meta["error"] = "PowerShell LLDP unavailable on non-Windows"
         meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
-        return neighbors, meta
+        return finalize()
 
     ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
     if not ps_exe:
         meta["error"] = "PowerShell not found"
         meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
-        return neighbors, meta
+        return finalize()
 
     iface_filter = ""
     if interface_name_or_alias:
         safe_iface = str(interface_name_or_alias).replace("'", "''")
         iface_filter = (
-            f"$capture = $capture | Where-Object {{ $_.Interface -eq '{safe_iface}' "
+            f"$data = $data | Where-Object {{ $_.Interface -eq '{safe_iface}' "
             f"-or $_.InterfaceAlias -eq '{safe_iface}' }}"
         )
 
     script_lines = [
-        "$ErrorActionPreference = 'Stop'",
-        "$ProgressPreference = 'SilentlyContinue'",
-        "$VerbosePreference = 'SilentlyContinue'",
-        "$InformationPreference = 'SilentlyContinue'",
-        "$capture = Invoke-DiscoveryProtocolCapture -Type LLDP -Force | Get-DiscoveryProtocolData",
-        "if ($null -eq $capture) { $capture = @() }",
+        "$ProgressPreference='SilentlyContinue'",
+        "$ErrorActionPreference='Stop'",
+        "Import-Module PSDiscoveryProtocol -ErrorAction Stop",
+        "$data = Invoke-DiscoveryProtocolCapture -Type LLDP -Force | Get-DiscoveryProtocolData",
+        "if ($null -eq $data) { $data = @() }",
     ]
 
     if iface_filter:
         script_lines.append(iface_filter)
 
-    script_lines.extend(
-        [
-            "$result = $capture | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer",
-            "if ($null -eq $result) { $result = @() }",
-            "$json = $result | ConvertTo-Json -Depth 6",
-            "if (-not $json) { $json = '[]' }",
-            "Write-Output $json",
-        ]
+    script_lines.append(
+        "$data | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer, Type | ConvertTo-Json -Depth 6"
     )
 
-    ps_script = (
-        "try { "
-        + "; ".join(script_lines)
-        + " } catch { $msg = $_.Exception.Message; [Console]::Error.WriteLine($msg); exit 1 }"
-    )
+    encoded_script = build_encoded_ps("; ".join(script_lines))
 
     cmd = [
         ps_exe,
@@ -244,10 +250,10 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
-        "-Command",
-        ps_script,
+        "-EncodedCommand",
+        encoded_script,
     ]
-    meta["command"] = " ".join(cmd)
+    meta["used_cmd"] = cmd
 
     startupinfo = None
     creationflags = 0
@@ -271,7 +277,7 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
     except Exception as e:
         meta["error"] = str(e)
         meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
-        return neighbors, meta
+        return finalize()
 
     try:
         stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
@@ -301,24 +307,25 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
 
     exit_code = proc.returncode if proc.returncode is not None else -1
     meta["exit_code"] = exit_code
-    meta["stdout_len"] = len(stdout or "")
-    meta["stderr_len"] = len(stderr or "")
+    meta["stdout_preview"] = (stdout or "")[:500]
+    meta["stderr_preview"] = (stderr or "")[:1000]
     meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
 
     stderr_clean = (stderr or "").strip() or None
     if meta.get("error") or exit_code not in (0, None):
         meta["error"] = meta.get("error") or stderr_clean or "PowerShell execution failed"
-        return neighbors, meta
+        return finalize()
 
     output = (stdout or "").strip()
     if not output:
-        return neighbors, meta
+        return finalize()
 
     try:
         data = json.loads(output)
     except Exception as e:
+        meta["parse_error"] = str(e)
         meta["error"] = f"Failed to parse PowerShell output: {e}"
-        return neighbors, meta
+        return finalize()
 
     entries = data if isinstance(data, list) else [data]
     for entry in entries:
@@ -340,13 +347,13 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
             "chassis_id": norm(entry.get("ChassisId")),
             "port_id": norm(entry.get("Port") or entry.get("PortId")),
-            "port_description": None,
+            "port_description": norm(entry.get("PortDescription")),
             "management_address": norm(mgmt_addr),
             "raw": entry,
         }
         neighbors.append(neighbor)
 
-    return neighbors, meta
+    return finalize()
 
 
 def is_device_online(d: Device) -> bool:
@@ -1880,12 +1887,12 @@ class Layer2InfoWorker(QThread):
         lldp_neighbors_cache = list(neighbors)
         lldp_status = "Detected" if lldp_neighbors_cache else "Not detected"
         if ps_meta.get("error"):
-            lldp_status = "Unavailable"
+            lldp_status = "Error"
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
         payload["lldp"]["status"] = lldp_status
         payload["lldp"]["source"] = ps_meta.get("source")
-        payload["lldp"]["error"] = ps_meta.get("error")
+        payload["lldp"]["error"] = ps_meta.get("error_short") or ps_meta.get("error")
         if payload["lldp"]["primary"]:
             payload["lldp"].update(payload["lldp"]["primary"])
         payload["meta"]["captured"] = len(lldp_neighbors_cache)
@@ -1893,12 +1900,11 @@ class Layer2InfoWorker(QThread):
         payload["meta"]["lldp_source"] = payload["lldp"].get("source")
         payload["meta"]["lldp_debug"] = ps_meta
         if ps_meta.get("error"):
-            payload["meta"]["error"] = ps_meta.get("error")
+            payload["meta"]["error"] = ps_meta.get("error_short") or ps_meta.get("error")
 
         allow_lldp_from_scapy = (
             admin_state is True
-            and not payload["lldp"].get("error")
-            and not lldp_neighbors_cache
+            and (ps_meta.get("error") or not lldp_neighbors_cache)
         )
 
         if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
@@ -3295,6 +3301,7 @@ QHeaderView::section {
             return
 
         self.l2_check_running = True
+        self._set_l2_refreshing_state("Running...")
         self.l2_worker = Layer2InfoWorker(iface_name, self.is_admin)
         self.l2_worker.result.connect(self.apply_l2_result)
         self.l2_worker.finished.connect(self.on_l2_finished)
@@ -3341,18 +3348,23 @@ QHeaderView::section {
         lldp = payload.get("lldp", {}) if payload else {}
         vlans = payload.get("vlans", {}) if payload else {}
         meta = payload.get("meta", {}) if payload else {}
+        neighbors = lldp.get("neighbors") or []
         lldp_status = str(lldp.get("status", "Unknown"))
         status_lower = lldp_status.lower()
-        color_map = {
-            "detected": "green",
-            "not detected": "red",
-            "unavailable": "yellow",
-            "unknown": "yellow",
-        }
-        badge_state = next((v for k, v in color_map.items() if status_lower.startswith(k)), "gray")
-        set_badge(self.lldp_status_lbl, badge_state, f"LLDP: {lldp_status}")
+        error_text = lldp.get("error")
+        overall_status = "OK"
+        if status_lower.startswith("unavailable"):
+            overall_status = "Unavailable"
+        elif error_text and not neighbors:
+            overall_status = "Error"
+        color_map = {"ok": "green", "unavailable": "yellow", "error": "red", "unknown": "gray"}
+        badge_state = color_map.get(overall_status.lower(), "gray")
+        status_label = f"LLDP: {overall_status}"
+        if overall_status == "OK" and lldp_status:
+            status_label = f"LLDP: OK ({lldp_status})"
+        set_badge(self.lldp_status_lbl, badge_state, status_label)
+        self.lldp_status_lbl.setToolTip(lldp_status)
 
-        neighbors = lldp.get("neighbors") or []
         self._lldp_neighbors_cache = neighbors
         self._lldp_primary_cache = lldp.get("primary") or {}
         self._last_lldp_data = lldp
@@ -3375,13 +3387,20 @@ QHeaderView::section {
         captured = meta.get("captured", 0) if meta else 0
         lldp_frames = meta.get("lldp_frames", 0) if meta else 0
         vlan_frames = meta.get("vlan_frames", 0) if meta else 0
-        error_text = meta.get("error") if meta else None
+        meta_error = meta.get("error") if meta else None
+        debug_data = meta.get("lldp_debug") if meta else None
+        debug_tooltip = (
+            json.dumps(debug_data, indent=2, ensure_ascii=False)[:3000]
+            if isinstance(debug_data, dict)
+            else None
+        )
+        self.l2_debug_container.setToolTip(debug_tooltip or "")
 
         self.l2_iface_hint.setText(f"Capture interface: {iface_text}")
         if status_lower.startswith("unavailable"):
             self.l2_capture_hint.setText("Captured frames: Unavailable")
             self.l2_counts_hint.setText("LLDP frames: - | VLAN-tagged frames: -")
-        elif error_text:
+        elif meta_error:
             self.l2_capture_hint.setText("Captured frames: Unknown (capture failed)")
             self.l2_counts_hint.setText(
                 f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
@@ -3404,8 +3423,11 @@ QHeaderView::section {
             self.lldp_error_hint.setText("Run application as Administrator to enable LLDP discovery")
         elif lldp.get("error"):
             self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
+        elif meta_error:
+            self.lldp_error_hint.setText(f"LLDP error: {meta_error}")
         else:
             self.lldp_error_hint.setText("LLDP error: None")
+        self.lldp_error_hint.setToolTip(debug_tooltip or "")
 
     def on_l2_finished(self):
         self.l2_check_running = False
@@ -3560,8 +3582,8 @@ QHeaderView::section {
         self.client_ip_lbl.setText(info.get("ip", "") or fallback)
         self.interface_lbl.setText(info.get("interface", "") or fallback)
 
-    def _set_l2_refreshing_state(self):
-        set_badge(self.lldp_status_lbl, "yellow", "LLDP: Refreshing...")
+    def _set_l2_refreshing_state(self, status_text: str = "Refreshing..."):
+        set_badge(self.lldp_status_lbl, "yellow", f"LLDP: {status_text}")
         set_badge(self.vlan_status_badge, "yellow", "VLANs: Refreshing...")
         for lbl in [
             self.lldp_chassis_lbl,
