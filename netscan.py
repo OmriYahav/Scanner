@@ -1025,6 +1025,8 @@ class ScanWorker(QThread):
         return self._stop_event.is_set()
 
     def _queue_update(self, device: Device):
+        if not self._has_evidence(device):
+            return
         if device.mac:
             device.vendor = vendor_from_mac(device.mac, self.oui_map)
         state = (
@@ -1053,6 +1055,15 @@ class ScanWorker(QThread):
                 self.partial.emit(list(self._partial_buffer))
                 self._partial_buffer.clear()
                 self._last_partial_emit = now
+
+    @staticmethod
+    def _has_evidence(device: Device) -> bool:
+        return (
+            device.alive
+            or bool(device.protocols)
+            or bool(device.sources)
+            or is_valid_mac(device.mac)
+        )
 
     def _mark_alive(self, device: Device, evidence: str, rtt_ms: Optional[float] = None):
         device.alive = True
@@ -4148,7 +4159,12 @@ QHeaderView::section {
             return d.hostname.lower()
         return d.ip
 
+    def _has_evidence(self, d: Device) -> bool:
+        return d.alive or bool(d.protocols) or bool(d.sources) or is_valid_mac(d.mac)
+
     def _merge_identity(self, incoming: Device) -> Device:
+        if not self._has_evidence(incoming):
+            return incoming
         incoming.last_seen_ts = time.time()
         key = self._compute_identity_key(incoming)
         existing_key = self.ip_to_key.get(incoming.ip)
@@ -4206,7 +4222,7 @@ QHeaderView::section {
         online_ttl = int(self.sp_online_ttl.value()) if hasattr(self, "sp_online_ttl") else self.ONLINE_TTL_SEC
         stale_ttl = int(self.sp_stale_ttl.value()) if hasattr(self, "sp_stale_ttl") else self.STALE_TTL_SEC
         offline_ttl = int(self.sp_offline_ttl.value()) if hasattr(self, "sp_offline_ttl") else self.OFFLINE_AFTER_SEC
-        last_alive = d.last_alive_ts
+        last_alive = d.last_alive_ts or d.last_seen_ts
         if last_alive:
             delta = now - last_alive
             if delta <= online_ttl:
@@ -4348,12 +4364,16 @@ QHeaderView::section {
                 self._row_by_key[other_key] = other_row - 1
 
     def _queue_pending_update(self, device: Device):
+        if not self._has_evidence(device):
+            return
         key = device.primary_key or device.ip
         with self._pending_lock:
             self._pending_updates[key] = device
 
     @Slot(object)
     def on_device_found(self, device: Device):
+        if not self._has_evidence(device):
+            return
         merged = self._merge_identity(device)
         self._queue_pending_update(merged)
 
@@ -4531,6 +4551,8 @@ QHeaderView::section {
     @Slot(list)
     def on_partial_results(self, devices: List[Device]):
         for d in devices:
+            if not self._has_evidence(d):
+                continue
             merged = self._merge_identity(d)
             self._queue_pending_update(merged)
         self.flush_pending_updates()
@@ -4550,6 +4572,8 @@ QHeaderView::section {
         for d in devices:
             if d.mac and not d.vendor:
                 d.vendor = vendor_from_mac(d.mac, self.oui_map)
+            if not self._has_evidence(d):
+                continue
             merged = self._merge_identity(d)
             self._queue_pending_update(merged)
 
