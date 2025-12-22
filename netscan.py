@@ -167,6 +167,13 @@ def is_valid_mac(mac: Optional[str]) -> bool:
     return bool(re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", norm))
 
 
+def is_running_as_admin() -> Optional[bool]:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return None
+
+
 def is_device_online(d: Device) -> bool:
     if d.rtt_ms is not None:
         return True
@@ -1621,9 +1628,10 @@ class DiagnosticsWorker(QThread):
 class Layer2InfoWorker(QThread):
     result = Signal(dict)
 
-    def __init__(self, iface_name: Optional[str]):
+    def __init__(self, iface_name: Optional[str], is_admin: Optional[bool]):
         super().__init__()
         self.iface_name = iface_name
+        self.is_admin = is_admin
 
     def _normalize_lldp_neighbor(self, entry: dict) -> dict:
         def first_val(keys: List[str]) -> Optional[str]:
@@ -1721,11 +1729,16 @@ class Layer2InfoWorker(QThread):
             }
 
         stderr = proc.stderr.strip() or None
+        clean_stderr = stderr.splitlines()[0] if stderr else None
         stdout = proc.stdout.strip()
         if proc.returncode != 0:
+            err_text = clean_stderr or f"PowerShell exit code {proc.returncode}"
+            lower = (clean_stderr or "").lower()
+            if any(t in lower for t in ["admin", "elevat", "privilege", "permission"]):
+                err_text = "Requires Administrator privileges"
             return {
                 "status": "Unavailable",
-                "error": stderr or f"PowerShell exit code {proc.returncode}",
+                "error": err_text,
                 "neighbors": [],
                 "captured": 0,
                 "lldp_frames": 0,
@@ -1735,7 +1748,7 @@ class Layer2InfoWorker(QThread):
         if not stdout:
             return {
                 "status": "Not detected",
-                "error": stderr,
+                "error": clean_stderr,
                 "neighbors": [],
                 "captured": 0,
                 "lldp_frames": 0,
@@ -1795,6 +1808,8 @@ class Layer2InfoWorker(QThread):
         }
 
     def run(self):
+        admin_state = self.is_admin if self.is_admin is not None else is_running_as_admin()
+        admin_text = "Yes" if admin_state else ("No" if admin_state is False else "Unknown")
         payload = {
             "lldp": {
                 "status": "Unknown",
@@ -1811,8 +1826,18 @@ class Layer2InfoWorker(QThread):
                 "vlan_frames": 0,
                 "error": None,
                 "lldp_source": None,
+                "admin": admin_text,
             },
         }
+
+        if admin_state is not True:
+            payload["lldp"]["status"] = "Unavailable (Administrator required)"
+            payload["lldp"]["source"] = "Unavailable"
+            payload["lldp"]["error"] = "Requires Administrator privileges"
+            payload["meta"]["lldp_source"] = "Unavailable"
+            payload["meta"]["error"] = "Requires Administrator privileges"
+            self.result.emit(payload)
+            return
 
         ps_result = self.run_powershell_lldp(self.iface_name)
         lldp_neighbors_cache = ps_result.get("neighbors", []) if ps_result else []
@@ -1826,6 +1851,14 @@ class Layer2InfoWorker(QThread):
         payload["meta"]["captured"] = ps_result.get("captured", 0) if ps_result else 0
         payload["meta"]["lldp_frames"] = ps_result.get("lldp_frames", 0) if ps_result else 0
         payload["meta"]["lldp_source"] = payload["lldp"].get("source")
+        if ps_result and ps_result.get("error"):
+            payload["meta"]["error"] = ps_result.get("error")
+
+        allow_lldp_from_scapy = (
+            admin_state is True
+            and not payload["lldp"].get("error")
+            and not lldp_neighbors_cache
+        )
 
         if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
             if not payload["vlans"].get("status"):
@@ -1851,8 +1884,6 @@ class Layer2InfoWorker(QThread):
         payload["meta"]["captured"] = len(packets)
         lldp_detected = False
         lldp_details: Dict[str, str] = {}
-        had_ps_neighbors = bool(lldp_neighbors_cache)
-        had_ps_source = payload["lldp"].get("source")
         seen_neighbors = {
             (
                 n.get("system_name"),
@@ -1864,6 +1895,7 @@ class Layer2InfoWorker(QThread):
         vlan_ids: Set[int] = set()
         lldp_frames = 0
         vlan_frame_count = 0
+        scapy_added_neighbor = False
 
         for pkt in packets:
             try:
@@ -1883,9 +1915,7 @@ class Layer2InfoWorker(QThread):
                         if v:
                             lldp_details.setdefault(k, v)
 
-                    if payload["lldp"].get("source") != "PowerShell" or not payload[
-                        "lldp"
-                    ].get("neighbors"):
+                    if allow_lldp_from_scapy:
                         neighbor = {
                             "system_name": parsed.get("system_name"),
                             "chassis_id": parsed.get("chassis_id"),
@@ -1902,6 +1932,7 @@ class Layer2InfoWorker(QThread):
                         if key not in seen_neighbors:
                             seen_neighbors.add(key)
                             lldp_neighbors_cache.append(neighbor)
+                            scapy_added_neighbor = True
 
                 vlan_layer = pkt[Dot1Q] if Dot1Q and pkt.haslayer(Dot1Q) else None
                 if vlan_layer or eth_type == 0x8100:
@@ -1914,21 +1945,21 @@ class Layer2InfoWorker(QThread):
 
         payload["meta"]["lldp_frames"] = lldp_frames or payload["meta"].get("lldp_frames", 0)
         payload["meta"]["vlan_frames"] = vlan_frame_count
-        if (
-            had_ps_source == "PowerShell"
-            and not had_ps_neighbors
-            and lldp_neighbors_cache
-        ):
+        if scapy_added_neighbor:
             payload["lldp"]["source"] = "Scapy"
-        if not payload["lldp"].get("source"):
+        if not payload["lldp"].get("source") and scapy_added_neighbor:
             payload["lldp"]["source"] = "Scapy"
-        payload["meta"]["lldp_source"] = payload["lldp"].get("source")
-        if not payload["lldp"].get("neighbors"):
+        payload["meta"]["lldp_source"] = payload["lldp"].get("source") or payload["meta"].get("lldp_source")
+        if not payload["lldp"].get("neighbors") and lldp_neighbors_cache:
             payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = payload["lldp"].get("primary") or self._choose_primary_neighbor(
             payload["lldp"].get("neighbors", [])
         )
-        if lldp_neighbors_cache or lldp_detected:
+        if payload["lldp"].get("status", "").lower().startswith("unavailable"):
+            pass
+        elif payload["lldp"].get("neighbors"):
+            payload["lldp"]["status"] = "Detected"
+        elif scapy_added_neighbor or lldp_detected:
             payload["lldp"]["status"] = "Detected"
         elif payload["lldp"].get("status") in (None, "Unknown"):
             payload["lldp"]["status"] = "Not detected"
@@ -2015,6 +2046,7 @@ class MainWindow(QMainWindow):
         self.diag_worker: Optional[DiagnosticsWorker] = None
         self.l2_worker: Optional[Layer2InfoWorker] = None
         self.av_worker: Optional[AVInsightsWorker] = None
+        self.is_admin: Optional[bool] = is_running_as_admin()
         self.presence_timer = QTimer(self)
         self.presence_timer.setInterval(1000)
         self.presence_timer.timeout.connect(self._tick_presence)
@@ -2058,6 +2090,7 @@ class MainWindow(QMainWindow):
         self.btn_diag_traceroute.clicked.connect(self.run_diag_traceroute)
         self.btn_diag_stop.clicked.connect(self.stop_diag_worker)
         self.btn_l2_refresh.clicked.connect(self.run_l2_check)
+        self.btn_restart_admin.clicked.connect(self.restart_as_admin)
         self.lldp_neighbors_combo.currentIndexChanged.connect(self.on_lldp_neighbor_selected)
         self.btn_copy_lldp.clicked.connect(self.copy_selected_lldp_neighbor)
         self.l2_toggle_btn.clicked.connect(self.toggle_l2_debug)
@@ -2268,6 +2301,9 @@ class MainWindow(QMainWindow):
 
         self.lldp_status_lbl = QLabel()
         set_badge(self.lldp_status_lbl, "gray", "LLDP: Unknown")
+        self.btn_restart_admin = QPushButton("Restart as Administrator")
+        self.btn_restart_admin.setObjectName("secondaryButton")
+        self.btn_restart_admin.setVisible(os.name == "nt")
         self.lldp_neighbors_combo = QComboBox()
         self.btn_copy_lldp = QPushButton("Copy")
         self.btn_copy_lldp.setObjectName("secondaryButton")
@@ -2283,7 +2319,13 @@ class MainWindow(QMainWindow):
         self.vlan_lbl = make_value_label()
 
         l2_layout.addWidget(make_label("LLDP Status"), 0, 0)
-        l2_layout.addWidget(self.lldp_status_lbl, 0, 1)
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
+        status_row.addWidget(self.lldp_status_lbl)
+        status_row.addWidget(self.btn_restart_admin)
+        status_row.addStretch(1)
+        l2_layout.addLayout(status_row, 0, 1)
         neighbors_row = QHBoxLayout()
         neighbors_row.setContentsMargins(0, 0, 0, 0)
         neighbors_row.setSpacing(8)
@@ -2315,6 +2357,8 @@ class MainWindow(QMainWindow):
         self.l2_counts_hint.setObjectName("hintLabel")
         self.lldp_source_hint = QLabel("LLDP source: -")
         self.lldp_source_hint.setObjectName("hintLabel")
+        self.lldp_admin_hint = QLabel("Admin: Unknown")
+        self.lldp_admin_hint.setObjectName("hintLabel")
         self.lldp_neighbors_hint = QLabel("LLDP neighbors count: 0")
         self.lldp_neighbors_hint.setObjectName("hintLabel")
         self.lldp_error_hint = QLabel("LLDP error: None")
@@ -2328,6 +2372,7 @@ class MainWindow(QMainWindow):
         debug_layout.addWidget(self.l2_capture_hint)
         debug_layout.addWidget(self.l2_counts_hint)
         debug_layout.addWidget(self.lldp_source_hint)
+        debug_layout.addWidget(self.lldp_admin_hint)
         debug_layout.addWidget(self.lldp_neighbors_hint)
         debug_layout.addWidget(self.lldp_error_hint)
         self.l2_debug_container.setVisible(False)
@@ -3127,10 +3172,10 @@ QHeaderView::section {
         return False
 
     def _check_is_admin(self) -> Optional[bool]:
-        try:
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return None
+        if self.is_admin is not None:
+            return self.is_admin
+        self.is_admin = is_running_as_admin()
+        return self.is_admin
 
     def _check_arp_available(self) -> Optional[bool]:
         try:
@@ -3188,6 +3233,11 @@ QHeaderView::section {
                 "limited/unavailable": "red",
                 "unknown": "yellow",
             }
+            admin_text = str(payload.get("admin", "Unknown"))
+            if admin_text.lower() == "admin":
+                self.is_admin = True
+            elif admin_text.lower() == "not admin":
+                self.is_admin = False
             self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic, "sm")
             self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin, "sm")
             self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp, "sm")
@@ -3204,7 +3254,7 @@ QHeaderView::section {
             return
 
         self.l2_check_running = True
-        self.l2_worker = Layer2InfoWorker(iface_name)
+        self.l2_worker = Layer2InfoWorker(iface_name, self.is_admin)
         self.l2_worker.result.connect(self.apply_l2_result)
         self.l2_worker.finished.connect(self.on_l2_finished)
         self.l2_worker.start()
@@ -3251,8 +3301,15 @@ QHeaderView::section {
         vlans = payload.get("vlans", {}) if payload else {}
         meta = payload.get("meta", {}) if payload else {}
         lldp_status = str(lldp.get("status", "Unknown"))
-        color_map = {"detected": "green", "not detected": "red", "unknown": "yellow"}
-        self._style_status(self.lldp_status_lbl, "LLDP", lldp_status, color_map)
+        status_lower = lldp_status.lower()
+        color_map = {
+            "detected": "green",
+            "not detected": "red",
+            "unavailable": "yellow",
+            "unknown": "yellow",
+        }
+        badge_state = next((v for k, v in color_map.items() if status_lower.startswith(k)), "gray")
+        set_badge(self.lldp_status_lbl, badge_state, f"LLDP: {lldp_status}")
 
         neighbors = lldp.get("neighbors") or []
         self._lldp_neighbors_cache = neighbors
@@ -3280,17 +3337,31 @@ QHeaderView::section {
         error_text = meta.get("error") if meta else None
 
         self.l2_iface_hint.setText(f"Capture interface: {iface_text}")
-        if error_text:
+        if status_lower.startswith("unavailable"):
+            self.l2_capture_hint.setText("Captured frames: Unavailable")
+            self.l2_counts_hint.setText("LLDP frames: - | VLAN-tagged frames: -")
+        elif error_text:
             self.l2_capture_hint.setText("Captured frames: Unknown (capture failed)")
+            self.l2_counts_hint.setText(
+                f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
+            )
         else:
             self.l2_capture_hint.setText(f"Captured frames: {captured}")
-        self.l2_counts_hint.setText(
-            f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
-        )
+            self.l2_counts_hint.setText(
+                f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
+            )
         source_text = lldp.get("source") or meta.get("lldp_source") or "-"
         self.lldp_source_hint.setText(f"LLDP source: {source_text}")
+        admin_text = meta.get("admin") or "Unknown"
+        self.lldp_admin_hint.setText(f"Admin: {admin_text}")
         self.lldp_neighbors_hint.setText(f"LLDP neighbors count: {len(neighbors)}")
-        if lldp.get("error"):
+        if status_lower.startswith("unavailable"):
+            self.lldp_neighbors_combo.setEnabled(False)
+            if not neighbors:
+                self.lldp_neighbors_combo.clear()
+                self.lldp_neighbors_combo.addItem("Unavailable", None)
+            self.lldp_error_hint.setText("Run application as Administrator to enable LLDP discovery")
+        elif lldp.get("error"):
             self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
         else:
             self.lldp_error_hint.setText("LLDP error: None")
@@ -3321,6 +3392,24 @@ QHeaderView::section {
             ]
             text = "\n".join(lines)
         QApplication.clipboard().setText(text)
+
+    def restart_as_admin(self):
+        if os.name != "nt":
+            QMessageBox.information(self, "Restart", "Restart as Administrator is only available on Windows.")
+            return
+
+        params = " ".join(f'"{arg}"' for arg in sys.argv)
+        try:
+            res = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        except Exception as e:
+            QMessageBox.warning(self, "Restart failed", str(e))
+            return
+
+        if res <= 32:
+            QMessageBox.warning(self, "Restart failed", "Unable to request elevation.")
+            return
+
+        QApplication.instance().quit()
 
     def refresh_av_insights(self, auto_trigger: bool = False):
         if self.av_check_running:
