@@ -96,7 +96,14 @@ def get_active_ipv4_interfaces() -> List[dict]:
         if not st or not st.isup:
             continue
 
-        ipv4 = next((a for a in lst if a.family.name == "AF_INET"), None)
+        ipv4 = next(
+            (
+                a
+                for a in lst
+                if getattr(a.family, "name", a.family) == "AF_INET" or a.family == socket.AF_INET
+            ),
+            None,
+        )
         if not ipv4 or not ipv4.address or not ipv4.netmask:
             continue
 
@@ -104,6 +111,8 @@ def get_active_ipv4_interfaces() -> List[dict]:
         mask = ipv4.netmask
         try:
             net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+            ip_obj = ipaddress.IPv4Address(ip)
+            is_link_local = ip_obj.is_link_local
         except Exception:
             continue
 
@@ -114,8 +123,14 @@ def get_active_ipv4_interfaces() -> List[dict]:
             "network": str(net.network_address),
             "prefix": net.prefixlen,
             "cidr": str(net),
+            "link_local": is_link_local,
         })
-    return out
+
+    # Prefer non-link-local interfaces, but fall back to link-local when nothing else exists
+    non_link_local = [it for it in out if not it.get("link_local")]
+    if non_link_local:
+        return sorted(non_link_local, key=lambda x: x.get("name", ""))
+    return sorted(out, key=lambda x: x.get("name", ""))
 
 
 DEFAULT_OUI_URL = "https://raw.githubusercontent.com/oui-lookup/ieee-oui/master/oui.csv"
@@ -3110,15 +3125,16 @@ QHeaderView::section {
         self.npcapInstallStatus.emit(f"Installer downloaded ({size_bytes // 1024 // 1024} MB).")
         return installer_path
 
-    def _shell_execute_elevated(self, target: str, params: str, cwd: Optional[str] = None) -> Tuple[bool, Optional[int], Optional[str]]:
+    def _shell_execute_elevated(self, target: str, params: Optional[str], cwd: Optional[str] = None) -> Tuple[bool, Optional[int], Optional[str]]:
         if os.name != "nt" or not wintypes:
             return False, None, "Elevation is only supported on Windows."
 
         ShellExecuteW = ctypes.windll.shell32.ShellExecuteW  # type: ignore
-        SW_SHOW = 5
-        cwd_to_use = cwd or os.getcwd()
-        print(f"[Npcap] Requesting elevation for {target} with params '{params}' (cwd={cwd_to_use})")
-        result = ShellExecuteW(None, "runas", target, params, cwd_to_use, SW_SHOW)
+        SW_SHOWNORMAL = 1
+        cwd_to_use = cwd or None
+        params_to_use = params or None
+        print(f"[Npcap] Requesting elevation for {target} with params '{params_to_use}' (cwd={cwd_to_use})")
+        result = ShellExecuteW(None, "runas", target, params_to_use, cwd_to_use, SW_SHOWNORMAL)
         if result <= 32:
             err = ctypes.GetLastError()
             if err == 1223:
@@ -3129,7 +3145,8 @@ QHeaderView::section {
     def _launch_npcap_installer(self, installer_path: str) -> dict:
         cwd = os.path.dirname(installer_path) or None
         self.npcapInstallStatus.emit("Launching installer (UAC)...")
-        ok, exit_code, err = self._shell_execute_elevated(installer_path, "", cwd)
+        print(f"[Npcap] Launching installer from {installer_path} (cwd={cwd})")
+        ok, exit_code, err = self._shell_execute_elevated(installer_path, None, cwd)
         result = {"success": False, "message": "Npcap installation failed.", "cancelled": False}
         if not ok:
             result["message"] = err or "Npcap installation was cancelled."
@@ -3138,6 +3155,7 @@ QHeaderView::section {
 
         result["success"] = True
         result["message"] = "Npcap installation completed. Please restart the application."
+        print(f"[Npcap] Installer launch requested successfully for {installer_path}")
         return result
 
     def install_npcap(self):
@@ -3480,12 +3498,34 @@ QHeaderView::section {
             return False
         return proc.returncode == 0
 
-    def detect_env_status(self) -> dict:
+    def detect_env_status(self, iface_name: Optional[str], iface_data: Optional[dict]) -> dict:
         npcap_state = self._check_npcap_installed()
         driver_present, driver_running, driver_detail = self._check_npf_driver_status()
         pcap_state, pcap_detail = self._check_pcap_provider_available()
         admin_state = self._check_is_admin()
         arp_state = self._check_arp_available()
+        dhcp_info = get_dhcp_info(iface_name, iface_data)
+        ip_text = iface_data.get("ip") if isinstance(iface_data, dict) else None
+        ip_assigned = False
+        try:
+            if ip_text:
+                ip_obj = ipaddress.IPv4Address(ip_text)
+                ip_assigned = not (ip_obj.is_unspecified or ip_obj.is_loopback)
+        except Exception:
+            ip_assigned = False
+
+        core_caps = {
+            "interface_up": bool(iface_name),
+            "ip_assigned": ip_assigned,
+            "dhcp_info": bool(dhcp_info),
+        }
+        optional_caps = {
+            "admin": admin_state,
+            "npcap_installed": npcap_state,
+            "npcap_driver_running": driver_running,
+            "pcap_provider": pcap_state,
+            "lldp_capture": bool(npcap_state and driver_running and pcap_state and admin_state),
+        }
 
         def to_text(val: Optional[bool], true_text: str, false_text: str) -> str:
             if val is True:
@@ -3504,6 +3544,9 @@ QHeaderView::section {
             return "Unknown"
 
         return {
+            "core_capabilities": core_caps,
+            "optional_capabilities": optional_caps,
+            "dhcp_details": dhcp_info,
             "npcap": to_text(npcap_state, "Installed", "Not installed"),
             "npcap_raw": npcap_state,
             "driver": driver_text(driver_present, driver_running),
@@ -3521,12 +3564,19 @@ QHeaderView::section {
         if self.env_check_running:
             return
         self.env_check_running = True
+        data = self.if_combo.currentData()
+        iface_name = data.get("name") if isinstance(data, dict) else None
+        iface_data = data if isinstance(data, dict) else None
 
         def worker():
             try:
-                result = self.detect_env_status()
-            except Exception:
+                result = self.detect_env_status(iface_name, iface_data)
+            except Exception as exc:
+                print(f"[Env] Environment status failed: {exc}")
                 result = {
+                    "core_capabilities": {},
+                    "optional_capabilities": {},
+                    "dhcp_details": {},
                     "npcap": "Unknown",
                     "npcap_raw": None,
                     "driver": "Unknown",
@@ -3590,11 +3640,10 @@ QHeaderView::section {
 
     def _update_feature_availability(self):
         self.btn_restart_admin.setVisible(os.name == "nt" and self.is_admin is False)
-        l2_ready = bool(self.is_admin and self.capture_provider_available)
         if hasattr(self, "btn_l2_refresh"):
-            self.btn_l2_refresh.setEnabled(l2_ready)
+            self.btn_l2_refresh.setEnabled(True)
         if hasattr(self, "l2_toggle_btn"):
-            self.l2_toggle_btn.setEnabled(l2_ready)
+            self.l2_toggle_btn.setEnabled(True)
         if hasattr(self, "btn_install_npcap"):
             self.btn_install_npcap.setVisible(os.name == "nt" and not self.npcap_available)
 
