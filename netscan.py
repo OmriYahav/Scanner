@@ -1649,49 +1649,150 @@ class Layer2InfoWorker(QThread):
         }
         return neighbor
 
-    def _collect_lldp_via_powershell(self, iface_name: Optional[str]) -> Tuple[Optional[List[dict]], Optional[str]]:
+    def _choose_primary_neighbor(self, neighbors: List[dict]) -> dict:
+        if not neighbors:
+            return {}
+
+        for neighbor in neighbors:
+            if neighbor.get("system_name"):
+                return neighbor
+            raw = neighbor.get("raw") or {}
+            if raw.get("SystemDescription") or raw.get("SystemName"):
+                return neighbor
+        return neighbors[0]
+
+    def run_powershell_lldp(self, iface_name: Optional[str]) -> dict:
         if os.name != "nt":
-            return None, "PowerShell LLDP unavailable on non-Windows"
+            return {
+                "status": "Unavailable",
+                "error": "PowerShell LLDP unavailable on non-Windows",
+                "neighbors": [],
+                "captured": 0,
+                "lldp_frames": 0,
+                "source": None,
+            }
 
         ps_exe = shutil.which("powershell") or shutil.which("pwsh")
         if not ps_exe:
-            return None, "PowerShell not found"
+            return {
+                "status": "Unavailable",
+                "error": "PowerShell not found",
+                "neighbors": [],
+                "captured": 0,
+                "lldp_frames": 0,
+                "source": None,
+            }
 
-        query = "Get-NetLldpNeighbor"
+        iface_filter = ""
         if iface_name:
-            query += f" | Where-Object {{ $_.InterfaceAlias -eq '{iface_name}' }}"
-        query += " | ConvertTo-Json -Depth 4"
+            safe_iface = str(iface_name).replace("'", "''")
+            iface_filter = f" | Where-Object {{ $_.Interface -eq '{safe_iface}' -or $_.InterfaceAlias -eq '{safe_iface}' }}"
+
+        ps_command = (
+            "Invoke-DiscoveryProtocolCapture -Type LLDP -Force | "
+            "Get-DiscoveryProtocolData"
+            f"{iface_filter}"
+            " | Select-Object Port,PortDescription,SystemName,SystemDescription,ChassisId,ManagementAddress,TimeToLive,Interface,MacAddress,IPAddress"
+            " | ConvertTo-Json -Depth 6 -Compress"
+        )
 
         try:
             proc = subprocess.run(
-                [ps_exe, "-NoProfile", "-Command", query],
+                [
+                    ps_exe,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_command,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=8,
             )
         except Exception as e:
-            return None, str(e)
+            return {
+                "status": "Unavailable",
+                "error": str(e),
+                "neighbors": [],
+                "captured": 0,
+                "lldp_frames": 0,
+                "source": None,
+            }
 
-        error_text = proc.stderr.strip() or None
-        raw_out = proc.stdout.strip()
+        stderr = proc.stderr.strip() or None
+        stdout = proc.stdout.strip()
         if proc.returncode != 0:
-            return None, error_text or f"PowerShell exit code {proc.returncode}"
+            return {
+                "status": "Unavailable",
+                "error": stderr or f"PowerShell exit code {proc.returncode}",
+                "neighbors": [],
+                "captured": 0,
+                "lldp_frames": 0,
+                "source": None,
+            }
 
-        if not raw_out:
-            return [], error_text
+        if not stdout:
+            return {
+                "status": "Not detected",
+                "error": stderr,
+                "neighbors": [],
+                "captured": 0,
+                "lldp_frames": 0,
+                "source": "PowerShell",
+            }
 
         try:
-            data = json.loads(raw_out)
+            data = json.loads(stdout)
         except Exception as e:
-            return None, f"Failed to parse PowerShell output: {e}"
+            return {
+                "status": "Unavailable",
+                "error": f"Failed to parse PowerShell output: {e}",
+                "neighbors": [],
+                "captured": 0,
+                "lldp_frames": 0,
+                "source": None,
+            }
 
-        neighbors: List[dict] = []
         entries = data if isinstance(data, list) else [data]
+        neighbors: List[dict] = []
         for entry in entries:
-            if isinstance(entry, dict):
-                neighbors.append(self._normalize_lldp_neighbor(entry))
+            if not isinstance(entry, dict):
+                continue
 
-        return neighbors, error_text
+            mgmt_addr = entry.get("ManagementAddress")
+            ip_addr = entry.get("IPAddress")
+            if isinstance(ip_addr, list) and ip_addr:
+                mgmt_fallback = ip_addr[0]
+            else:
+                mgmt_fallback = ip_addr
+
+            def norm(value: Optional[str]) -> Optional[str]:
+                if value is None:
+                    return None
+                if isinstance(value, list):
+                    return str(value[0]) if value else None
+                return str(value)
+
+            neighbor = {
+                "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
+                "chassis_id": norm(entry.get("ChassisId")),
+                "port_id": norm(entry.get("Port") or entry.get("PortId")),
+                "port_description": norm(entry.get("PortDescription")),
+                "management_address": norm(mgmt_addr or mgmt_fallback),
+                "raw": entry,
+            }
+            neighbors.append(neighbor)
+
+        status = "Detected" if neighbors else "Not detected"
+        return {
+            "status": status,
+            "error": stderr,
+            "neighbors": neighbors,
+            "captured": len(neighbors),
+            "lldp_frames": len(neighbors),
+            "source": "PowerShell",
+        }
 
     def run(self):
         payload = {
@@ -1709,21 +1810,26 @@ class Layer2InfoWorker(QThread):
                 "lldp_frames": 0,
                 "vlan_frames": 0,
                 "error": None,
+                "lldp_source": None,
             },
         }
 
-        lldp_neighbors, ps_error = self._collect_lldp_via_powershell(self.iface_name)
-        if lldp_neighbors is not None:
-            payload["lldp"]["neighbors"] = lldp_neighbors
-            payload["lldp"]["primary"] = lldp_neighbors[0] if lldp_neighbors else {}
-            payload["lldp"]["status"] = "Detected" if lldp_neighbors else "Not detected"
-            payload["lldp"]["source"] = "PowerShell"
-            if ps_error:
-                payload["lldp"]["error"] = ps_error
-            if payload["lldp"]["primary"]:
-                payload["lldp"].update(payload["lldp"]["primary"])
+        ps_result = self.run_powershell_lldp(self.iface_name)
+        lldp_neighbors_cache = ps_result.get("neighbors", []) if ps_result else []
+        payload["lldp"]["neighbors"] = lldp_neighbors_cache
+        payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
+        payload["lldp"]["status"] = ps_result.get("status", "Unknown") if ps_result else "Unknown"
+        payload["lldp"]["source"] = ps_result.get("source") if ps_result else None
+        payload["lldp"]["error"] = ps_result.get("error") if ps_result else None
+        if payload["lldp"]["primary"]:
+            payload["lldp"].update(payload["lldp"]["primary"])
+        payload["meta"]["captured"] = ps_result.get("captured", 0) if ps_result else 0
+        payload["meta"]["lldp_frames"] = ps_result.get("lldp_frames", 0) if ps_result else 0
+        payload["meta"]["lldp_source"] = payload["lldp"].get("source")
 
         if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
+            if not payload["vlans"].get("status"):
+                payload["vlans"]["status"] = "Unknown"
             self.result.emit(payload)
             return
 
@@ -1732,16 +1838,19 @@ class Layer2InfoWorker(QThread):
             payload["meta"]["iface"] = resolved_iface or self.iface_name
             packets = sniff(iface=resolved_iface, timeout=3, store=True, promisc=True)
         except Exception as e:
-            payload["lldp"]["status"] = "Layer 2 capture: Unavailable (requires Npcap + permissions)"
+            payload["lldp"]["status"] = payload["lldp"].get(
+                "status",
+                "Layer 2 capture: Unavailable (requires Npcap + permissions)",
+            )
             payload["vlans"]["status"] = "Unknown (capture failed)"
             payload["meta"]["error"] = str(e)
+            payload["meta"]["lldp_source"] = payload["lldp"].get("source")
             self.result.emit(payload)
             return
 
         payload["meta"]["captured"] = len(packets)
         lldp_detected = False
         lldp_details: Dict[str, str] = {}
-        lldp_neighbors_cache = payload["lldp"].get("neighbors", [])
         had_ps_neighbors = bool(lldp_neighbors_cache)
         had_ps_source = payload["lldp"].get("source")
         seen_neighbors = {
@@ -1803,7 +1912,7 @@ class Layer2InfoWorker(QThread):
             except Exception:
                 continue
 
-        payload["meta"]["lldp_frames"] = lldp_frames
+        payload["meta"]["lldp_frames"] = lldp_frames or payload["meta"].get("lldp_frames", 0)
         payload["meta"]["vlan_frames"] = vlan_frame_count
         if (
             had_ps_source == "PowerShell"
@@ -1813,14 +1922,16 @@ class Layer2InfoWorker(QThread):
             payload["lldp"]["source"] = "Scapy"
         if not payload["lldp"].get("source"):
             payload["lldp"]["source"] = "Scapy"
+        payload["meta"]["lldp_source"] = payload["lldp"].get("source")
         if not payload["lldp"].get("neighbors"):
             payload["lldp"]["neighbors"] = lldp_neighbors_cache
-        payload["lldp"]["primary"] = payload["lldp"].get("primary") or (
-            payload["lldp"].get("neighbors", [])[:1] or [{}]
-        )[0]
-        payload["lldp"]["status"] = payload["lldp"].get("status") or (
-            "Detected" if lldp_detected else "Not detected"
+        payload["lldp"]["primary"] = payload["lldp"].get("primary") or self._choose_primary_neighbor(
+            payload["lldp"].get("neighbors", [])
         )
+        if lldp_neighbors_cache or lldp_detected:
+            payload["lldp"]["status"] = "Detected"
+        elif payload["lldp"].get("status") in (None, "Unknown"):
+            payload["lldp"]["status"] = "Not detected"
         payload["lldp"].update(payload["lldp"].get("primary") or lldp_details)
 
         if vlan_ids:
@@ -3176,7 +3287,7 @@ QHeaderView::section {
         self.l2_counts_hint.setText(
             f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
         )
-        source_text = lldp.get("source") or "-"
+        source_text = lldp.get("source") or meta.get("lldp_source") or "-"
         self.lldp_source_hint.setText(f"LLDP source: {source_text}")
         self.lldp_neighbors_hint.setText(f"LLDP neighbors count: {len(neighbors)}")
         if lldp.get("error"):
