@@ -12,6 +12,7 @@ import ctypes
 import shutil
 import re
 import errno
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Set, List, Dict, Tuple
@@ -1624,9 +1625,83 @@ class Layer2InfoWorker(QThread):
         super().__init__()
         self.iface_name = iface_name
 
+    def _normalize_lldp_neighbor(self, entry: dict) -> dict:
+        def first_val(keys: List[str]) -> Optional[str]:
+            for key in keys:
+                val = entry.get(key)
+                if val:
+                    if isinstance(val, list):
+                        return str(val[0]) if val else None
+                    return str(val)
+            return None
+
+        mgmt = entry.get("ManagementAddress") or entry.get("ManagementAddresses")
+        if isinstance(mgmt, list):
+            mgmt = mgmt[0] if mgmt else None
+
+        neighbor = {
+            "system_name": first_val(["RemoteSystemName", "SystemName"]),
+            "chassis_id": first_val(["RemoteChassisId", "ChassisId"]),
+            "port_id": first_val(["RemotePortId", "PortId"]),
+            "port_description": first_val(["RemotePortDescription", "PortDescription"]),
+            "management_address": str(mgmt) if mgmt else None,
+            "raw": entry,
+        }
+        return neighbor
+
+    def _collect_lldp_via_powershell(self, iface_name: Optional[str]) -> Tuple[Optional[List[dict]], Optional[str]]:
+        if os.name != "nt":
+            return None, "PowerShell LLDP unavailable on non-Windows"
+
+        ps_exe = shutil.which("powershell") or shutil.which("pwsh")
+        if not ps_exe:
+            return None, "PowerShell not found"
+
+        query = "Get-NetLldpNeighbor"
+        if iface_name:
+            query += f" | Where-Object {{ $_.InterfaceAlias -eq '{iface_name}' }}"
+        query += " | ConvertTo-Json -Depth 4"
+
+        try:
+            proc = subprocess.run(
+                [ps_exe, "-NoProfile", "-Command", query],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+        except Exception as e:
+            return None, str(e)
+
+        error_text = proc.stderr.strip() or None
+        raw_out = proc.stdout.strip()
+        if proc.returncode != 0:
+            return None, error_text or f"PowerShell exit code {proc.returncode}"
+
+        if not raw_out:
+            return [], error_text
+
+        try:
+            data = json.loads(raw_out)
+        except Exception as e:
+            return None, f"Failed to parse PowerShell output: {e}"
+
+        neighbors: List[dict] = []
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if isinstance(entry, dict):
+                neighbors.append(self._normalize_lldp_neighbor(entry))
+
+        return neighbors, error_text
+
     def run(self):
         payload = {
-            "lldp": {"status": "Unknown"},
+            "lldp": {
+                "status": "Unknown",
+                "source": None,
+                "primary": {},
+                "neighbors": [],
+                "error": None,
+            },
             "vlans": {"status": "Unknown", "vlans": []},
             "meta": {
                 "iface": self.iface_name or "-",
@@ -1636,6 +1711,17 @@ class Layer2InfoWorker(QThread):
                 "error": None,
             },
         }
+
+        lldp_neighbors, ps_error = self._collect_lldp_via_powershell(self.iface_name)
+        if lldp_neighbors is not None:
+            payload["lldp"]["neighbors"] = lldp_neighbors
+            payload["lldp"]["primary"] = lldp_neighbors[0] if lldp_neighbors else {}
+            payload["lldp"]["status"] = "Detected" if lldp_neighbors else "Not detected"
+            payload["lldp"]["source"] = "PowerShell"
+            if ps_error:
+                payload["lldp"]["error"] = ps_error
+            if payload["lldp"]["primary"]:
+                payload["lldp"].update(payload["lldp"]["primary"])
 
         if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
             self.result.emit(payload)
@@ -1655,6 +1741,17 @@ class Layer2InfoWorker(QThread):
         payload["meta"]["captured"] = len(packets)
         lldp_detected = False
         lldp_details: Dict[str, str] = {}
+        lldp_neighbors_cache = payload["lldp"].get("neighbors", [])
+        had_ps_neighbors = bool(lldp_neighbors_cache)
+        had_ps_source = payload["lldp"].get("source")
+        seen_neighbors = {
+            (
+                n.get("system_name"),
+                n.get("chassis_id"),
+                n.get("port_id"),
+            )
+            for n in lldp_neighbors_cache
+        }
         vlan_ids: Set[int] = set()
         lldp_frames = 0
         vlan_frame_count = 0
@@ -1677,6 +1774,26 @@ class Layer2InfoWorker(QThread):
                         if v:
                             lldp_details.setdefault(k, v)
 
+                    if payload["lldp"].get("source") != "PowerShell" or not payload[
+                        "lldp"
+                    ].get("neighbors"):
+                        neighbor = {
+                            "system_name": parsed.get("system_name"),
+                            "chassis_id": parsed.get("chassis_id"),
+                            "port_id": parsed.get("port_id"),
+                            "port_description": parsed.get("port_description"),
+                            "management_address": parsed.get("management_address"),
+                            "raw": parsed,
+                        }
+                        key = (
+                            neighbor.get("system_name"),
+                            neighbor.get("chassis_id"),
+                            neighbor.get("port_id"),
+                        )
+                        if key not in seen_neighbors:
+                            seen_neighbors.add(key)
+                            lldp_neighbors_cache.append(neighbor)
+
                 vlan_layer = pkt[Dot1Q] if Dot1Q and pkt.haslayer(Dot1Q) else None
                 if vlan_layer or eth_type == 0x8100:
                     vlan_frame_count += 1
@@ -1688,8 +1805,23 @@ class Layer2InfoWorker(QThread):
 
         payload["meta"]["lldp_frames"] = lldp_frames
         payload["meta"]["vlan_frames"] = vlan_frame_count
-        payload["lldp"]["status"] = "Detected" if lldp_detected else "Not detected"
-        payload["lldp"].update(lldp_details)
+        if (
+            had_ps_source == "PowerShell"
+            and not had_ps_neighbors
+            and lldp_neighbors_cache
+        ):
+            payload["lldp"]["source"] = "Scapy"
+        if not payload["lldp"].get("source"):
+            payload["lldp"]["source"] = "Scapy"
+        if not payload["lldp"].get("neighbors"):
+            payload["lldp"]["neighbors"] = lldp_neighbors_cache
+        payload["lldp"]["primary"] = payload["lldp"].get("primary") or (
+            payload["lldp"].get("neighbors", [])[:1] or [{}]
+        )[0]
+        payload["lldp"]["status"] = payload["lldp"].get("status") or (
+            "Detected" if lldp_detected else "Not detected"
+        )
+        payload["lldp"].update(payload["lldp"].get("primary") or lldp_details)
 
         if vlan_ids:
             payload["vlans"]["status"] = "Detected"
@@ -1779,6 +1911,9 @@ class MainWindow(QMainWindow):
         self.live_feed_lines: List[str] = []
         self.continuous_worker: Optional['BackgroundDiscoveryWorker'] = None
         self._last_presence_state: Dict[str, str] = {}
+        self._lldp_neighbors_cache: List[dict] = []
+        self._lldp_primary_cache: Dict[str, str] = {}
+        self._last_lldp_data: Dict[str, str] = {}
 
         self.externalIpChanged.connect(self.set_external_ip)
         self.internetStatusChanged.connect(self.set_connectivity_state)
@@ -1812,6 +1947,8 @@ class MainWindow(QMainWindow):
         self.btn_diag_traceroute.clicked.connect(self.run_diag_traceroute)
         self.btn_diag_stop.clicked.connect(self.stop_diag_worker)
         self.btn_l2_refresh.clicked.connect(self.run_l2_check)
+        self.lldp_neighbors_combo.currentIndexChanged.connect(self.on_lldp_neighbor_selected)
+        self.btn_copy_lldp.clicked.connect(self.copy_selected_lldp_neighbor)
         self.l2_toggle_btn.clicked.connect(self.toggle_l2_debug)
         self.cb_continuous.stateChanged.connect(self.on_continuous_changed)
         self.cb_online_only.stateChanged.connect(lambda _: self.flush_pending_updates())
@@ -2020,6 +2157,11 @@ class MainWindow(QMainWindow):
 
         self.lldp_status_lbl = QLabel()
         set_badge(self.lldp_status_lbl, "gray", "LLDP: Unknown")
+        self.lldp_neighbors_combo = QComboBox()
+        self.btn_copy_lldp = QPushButton("Copy")
+        self.btn_copy_lldp.setObjectName("secondaryButton")
+        self.lldp_neighbors_combo.addItem("None", None)
+        self.lldp_neighbors_combo.setEnabled(False)
         self.lldp_chassis_lbl = make_value_label()
         self.lldp_port_lbl = make_value_label()
         self.lldp_sysname_lbl = make_value_label()
@@ -2031,20 +2173,28 @@ class MainWindow(QMainWindow):
 
         l2_layout.addWidget(make_label("LLDP Status"), 0, 0)
         l2_layout.addWidget(self.lldp_status_lbl, 0, 1)
-        l2_layout.addWidget(make_label("Chassis ID"), 1, 0)
-        l2_layout.addWidget(self.lldp_chassis_lbl, 1, 1)
-        l2_layout.addWidget(make_label("Port ID"), 2, 0)
-        l2_layout.addWidget(self.lldp_port_lbl, 2, 1)
-        l2_layout.addWidget(make_label("System Name"), 3, 0)
-        l2_layout.addWidget(self.lldp_sysname_lbl, 3, 1)
-        l2_layout.addWidget(make_label("Port Description"), 4, 0)
-        l2_layout.addWidget(self.lldp_portdesc_lbl, 4, 1)
-        l2_layout.addWidget(make_label("Management Address"), 5, 0)
-        l2_layout.addWidget(self.lldp_mgmt_lbl, 5, 1)
-        l2_layout.addWidget(make_label("VLAN Status"), 6, 0)
-        l2_layout.addWidget(self.vlan_status_badge, 6, 1)
-        l2_layout.addWidget(make_label("VLAN Details"), 7, 0)
-        l2_layout.addWidget(self.vlan_lbl, 7, 1)
+        neighbors_row = QHBoxLayout()
+        neighbors_row.setContentsMargins(0, 0, 0, 0)
+        neighbors_row.setSpacing(8)
+        neighbors_row.addWidget(self.lldp_neighbors_combo)
+        neighbors_row.addWidget(self.btn_copy_lldp)
+        neighbors_row.addStretch(1)
+        l2_layout.addWidget(make_label("LLDP Neighbors"), 1, 0)
+        l2_layout.addLayout(neighbors_row, 1, 1)
+        l2_layout.addWidget(make_label("Chassis ID"), 2, 0)
+        l2_layout.addWidget(self.lldp_chassis_lbl, 2, 1)
+        l2_layout.addWidget(make_label("Port ID"), 3, 0)
+        l2_layout.addWidget(self.lldp_port_lbl, 3, 1)
+        l2_layout.addWidget(make_label("System Name"), 4, 0)
+        l2_layout.addWidget(self.lldp_sysname_lbl, 4, 1)
+        l2_layout.addWidget(make_label("Port Description"), 5, 0)
+        l2_layout.addWidget(self.lldp_portdesc_lbl, 5, 1)
+        l2_layout.addWidget(make_label("Management Address"), 6, 0)
+        l2_layout.addWidget(self.lldp_mgmt_lbl, 6, 1)
+        l2_layout.addWidget(make_label("VLAN Status"), 7, 0)
+        l2_layout.addWidget(self.vlan_status_badge, 7, 1)
+        l2_layout.addWidget(make_label("VLAN Details"), 8, 0)
+        l2_layout.addWidget(self.vlan_lbl, 8, 1)
 
         self.l2_iface_hint = QLabel("Capture interface: -")
         self.l2_iface_hint.setObjectName("hintLabel")
@@ -2052,6 +2202,12 @@ class MainWindow(QMainWindow):
         self.l2_capture_hint.setObjectName("hintLabel")
         self.l2_counts_hint = QLabel("LLDP frames: 0 | VLAN-tagged frames: 0")
         self.l2_counts_hint.setObjectName("hintLabel")
+        self.lldp_source_hint = QLabel("LLDP source: -")
+        self.lldp_source_hint.setObjectName("hintLabel")
+        self.lldp_neighbors_hint = QLabel("LLDP neighbors count: 0")
+        self.lldp_neighbors_hint.setObjectName("hintLabel")
+        self.lldp_error_hint = QLabel("LLDP error: None")
+        self.lldp_error_hint.setObjectName("hintLabel")
 
         self.l2_debug_container = QWidget()
         debug_layout = QVBoxLayout(self.l2_debug_container)
@@ -2060,6 +2216,9 @@ class MainWindow(QMainWindow):
         debug_layout.addWidget(self.l2_iface_hint)
         debug_layout.addWidget(self.l2_capture_hint)
         debug_layout.addWidget(self.l2_counts_hint)
+        debug_layout.addWidget(self.lldp_source_hint)
+        debug_layout.addWidget(self.lldp_neighbors_hint)
+        debug_layout.addWidget(self.lldp_error_hint)
         self.l2_debug_container.setVisible(False)
 
         toggle_row = QHBoxLayout()
@@ -2943,6 +3102,39 @@ QHeaderView::section {
     def apply_l2_result(self, payload: dict):
         self._update_l2_ui(payload)
 
+    def _format_neighbor_label(self, neighbor: dict) -> str:
+        system_name = neighbor.get("system_name") or "-"
+        port_id = neighbor.get("port_id") or "-"
+        chassis_id = neighbor.get("chassis_id") or "-"
+        return f"{system_name} | {port_id} | {chassis_id}"
+
+    def _populate_lldp_neighbors(self, neighbors: List[dict]):
+        self.lldp_neighbors_combo.blockSignals(True)
+        self.lldp_neighbors_combo.clear()
+        if neighbors:
+            for neighbor in neighbors:
+                self.lldp_neighbors_combo.addItem(
+                    self._format_neighbor_label(neighbor), neighbor
+                )
+            self.lldp_neighbors_combo.setEnabled(True)
+            self.lldp_neighbors_combo.setCurrentIndex(0)
+        else:
+            self.lldp_neighbors_combo.addItem("None", None)
+            self.lldp_neighbors_combo.setEnabled(False)
+        self.lldp_neighbors_combo.blockSignals(False)
+        self.btn_copy_lldp.setEnabled(bool(neighbors))
+
+    def _apply_lldp_selection(self, neighbor: Optional[dict], lldp: dict):
+        def set_or_dash(lbl: QLabel, value: Optional[str]):
+            lbl.setText(value if value else "-")
+
+        selected = neighbor or self._lldp_primary_cache or lldp or {}
+        set_or_dash(self.lldp_chassis_lbl, selected.get("chassis_id"))
+        set_or_dash(self.lldp_port_lbl, selected.get("port_id"))
+        set_or_dash(self.lldp_sysname_lbl, selected.get("system_name"))
+        set_or_dash(self.lldp_portdesc_lbl, selected.get("port_description"))
+        set_or_dash(self.lldp_mgmt_lbl, selected.get("management_address"))
+
     def _update_l2_ui(self, payload: dict):
         lldp = payload.get("lldp", {}) if payload else {}
         vlans = payload.get("vlans", {}) if payload else {}
@@ -2951,14 +3143,14 @@ QHeaderView::section {
         color_map = {"detected": "green", "not detected": "red", "unknown": "yellow"}
         self._style_status(self.lldp_status_lbl, "LLDP", lldp_status, color_map)
 
-        def set_or_dash(lbl: QLabel, value: Optional[str]):
-            lbl.setText(value if value else "-")
+        neighbors = lldp.get("neighbors") or []
+        self._lldp_neighbors_cache = neighbors
+        self._lldp_primary_cache = lldp.get("primary") or {}
+        self._last_lldp_data = lldp
 
-        set_or_dash(self.lldp_chassis_lbl, lldp.get("chassis_id"))
-        set_or_dash(self.lldp_port_lbl, lldp.get("port_id"))
-        set_or_dash(self.lldp_sysname_lbl, lldp.get("system_name"))
-        set_or_dash(self.lldp_portdesc_lbl, lldp.get("port_description"))
-        set_or_dash(self.lldp_mgmt_lbl, lldp.get("management_address"))
+        self._populate_lldp_neighbors(neighbors)
+        initial_neighbor = neighbors[0] if neighbors else (self._lldp_primary_cache or lldp)
+        self._apply_lldp_selection(initial_neighbor, lldp)
 
         vlan_status = str(vlans.get("status", "Unknown"))
         vlan_ids = vlans.get("vlans") or []
@@ -2984,9 +3176,40 @@ QHeaderView::section {
         self.l2_counts_hint.setText(
             f"LLDP frames: {lldp_frames} | VLAN-tagged frames: {vlan_frames}"
         )
+        source_text = lldp.get("source") or "-"
+        self.lldp_source_hint.setText(f"LLDP source: {source_text}")
+        self.lldp_neighbors_hint.setText(f"LLDP neighbors count: {len(neighbors)}")
+        if lldp.get("error"):
+            self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
+        else:
+            self.lldp_error_hint.setText("LLDP error: None")
 
     def on_l2_finished(self):
         self.l2_check_running = False
+
+    @Slot(int)
+    def on_lldp_neighbor_selected(self, index: int):
+        neighbor = self.lldp_neighbors_combo.itemData(index)
+        self._apply_lldp_selection(neighbor, self._last_lldp_data)
+
+    def copy_selected_lldp_neighbor(self):
+        neighbor = self.lldp_neighbors_combo.currentData()
+        if not neighbor:
+            return
+
+        sanitized = {k: v for k, v in neighbor.items() if k != "raw"}
+        try:
+            text = json.dumps(sanitized, indent=2, ensure_ascii=False)
+        except Exception:
+            lines = [
+                f"System: {sanitized.get('system_name') or '-'}",
+                f"Chassis: {sanitized.get('chassis_id') or '-'}",
+                f"Port: {sanitized.get('port_id') or '-'}",
+                f"Desc: {sanitized.get('port_description') or '-'}",
+                f"Mgmt: {sanitized.get('management_address') or '-'}",
+            ]
+            text = "\n".join(lines)
+        QApplication.clipboard().setText(text)
 
     def refresh_av_insights(self, auto_trigger: bool = False):
         if self.av_check_running:
@@ -3108,6 +3331,18 @@ QHeaderView::section {
             self.vlan_lbl,
         ]:
             lbl.setText("Refreshing...")
+        self._lldp_neighbors_cache = []
+        self._lldp_primary_cache = {}
+        self._last_lldp_data = {}
+        self.lldp_neighbors_combo.blockSignals(True)
+        self.lldp_neighbors_combo.clear()
+        self.lldp_neighbors_combo.addItem("Refreshing...", None)
+        self.lldp_neighbors_combo.setEnabled(False)
+        self.lldp_neighbors_combo.blockSignals(False)
+        self.btn_copy_lldp.setEnabled(False)
+        self.lldp_source_hint.setText("LLDP source: -")
+        self.lldp_neighbors_hint.setText("LLDP neighbors count: 0")
+        self.lldp_error_hint.setText("LLDP error: None")
 
     def _update_network_updated_label(self):
         if not getattr(self, "network_updated_lbl", None):
@@ -3153,6 +3388,18 @@ QHeaderView::section {
             self.vlan_lbl,
         ]:
             lbl.setText("Unavailable")
+        self._lldp_neighbors_cache = []
+        self._lldp_primary_cache = {}
+        self._last_lldp_data = {}
+        self.lldp_neighbors_combo.blockSignals(True)
+        self.lldp_neighbors_combo.clear()
+        self.lldp_neighbors_combo.addItem("None", None)
+        self.lldp_neighbors_combo.setEnabled(False)
+        self.lldp_neighbors_combo.blockSignals(False)
+        self.btn_copy_lldp.setEnabled(False)
+        self.lldp_source_hint.setText("LLDP source: -")
+        self.lldp_neighbors_hint.setText("LLDP neighbors count: 0")
+        self.lldp_error_hint.setText("LLDP error: None")
 
     def toggle_l2_debug(self):
         visible = not self.l2_debug_container.isVisible()
