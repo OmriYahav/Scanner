@@ -2358,13 +2358,9 @@ class MainWindow(QMainWindow):
         env_rows = []
         self.npcap_status_lbl = QLabel()
         self.npf_status_lbl = QLabel()
-        self.pcap_status_lbl = QLabel()
-        self.admin_status_lbl = QLabel()
         self.arp_status_lbl = QLabel()
         env_rows.append(("Npcap", self.npcap_status_lbl))
         env_rows.append(("Npcap Driver", self.npf_status_lbl))
-        env_rows.append(("Pcap Provider", self.pcap_status_lbl))
-        env_rows.append(("Administrator", self.admin_status_lbl))
         env_rows.append(("ARP", self.arp_status_lbl))
         for title_text, lbl in env_rows:
             row = QHBoxLayout()
@@ -2376,6 +2372,14 @@ class MainWindow(QMainWindow):
             row.addWidget(lbl)
             row.addStretch(1)
             env_layout.addLayout(row)
+        self.npcap_download_lbl = QLabel(
+            '<a href="https://npcap.com/dist/npcap-1.79.exe">Download Npcap (direct)</a>'
+        )
+        self.npcap_download_lbl.setTextFormat(Qt.RichText)
+        self.npcap_download_lbl.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.npcap_download_lbl.setOpenExternalLinks(True)
+        self.npcap_download_lbl.setObjectName("hintLabel")
+        env_layout.addWidget(self.npcap_download_lbl)
         arp_hint = QLabel(
             "Npcap + Administrator privileges enable ARP/LLDP capture. Install with WinPcap API support and restart as Admin if capture shows unavailable."
         )
@@ -3632,7 +3636,6 @@ QHeaderView::section {
                 "not found": "red",
                 "unknown": "yellow",
             }
-            color_map_pcap = {"available": "green", "unavailable": "red", "unknown": "yellow"}
             admin_text = str(payload.get("admin", "Unknown"))
             if admin_text.lower() == "admin":
                 self.is_admin = True
@@ -3644,8 +3647,6 @@ QHeaderView::section {
             self.npcap_available = bool(self.npcap_installed_state and self.npf_driver_running and self.capture_provider_available)
             self._style_status(self.npcap_status_lbl, "Npcap Installed", payload.get("npcap", "Unknown"), color_map_basic, "sm")
             self._style_status(self.npf_status_lbl, "Npcap Driver", payload.get("driver", "Unknown"), color_map_driver, "sm")
-            self._style_status(self.pcap_status_lbl, "Pcap Provider", payload.get("pcap", "Unknown"), color_map_pcap, "sm")
-            self._style_status(self.admin_status_lbl, "Running as Administrator", payload.get("admin", "Unknown"), color_map_admin, "sm")
             self._style_status(self.arp_status_lbl, "ARP Available", payload.get("arp", "Unknown"), color_map_arp, "sm")
             env_message = ""
             if payload.get("npcap_raw") is False:
