@@ -2,6 +2,7 @@ import sys
 import os
 import csv
 import time
+from datetime import datetime
 import webbrowser
 import socket
 import ipaddress
@@ -482,6 +483,13 @@ def run_lldp_powershell_capture(
         if meta.get("error") and "error_short" not in meta:
             err = str(meta.get("error") or "")
             meta["error_short"] = (err.splitlines()[0] if err else "Unknown error")[:200]
+        if meta.get("status") is None:
+            if meta.get("exit_code") not in (0, None):
+                meta["status"] = "Error"
+            elif neighbors:
+                meta["status"] = "OK (Detected)"
+            else:
+                meta["status"] = "No neighbors"
         return neighbors, meta
 
     if os.name != "nt":
@@ -613,46 +621,23 @@ def run_lldp_powershell_capture(
             if not isinstance(entry, dict):
                 continue
 
-            mgmt_address = pick_entry_value(entry, ["management_address"])
-            if not mgmt_address:
-                ips = entry.get("IPAddresses")
-                if isinstance(ips, list) and ips:
-                    mgmt_address = ips[0]
-            if not mgmt_address:
+            ip_addresses = entry.get("IPAddresses")
+            if isinstance(ip_addresses, (list, tuple)) and ip_addresses:
+                mgmt_address = ip_addresses[0]
+            else:
                 mgmt_address = pick_entry_value(
-                    entry,
-                    ["ManagementAddress", "IPAddress", "ManagementAddresses"],
+                    entry, ["management_address", "ManagementAddress", "IPAddress", "ManagementAddresses"]
                 )
 
+            system_name_val = pick_entry_value(entry, ["system_name", "ComputerName", "SystemName"])
+
             neighbor = {
-                "system_name": stringify(
-                    pick_entry_value(
-                        entry,
-                        [
-                            "system_name",
-                            "ComputerName",
-                            "SystemName",
-                            "SystemDescription",
-                        ],
-                    )
-                ),
-                "system_description": stringify(
-                    pick_entry_value(entry, ["system_description", "SystemDescription"])
-                ),
-                "chassis_id": format_chassis(entry)
-                or stringify(pick_entry_value(entry, ["chassis_id", "ChassisId"])),
-                "port_id": stringify(
-                    pick_entry_value(entry, ["port_id", "Port", "PortId"])
-                ),
-                "port_description": stringify(
-                    pick_entry_value(entry, ["port_description", "PortDescription"])
-                ),
-                "management_address": stringify(
-                    pick_entry_value(
-                        {"management_address": mgmt_address} if mgmt_address else entry,
-                        ["management_address"],
-                    )
-                ),
+                "chassis_id": stringify(format_chassis(entry) or pick_entry_value(entry, ["chassis_id", "ChassisId"])),
+                "port_id": stringify(pick_entry_value(entry, ["port_id", "Port", "PortId"])),
+                "system_name": stringify(system_name_val),
+                "port_description": stringify(pick_entry_value(entry, ["port_description", "PortDescription"])),
+                "system_description": stringify(pick_entry_value(entry, ["system_description", "SystemDescription"])),
+                "management_address": stringify(mgmt_address),
                 "ttl": stringify(pick_entry_value(entry, ["ttl", "TimeToLive"])),
                 "connection": stringify(pick_entry_value(entry, ["connection", "Connection"])),
                 "interface": stringify(pick_entry_value(entry, ["interface", "Interface"])),
@@ -706,7 +691,9 @@ def run_lldp_powershell_capture(
         )
     except Exception as e:
         meta["error"] = str(e)
-        meta["error_type"] = "ParameterError"
+        meta["error_type"] = "ExecutionError"
+        meta["status"] = "Error"
+        stdout, stderr = "", ""
         return finalize()
 
     logger.info("LLDP capture started (blocking until completion)")
@@ -721,10 +708,12 @@ def run_lldp_powershell_capture(
             proc.terminate()
         except Exception:
             pass
+        meta["status"] = "Error"
         stdout, stderr = "", ""
     except Exception as e:
         meta["error"] = str(e)
-        meta["error_type"] = "ParameterError"
+        meta["error_type"] = "ExecutionError"
+        meta["status"] = "Error"
         stdout, stderr = "", ""
 
     meta["elapsed_ms"] = int((time.monotonic() - capture_start) * 1000)
@@ -733,65 +722,95 @@ def run_lldp_powershell_capture(
     meta["stderr_preview"] = (stderr or "")[:1000]
 
     if meta.get("error_type"):
+        meta["status"] = meta.get("status") or "Error"
         return finalize()
 
     output = (stdout or "").strip()
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    raw_log_path: Optional[Path] = None
     if debug_log:
         try:
-            log_path = Path("logs") / "lldp_raw.json"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text(output, encoding="utf-8")
-            meta["debug_log_path"] = str(log_path)
+            raw_log_path = Path("logs") / f"lldp_raw_{timestamp}.json"
+            raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_log_path.write_text(output, encoding="utf-8")
+            meta["debug_log_path"] = str(raw_log_path)
         except Exception:
-            logger.debug("Failed to write LLDP debug output", exc_info=True)
+            logger.debug("Failed to write LLDP raw debug output", exc_info=True)
     if not output:
         meta["error"] = "PowerShell returned no LLDP data"
-        meta["error_type"] = "Timeout"
+        meta["error_type"] = meta.get("error_type") or "Timeout"
+        meta["status"] = "Error"
         return finalize()
 
     try:
         parsed_json = json.loads(output)
     except Exception as e:
-        meta["error_type"] = "ParameterError"
+        meta["error_type"] = meta.get("error_type") or "ParseError"
         meta["error"] = f"Failed to parse PowerShell output: {e}"
+        meta["status"] = "Error"
         return finalize()
 
+    neighbor_payload = parsed_json
+    structured_error_type = None
+    structured_error_message = None
     if isinstance(parsed_json, dict):
         meta["module_imported"] = parsed_json.get("module_imported")
         meta["cmdlet_available"] = parsed_json.get("cmdlet_available")
         meta["cmdlet_used"] = parsed_json.get("cmdlet_used")
-        meta["error_type"] = parsed_json.get("error_type")
+        structured_error_type = parsed_json.get("error_type")
         meta["failed_stage"] = parsed_json.get("failed_stage")
+        structured_error_message = parsed_json.get("error_message")
 
         logger.info("PowerShell LLDP cmdlet used: %s", meta.get("cmdlet_used"))
         logger.info("PSDiscoveryProtocol imported: %s", meta.get("module_imported"))
         logger.info("Invoke-DiscoveryProtocolCapture available: %s", meta.get("cmdlet_available"))
 
-        if meta["error_type"]:
-            meta["error"] = parsed_json.get("error_message") or meta["error_type"]
-            return finalize()
-
         neighbor_payload = parsed_json.get("neighbors")
-    else:
-        neighbor_payload = parsed_json
+
+    if structured_error_type:
+        meta["error_type"] = structured_error_type
+        meta["error"] = structured_error_message or meta.get("error") or structured_error_type
 
     try:
-        parsed_neighbors = parse_neighbors(neighbor_payload)
-        meta["lldp_frames"] = len(parsed_neighbors)
-        if meta.get("exit_code") not in (0, None) and not meta.get("error"):
-            meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
-            meta["error_type"] = meta.get("error_type") or "ParameterError"
-            return finalize()
-        neighbors = parsed_neighbors
+        neighbors = parse_neighbors(neighbor_payload)
+        meta["lldp_frames"] = len(neighbors)
     except Exception as e:
-        meta["error_type"] = meta.get("error_type") or "ParameterError"
+        meta["error_type"] = meta.get("error_type") or "ParseError"
         meta["error"] = f"Failed to parse PowerShell output: {e}"
-        return finalize()
+        meta["status"] = "Error"
+        neighbors = []
 
-    if not neighbors:
+    if debug_log:
+        try:
+            normalized_path = Path("logs") / f"lldp_normalized_{timestamp}.json"
+            normalized_path.write_text(
+                json.dumps(neighbors, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            meta["normalized_log_path"] = str(normalized_path)
+        except Exception:
+            logger.debug("Failed to write LLDP normalized debug output", exc_info=True)
+
+    exit_code = meta.get("exit_code")
+    if exit_code not in (0, None) and not meta.get("error"):
+        meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
+        if not meta.get("error_type"):
+            meta["error_type"] = "ExecutionError"
+
+    if exit_code not in (0, None):
+        meta["status"] = "Error"
+    elif meta.get("error_type") == "ParameterError":
+        meta["status"] = "Parameter error"
+    elif meta.get("error_type"):
+        meta["status"] = "Error"
+    elif neighbors:
+        meta["status"] = "OK (Detected)"
+    else:
+        meta["status"] = "No neighbors"
+
+    if not neighbors and not meta.get("error") and exit_code in (0, None):
         meta["error_type"] = meta.get("error_type") or "NoNeighbors"
-        meta["error"] = meta.get("error") or "No LLDP frames detected on the network"
+        meta["error"] = "No LLDP frames detected on the network"
 
     meta["lldp_source"] = "PowerShell" if neighbors else meta.get("lldp_source")
     return finalize()
@@ -2472,28 +2491,18 @@ class Layer2InfoWorker(QThread):
                 logger.error(f"Failed to resolve interface {self.iface_name}: {e}")
                 resolved_iface = self.iface_name
         ps_error_type = ps_meta.get("error_type")
-        lldp_status = "Detected" if lldp_neighbors_cache else "No neighbors"
-        if ps_error_type == "PermissionError":
-            lldp_status = "Unavailable (Administrator required)"
-        elif ps_error_type == "ModuleError":
-            lldp_status = "Not supported / Module error"
-        elif ps_error_type == "ParameterError":
-            lldp_status = "Parameter error"
-        elif ps_error_type == "Timeout" or ps_meta.get("timeout"):
-            lldp_status = "Timeout"
-        elif ps_error_type == "NoNeighbors":
-            lldp_status = "No neighbors"
+        ps_status_text = ps_meta.get("status") or ("OK (Detected)" if lldp_neighbors_cache else "No neighbors")
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
-        payload["lldp"]["status"] = lldp_status
+        payload["lldp"]["status"] = ps_status_text
+        payload["lldp"]["status_label"] = ps_status_text if str(ps_status_text).startswith("LLDP:") else f"LLDP: {ps_status_text}"
         payload["lldp"]["source"] = ps_meta.get("lldp_source") or ps_meta.get("source")
-        error_message = ps_meta.get("error_short") or ps_meta.get("error")
-        if ps_error_type == "PermissionError":
-            error_message = error_message or "Requires Administrator privileges"
-        elif ps_error_type == "NoNeighbors" and not error_message:
+        error_message = ps_meta.get("error_short") or ps_meta.get("error") or ps_meta.get("stderr_preview")
+        exit_code = ps_meta.get("exit_code")
+        if exit_code not in (0, None) and not error_message:
+            error_message = "PowerShell execution failed"
+        if str(ps_status_text).lower().startswith("no neighbors") and not error_message:
             error_message = "No LLDP neighbors detected"
-        elif ps_error_type == "ParameterError" and not error_message:
-            error_message = "Invalid PowerShell parameters for LLDP capture"
         payload["lldp"]["error"] = error_message
         if payload["lldp"]["primary"]:
             payload["lldp"].update(payload["lldp"]["primary"])
@@ -3081,7 +3090,7 @@ class MainWindow(QMainWindow):
 
         self.lldp_debug_chk = QCheckBox("Save raw LLDP JSON")
         self.lldp_debug_chk.setToolTip(
-            "When enabled, raw PowerShell LLDP JSON is saved to logs/lldp_raw.json"
+            "When enabled, raw and normalized PowerShell LLDP JSON are saved to logs/lldp_raw_*.json"
         )
 
         toggle_row = QHBoxLayout()
@@ -4331,36 +4340,24 @@ QHeaderView::section {
         lldp_status = str(lldp.get("status", "Unknown"))
         status_lower = lldp_status.lower()
         error_text = lldp.get("error")
-        overall_status = "OK"
-        if status_lower.startswith("unavailable"):
-            overall_status = "Unavailable"
-        elif status_lower == "timeout":
-            overall_status = "Timeout"
-        elif status_lower.startswith("not supported"):
-            overall_status = "Not supported / Module error"
-        elif status_lower == "parameter error":
-            overall_status = "Parameter error"
-        elif status_lower == "no neighbors":
-            overall_status = "No neighbors"
-        elif error_text and not neighbors:
-            overall_status = "Module error" if meta.get("error_type") else "Error"
-        color_map = {
-            "ok": "green",
-            "unavailable": "yellow",
-            "error": "red",
-            "unknown": "gray",
-            "timeout": "red",
-            "not supported / module error": "red",
-            "no neighbors": "yellow",
-            "module error": "red",
-            "parameter error": "red",
-        }
-        badge_state = color_map.get(overall_status.lower(), "gray")
-        status_label = f"LLDP: {overall_status}"
-        if overall_status == "OK" and lldp_status:
-            status_label = f"LLDP: OK ({lldp_status})"
+        status_label = lldp.get("status_label") or (
+            lldp_status if lldp_status.lower().startswith("lldp:") else f"LLDP: {lldp_status}"
+        )
+
+        badge_state = "gray"
+        if status_lower.startswith("ok"):
+            badge_state = "green"
+        elif status_lower.startswith("no neighbors"):
+            badge_state = "yellow"
+        elif status_lower.startswith("unavailable"):
+            badge_state = "yellow"
+        elif status_lower.startswith("parameter error"):
+            badge_state = "red"
+        elif status_lower.startswith("error"):
+            badge_state = "red"
+
         set_badge(self.lldp_status_lbl, badge_state, status_label)
-        self.lldp_status_lbl.setToolTip(lldp_status)
+        self.lldp_status_lbl.setToolTip(status_label)
 
         self._lldp_neighbors_cache = neighbors
         self._lldp_primary_cache = lldp.get("primary") or {}
@@ -4418,12 +4415,14 @@ QHeaderView::section {
                 self.lldp_neighbors_combo.clear()
                 self.lldp_neighbors_combo.addItem("Unavailable", None)
             self.lldp_error_hint.setText(lldp.get("error") or "Run application as Administrator to enable LLDP discovery")
-        elif status_lower.startswith("not supported"):
-            self.lldp_error_hint.setText(lldp.get("error") or "LLDP: Not supported / Module error")
-        elif status_lower == "no neighbors":
-            self.lldp_error_hint.setText("LLDP: No neighbors detected")
-        elif status_lower == "parameter error":
+        elif status_lower.startswith("no neighbors"):
+            self.lldp_error_hint.setText(lldp.get("error") or "LLDP: No neighbors detected")
+        elif status_lower.startswith("parameter error"):
             self.lldp_error_hint.setText(lldp.get("error") or "LLDP: Parameter error")
+        elif status_lower.startswith("error"):
+            self.lldp_error_hint.setText(
+                f"LLDP error: {lldp.get('error') or meta_error or 'Unknown error'}"
+            )
         elif lldp.get("error"):
             self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
         elif meta_error:
