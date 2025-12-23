@@ -485,11 +485,11 @@ def run_lldp_powershell_capture(
             meta["error_short"] = (err.splitlines()[0] if err else "Unknown error")[:200]
         if meta.get("status") is None:
             if meta.get("exit_code") not in (0, None):
-                meta["status"] = "Error"
+                meta["status"] = "LLDP: Error"
             elif neighbors:
-                meta["status"] = "OK (Detected)"
+                meta["status"] = "LLDP: OK (Detected)"
             else:
-                meta["status"] = "No neighbors"
+                meta["status"] = "LLDP: No neighbors"
         return neighbors, meta
 
     if os.name != "nt":
@@ -622,21 +622,27 @@ def run_lldp_powershell_capture(
                 continue
 
             ip_addresses = entry.get("IPAddresses")
+            mgmt_address = None
             if isinstance(ip_addresses, (list, tuple)) and ip_addresses:
                 mgmt_address = ip_addresses[0]
             else:
                 mgmt_address = pick_entry_value(
-                    entry, ["management_address", "ManagementAddress", "IPAddress", "ManagementAddresses"]
+                    entry, ["management_address", "ManagementAddress"]
                 )
-
-            system_name_val = pick_entry_value(entry, ["system_name", "ComputerName", "SystemName"])
+                mgmt_list = pick_entry_value(entry, ["ManagementAddresses", "IPAddress"])
+                if mgmt_address is None and mgmt_list is not None:
+                    mgmt_address = mgmt_list
 
             neighbor = {
-                "chassis_id": stringify(format_chassis(entry) or pick_entry_value(entry, ["chassis_id", "ChassisId"])),
+                "chassis_id": stringify(
+                    format_chassis(entry) or pick_entry_value(entry, ["chassis_id", "ChassisId"])
+                ),
                 "port_id": stringify(pick_entry_value(entry, ["port_id", "Port", "PortId"])),
-                "system_name": stringify(system_name_val),
+                "system_name": stringify(pick_entry_value(entry, ["system_name", "ComputerName", "SystemName"])),
                 "port_description": stringify(pick_entry_value(entry, ["port_description", "PortDescription"])),
-                "system_description": stringify(pick_entry_value(entry, ["system_description", "SystemDescription"])),
+                "system_description": stringify(
+                    pick_entry_value(entry, ["system_description", "SystemDescription"])
+                ),
                 "management_address": stringify(mgmt_address),
                 "ttl": stringify(pick_entry_value(entry, ["ttl", "TimeToLive"])),
                 "connection": stringify(pick_entry_value(entry, ["connection", "Connection"])),
@@ -792,27 +798,30 @@ def run_lldp_powershell_capture(
             logger.debug("Failed to write LLDP normalized debug output", exc_info=True)
 
     exit_code = meta.get("exit_code")
-    if exit_code not in (0, None) and not meta.get("error"):
+    has_neighbors = bool(neighbors)
+    parameter_error = meta.get("error_type") == "ParameterError"
+
+    if parameter_error:
+        meta["status"] = "LLDP: Parameter error"
+    elif exit_code not in (0, None):
+        meta["status"] = "LLDP: Error"
+    elif has_neighbors:
+        meta["status"] = "LLDP: OK (Detected)"
+    else:
+        meta["status"] = "LLDP: No neighbors"
+
+    if has_neighbors and exit_code in (0, None) and not parameter_error:
+        meta["error"] = None
+        meta["error_type"] = None
+    elif not has_neighbors and not meta.get("error") and exit_code in (0, None):
+        meta["error_type"] = meta.get("error_type") or "NoNeighbors"
+        meta["error"] = "No LLDP frames detected on the network"
+    elif exit_code not in (0, None) and not meta.get("error"):
         meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
         if not meta.get("error_type"):
             meta["error_type"] = "ExecutionError"
 
-    if exit_code not in (0, None):
-        meta["status"] = "Error"
-    elif meta.get("error_type") == "ParameterError":
-        meta["status"] = "Parameter error"
-    elif meta.get("error_type"):
-        meta["status"] = "Error"
-    elif neighbors:
-        meta["status"] = "OK (Detected)"
-    else:
-        meta["status"] = "No neighbors"
-
-    if not neighbors and not meta.get("error") and exit_code in (0, None):
-        meta["error_type"] = meta.get("error_type") or "NoNeighbors"
-        meta["error"] = "No LLDP frames detected on the network"
-
-    meta["lldp_source"] = "PowerShell" if neighbors else meta.get("lldp_source")
+    meta["lldp_source"] = "PowerShell" if has_neighbors else meta.get("lldp_source")
     return finalize()
 
 def is_device_online(d: Device) -> bool:
@@ -2403,22 +2412,34 @@ class Layer2InfoWorker(QThread):
     def _normalize_lldp_neighbor(self, entry: dict) -> dict:
         def first_val(keys: List[str]) -> Optional[str]:
             for key in keys:
+                if key not in entry:
+                    continue
                 val = entry.get(key)
-                if val:
-                    if isinstance(val, list):
-                        return str(val[0]) if val else None
-                    return str(val)
+                if val is None:
+                    continue
+                if isinstance(val, (list, tuple)):
+                    if not val:
+                        continue
+                    val = val[0]
+                return str(val)
             return None
 
-        mgmt = entry.get("ManagementAddress") or entry.get("ManagementAddresses")
-        if isinstance(mgmt, list):
-            mgmt = mgmt[0] if mgmt else None
+        ip_addrs = entry.get("IPAddresses")
+        mgmt = None
+        if isinstance(ip_addrs, (list, tuple)) and ip_addrs:
+            mgmt = ip_addrs[0]
+        else:
+            mgmt = entry.get("management_address") or entry.get("ManagementAddress")
+            mgmt_list = entry.get("ManagementAddresses")
+            if mgmt is None and isinstance(mgmt_list, (list, tuple)):
+                mgmt = mgmt_list[0] if mgmt_list else None
 
         neighbor = {
-            "system_name": first_val(["RemoteSystemName", "SystemName"]),
-            "chassis_id": first_val(["RemoteChassisId", "ChassisId"]),
-            "port_id": first_val(["RemotePortId", "PortId"]),
-            "port_description": first_val(["RemotePortDescription", "PortDescription"]),
+            "chassis_id": first_val(["chassis_id", "ChassisId"]),
+            "port_id": first_val(["port_id", "Port", "PortId"]),
+            "system_name": first_val(["system_name", "ComputerName", "SystemName"]),
+            "port_description": first_val(["port_description", "PortDescription"]),
+            "system_description": first_val(["system_description", "SystemDescription"]),
             "management_address": str(mgmt) if mgmt else None,
             "raw": entry,
         }
@@ -2473,7 +2494,7 @@ class Layer2InfoWorker(QThread):
         neighbors, ps_meta = run_lldp_powershell_capture(
             self.iface_name, debug_log=self.debug_log
         )
-        lldp_neighbors_cache = list(neighbors)
+        lldp_neighbors_cache = [self._normalize_lldp_neighbor(n) for n in neighbors]
         seen_neighbors = {
             (
                 n.get("system_name"),
@@ -2491,7 +2512,9 @@ class Layer2InfoWorker(QThread):
                 logger.error(f"Failed to resolve interface {self.iface_name}: {e}")
                 resolved_iface = self.iface_name
         ps_error_type = ps_meta.get("error_type")
-        ps_status_text = ps_meta.get("status") or ("OK (Detected)" if lldp_neighbors_cache else "No neighbors")
+        ps_status_text = ps_meta.get("status") or (
+            "LLDP: OK (Detected)" if lldp_neighbors_cache else "LLDP: No neighbors"
+        )
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
         payload["lldp"]["status"] = ps_status_text
@@ -4339,21 +4362,22 @@ QHeaderView::section {
         neighbors = lldp.get("neighbors") or []
         lldp_status = str(lldp.get("status", "Unknown"))
         status_lower = lldp_status.lower()
+        status_core = status_lower.split("lldp:", 1)[1].strip() if status_lower.startswith("lldp:") else status_lower
         error_text = lldp.get("error")
         status_label = lldp.get("status_label") or (
             lldp_status if lldp_status.lower().startswith("lldp:") else f"LLDP: {lldp_status}"
         )
 
         badge_state = "gray"
-        if status_lower.startswith("ok"):
+        if status_core.startswith("ok"):
             badge_state = "green"
-        elif status_lower.startswith("no neighbors"):
+        elif status_core.startswith("no neighbors"):
             badge_state = "yellow"
-        elif status_lower.startswith("unavailable"):
+        elif status_core.startswith("unavailable"):
             badge_state = "yellow"
-        elif status_lower.startswith("parameter error"):
+        elif status_core.startswith("parameter error"):
             badge_state = "red"
-        elif status_lower.startswith("error"):
+        elif status_core.startswith("error"):
             badge_state = "red"
 
         set_badge(self.lldp_status_lbl, badge_state, status_label)
@@ -4409,17 +4433,17 @@ QHeaderView::section {
         admin_text = meta.get("admin") or "Unknown"
         self.lldp_admin_hint.setText(f"Admin: {admin_text}")
         self.lldp_neighbors_hint.setText(f"LLDP neighbors count: {len(neighbors)}")
-        if status_lower.startswith("unavailable"):
+        if status_core.startswith("unavailable"):
             self.lldp_neighbors_combo.setEnabled(False)
             if not neighbors:
                 self.lldp_neighbors_combo.clear()
                 self.lldp_neighbors_combo.addItem("Unavailable", None)
             self.lldp_error_hint.setText(lldp.get("error") or "Run application as Administrator to enable LLDP discovery")
-        elif status_lower.startswith("no neighbors"):
+        elif status_core.startswith("no neighbors"):
             self.lldp_error_hint.setText(lldp.get("error") or "LLDP: No neighbors detected")
-        elif status_lower.startswith("parameter error"):
+        elif status_core.startswith("parameter error"):
             self.lldp_error_hint.setText(lldp.get("error") or "LLDP: Parameter error")
-        elif status_lower.startswith("error"):
+        elif status_core.startswith("error"):
             self.lldp_error_hint.setText(
                 f"LLDP error: {lldp.get('error') or meta_error or 'Unknown error'}"
             )
@@ -4429,6 +4453,10 @@ QHeaderView::section {
             self.lldp_error_hint.setText(f"LLDP error: {meta_error}")
         else:
             self.lldp_error_hint.setText("LLDP error: None")
+        if status_core.startswith("ok"):
+            self.btn_copy_lldp.setEnabled(bool(neighbors))
+            if getattr(self, "lldp_debug_chk", None):
+                self.lldp_debug_chk.setEnabled(True)
         self.lldp_error_hint.setToolTip(debug_tooltip or "")
 
     def on_l2_finished(self):
