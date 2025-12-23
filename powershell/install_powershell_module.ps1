@@ -16,10 +16,28 @@ catch {
     Write-Warning "Unable to force TLS 1.2/1.3 for module installation: $($_.Exception.Message)"
 }
 
-if (-not (Get-PackageProvider -Name NuGet -ListAvailable)) {
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+function Ensure-NuGetProvider {
+    $nuget = Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue
+    if ($nuget) {
+        return $true
+    }
+
+    try {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ForceBootstrap -Scope CurrentUser -ErrorAction Stop | Out-Null
+        $nuget = Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue
+        return [bool]$nuget
+    }
+    catch {
+        Write-Warning "NuGet provider installation failed: $($_.Exception.Message)"
+        return $false
+    }
 }
 
-Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+if (-not (Ensure-NuGetProvider)) {
+    Write-Error "Unable to install NuGet package provider required for module installation"
+    exit 1
+}
+
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
 Install-Module -Name $ModuleName -Scope CurrentUser -Force -AllowClobber
 "OK"
