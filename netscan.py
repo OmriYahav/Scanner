@@ -878,77 +878,91 @@ def fetch_upnp_friendly_name(location_url: str, timeout_s: float = 1.5) -> Optio
 # -----------------------------
 # Passive Layer 2 / AV helpers
 # -----------------------------
-def parse_lldp_tlv(tlv: Any) -> Optional[str]:
-    """Return a human-readable value for a Scapy LLDP TLV object.
+def format_lldp_value(tlv: Any) -> Optional[str]:
+    """Return a readable string for an LLDP TLV.
 
-    The function is resilient to binary data by formatting MAC/IP addresses as
-    strings and falling back to hex when UTF-8 decoding fails.
+    The function handles common LLDP fields and subtypes, converting binary
+    values such as MAC/IP addresses into friendly strings. When text decoding
+    fails, the value is returned as hex to avoid garbled characters.
+
+    Example usage inside a packet handler::
+
+        if pkt.haslayer("LLDPDU"):
+            for tlv in pkt.getlayer("LLDPDU"):
+                human_value = format_lldp_value(tlv)
+                if human_value is not None:
+                    print(human_value)
     """
 
     def mac_to_str(data: bytes) -> str:
         return ":".join(f"{b:02X}" for b in data)
 
+    def to_bytes(value: Any) -> bytes:
+        if value is None:
+            return b""
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            return value.encode()
+        return bytes(value)
+
     def safe_decode(data: bytes) -> str:
-        if data is None:
-            return ""
         try:
             return data.decode("utf-8")
-        except Exception:
+        except UnicodeDecodeError:
             return data.hex(":")
 
     tlv_type = getattr(tlv, "_type", getattr(tlv, "type", None))
-    raw_val: bytes = b""
 
+    # Extract the raw payload for the TLV so that we can interpret subfields.
+    raw_val: bytes = b""
     if hasattr(tlv, "id"):
-        val = getattr(tlv, "id")
-        raw_val = val if isinstance(val, (bytes, bytearray)) else bytes(val)
+        raw_val = to_bytes(getattr(tlv, "id"))
     elif hasattr(tlv, "value"):
-        val = getattr(tlv, "value")
-        raw_val = val if isinstance(val, (bytes, bytearray)) else bytes(val)
+        raw_val = to_bytes(getattr(tlv, "value"))
     elif hasattr(tlv, "raw"):
-        val = getattr(tlv, "raw")
-        raw_val = val if isinstance(val, (bytes, bytearray)) else bytes(val)
+        raw_val = to_bytes(getattr(tlv, "raw"))
 
     if tlv_type == 1:  # Chassis ID
         subtype = getattr(tlv, "subtype", raw_val[0] if raw_val else None)
         chassis_id = raw_val[1:] if raw_val else b""
-        if subtype == 4:  # MAC address
+        if subtype == 4:  # MAC Address
             return mac_to_str(chassis_id)
         return safe_decode(chassis_id)
 
     if tlv_type == 2:  # Port ID
         subtype = getattr(tlv, "subtype", raw_val[0] if raw_val else None)
         port_id = raw_val[1:] if raw_val else b""
-        if subtype == 3:  # MAC address
+        if subtype == 3:  # MAC Address
             return mac_to_str(port_id)
-        if subtype in (5, 7):  # Interface name
-            try:
-                return port_id.decode("utf-8")
-            except Exception:
-                return port_id.hex(":")
+        if subtype in (5, 7):  # Interface Name / Locally Assigned
+            return safe_decode(port_id)
         return safe_decode(port_id)
 
-    if tlv_type == 8:  # Management address
+    if tlv_type == 8:  # Management Address
         subtype = getattr(tlv, "management_address_subtype", None)
-        addr_bytes = getattr(tlv, "management_address", raw_val) or b""
-        if isinstance(addr_bytes, str):
-            addr_bytes = addr_bytes.encode()
+        addr_bytes = to_bytes(getattr(tlv, "management_address", raw_val))
 
+        # Some TLVs encode length + subtype inside the raw bytes
         if not subtype and raw_val:
             mgmt_len = raw_val[0]
             subtype = raw_val[1] if len(raw_val) > 1 else None
             addr_bytes = raw_val[2 : 1 + mgmt_len]
 
         if subtype == 1 and len(addr_bytes) >= 4:  # IPv4
-            return socket.inet_ntop(socket.AF_INET, bytes(addr_bytes[:4]))
+            return socket.inet_ntop(socket.AF_INET, addr_bytes[:4])
         if subtype == 2 and len(addr_bytes) >= 16:  # IPv6
-            return socket.inet_ntop(socket.AF_INET6, bytes(addr_bytes[:16]))
+            return socket.inet_ntop(socket.AF_INET6, addr_bytes[:16])
         return addr_bytes.hex(":") if addr_bytes else None
 
-    if tlv_type in (4, 5):  # Port description / System name
-        return safe_decode(raw_val)
-
+    # Default/fallback: try UTF-8, otherwise hex so UI does not break.
     return safe_decode(raw_val) if raw_val else None
+
+
+def parse_lldp_tlv(tlv: Any) -> Optional[str]:
+    """Backwards-compatible wrapper around :func:`format_lldp_value`."""
+
+    return format_lldp_value(tlv)
 
 
 def parse_lldp_tlvs(raw: bytes) -> Dict[str, str]:
