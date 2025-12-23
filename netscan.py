@@ -352,6 +352,7 @@ LLDP_PROCESS_GRACE_SECONDS = 5
 LLDP_TIMEOUT_SECONDS = LLDP_CAPTURE_SECONDS + LLDP_PROCESS_GRACE_SECONDS
 LLDP_MAX_ATTEMPTS = 3
 LLDP_RETRY_DELAY_SECONDS = 2.5
+POWERSHELL_DIR = Path(__file__).resolve().parent / "powershell"
 
 
 def build_encoded_ps(script: str) -> str:
@@ -374,15 +375,10 @@ def install_powershell_module(module_name: str, ps_exe: Optional[str] = None) ->
     if not ps_path:
         return False
 
-    script = rf"""
-$ErrorActionPreference='Stop'
-if (-not (Get-PackageProvider -Name NuGet -ListAvailable)) {{
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
-}}
-Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-Install-Module -Name '{module_name}' -Scope CurrentUser -Force -AllowClobber
-"OK"
-"""
+    script_path = POWERSHELL_DIR / "install_powershell_module.ps1"
+    if not script_path.exists():
+        logger.error("PowerShell installer script missing at %s", script_path)
+        return False
 
     try:
         result = subprocess.run(
@@ -392,8 +388,10 @@ Install-Module -Name '{module_name}' -Scope CurrentUser -Force -AllowClobber
                 "-NonInteractive",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-Command",
-                script,
+                "-File",
+                str(script_path),
+                "-ModuleName",
+                module_name,
             ],
             capture_output=True,
             text=True,
@@ -418,14 +416,31 @@ Install-Module -Name '{module_name}' -Scope CurrentUser -Force -AllowClobber
 def check_psdiscovery_module() -> bool:
     """Check if PSDiscoveryProtocol module is available."""
 
+    script_path = POWERSHELL_DIR / "check_psdiscovery_module.ps1"
+    if not script_path.exists():
+        logger.error("PowerShell discovery check script missing at %s", script_path)
+        return False
+
+    ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    if not ps_exe:
+        return False
+
     try:
         result = subprocess.run(
-            ["powershell", "-Command", "Get-Module -ListAvailable PSDiscoveryProtocol"],
+            [
+                ps_exe,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+            ],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        return "PSDiscoveryProtocol" in (result.stdout or "")
+        return result.returncode == 0 and "True" in (result.stdout or "")
     except Exception:
         return False
 
@@ -571,81 +586,26 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             parsed_neighbors.append(neighbor)
         return parsed_neighbors
 
-    script = f"""
-$ProgressPreference='SilentlyContinue'
-$ErrorActionPreference='Stop'
-$duration = {LLDP_CAPTURE_SECONDS}
-$result = [ordered]@{{
-    module_imported = $false
-    cmdlet_available = $false
-    cmdlet_used = 'Invoke-DiscoveryProtocolCapture'
-    neighbors = @()
-    error_type = $null
-    error_message = $null
-    failed_stage = $null
-}}
-
-try {
-    Import-Module PSDiscoveryProtocol -ErrorAction Stop
-    $result.module_imported = $true
-} catch {
-    $result.error_type = 'ModuleError'
-    $result.error_message = "PSDiscoveryProtocol module missing: $($_.Exception.Message)"
-    $result.failed_stage = 'ImportModule'
-    $result | ConvertTo-Json -Depth 8
-    exit 1
-}
-
-try {
-    $null = Get-Command Invoke-DiscoveryProtocolCapture -ErrorAction Stop
-    $result.cmdlet_available = $true
-} catch {
-    $result.error_type = 'ModuleError'
-    $result.error_message = "Invoke-DiscoveryProtocolCapture unavailable: $($_.Exception.Message)"
-    $result.failed_stage = 'ValidateCmdlet'
-    $result | ConvertTo-Json -Depth 8
-    exit 1
-}
-
-try {
-    $capture = Invoke-DiscoveryProtocolCapture -Type LLDP -Force -Duration $duration
-    $data = $capture | Get-DiscoveryProtocolData
-} catch {
-    $result.error_type = 'ParameterError'
-    $result.error_message = $_.Exception.Message
-    $result.failed_stage = 'Capture'
-}
-
-if ($result.error_type) {
-    $result | ConvertTo-Json -Depth 8
-    exit 1
-}
-
-if ($null -eq $data) { $data = @() }
-$result.neighbors = $data | ForEach-Object {
-    [pscustomobject]@{
-        ChassisId = $_.ChassisId
-        PortId = $_.PortId
-        SystemName = $_.SystemName
-        PortDescription = $_.PortDescription
-        ManagementAddress = $_.ManagementAddress
-        Vlans = $_.Vlans
-        VlanIds = $_.VlanIds
-        Interface = $_.Interface
-        InterfaceAlias = $_.InterfaceAlias
-    }
-}
-$result | ConvertTo-Json -Depth 8
-"""
+    script_path = POWERSHELL_DIR / "run_lldp_capture.ps1"
+    if not script_path.exists():
+        meta["error"] = f"PowerShell LLDP script missing at {script_path}"
+        meta["error_type"] = "ScriptMissing"
+        return finalize()
 
     cmd = [
         ps_exe,
         "-NoProfile",
+        "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
-        "-Command",
-        script,
+        "-File",
+        str(script_path),
+        "-DurationSeconds",
+        str(LLDP_CAPTURE_SECONDS),
     ]
+
+    if interface_name_or_alias:
+        cmd.extend(["-InterfaceNameOrAlias", interface_name_or_alias])
     meta["used_cmd"] = cmd
     logger.info("PowerShell command line: %s", cmd)
 
@@ -715,7 +675,7 @@ $result | ConvertTo-Json -Depth 8
     if isinstance(parsed_json, dict):
         meta["module_imported"] = parsed_json.get("module_imported")
         meta["cmdlet_available"] = parsed_json.get("cmdlet_available")
-        meta["cmdlet_used"] = parsed_json.get("cmdlet_used") or "Invoke-DiscoveryProtocolCapture"
+        meta["cmdlet_used"] = parsed_json.get("cmdlet_used")
         meta["error_type"] = parsed_json.get("error_type")
         meta["failed_stage"] = parsed_json.get("failed_stage")
 
