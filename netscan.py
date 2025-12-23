@@ -137,7 +137,10 @@ def get_active_ipv4_interfaces() -> List[dict]:
     return sorted(out, key=lambda x: x.get("name", ""))
 
 
-DEFAULT_OUI_URL = "https://raw.githubusercontent.com/oui-lookup/ieee-oui/master/oui.csv"
+DEFAULT_OUI_URLS = [
+    "https://standards-oui.ieee.org/oui/oui.csv",
+    "https://raw.githubusercontent.com/oui-lookup/ieee-oui/master/oui.csv",
+]
 
 
 def setup_logging():
@@ -181,7 +184,7 @@ def build_oui_map(path: str) -> Dict[str, str]:
     return m
 
 
-def load_oui_map(path: str = "oui.csv", url: str = DEFAULT_OUI_URL) -> Dict[str, str]:
+def load_oui_map(path: str = "oui.csv", urls: Optional[List[str]] = None) -> Dict[str, str]:
     """Ensure an OUI map is available by downloading a CSV if missing."""
     primary_path = Path(path)
     cache_path = Path.home() / ".scanner" / "cache" / "oui.csv"
@@ -200,16 +203,18 @@ def load_oui_map(path: str = "oui.csv", url: str = DEFAULT_OUI_URL) -> Dict[str,
         except Exception:
             logger.debug("Failed to persist OUI data to %s", target, exc_info=True)
 
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        if resp.text:
-            _write_target(primary_path, resp.text)
-            _write_target(cache_path, resp.text)
-    except requests.RequestException as e:
-        logger.error("Failed to download OUI data from %s: %s", url, e)
-    except Exception:
-        logger.exception("Unexpected error while downloading OUI data")
+    for url in urls or DEFAULT_OUI_URLS:
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            if resp.text:
+                _write_target(primary_path, resp.text)
+                _write_target(cache_path, resp.text)
+                break
+        except requests.RequestException as e:
+            logger.error("Failed to download OUI data from %s: %s", url, e)
+        except Exception:
+            logger.exception("Unexpected error while downloading OUI data from %s", url)
 
     for candidate in (primary_path, cache_path):
         if candidate.exists():
