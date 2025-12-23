@@ -462,6 +462,11 @@ def run_lldp_powershell_capture(
 
     logger = logging.getLogger(__name__)
     logger.info("Starting LLDP capture for interface: %s", interface_name_or_alias)
+    if interface_name_or_alias:
+        logger.info(
+            "Invoke-DiscoveryProtocolCapture does not support interface selection; "
+            "capturing all interfaces and filtering results locally"
+        )
     start_ts = time.monotonic()
     neighbors: List[dict] = []
     meta: Dict[str, Any] = {
@@ -483,6 +488,7 @@ def run_lldp_powershell_capture(
         "module_imported": None,
         "cmdlet_available": None,
         "attempts": [],
+        "interface_filtering_requested": bool(interface_name_or_alias),
     }
 
     def finalize() -> Tuple[List[dict], dict]:
@@ -661,6 +667,143 @@ def run_lldp_powershell_capture(
             parsed_neighbors.append(neighbor)
         return parsed_neighbors
 
+    def normalize_mac(mac: Any) -> str:
+        try:
+            return re.sub(r"[^0-9a-f]", "", str(mac).lower())
+        except Exception:
+            return ""
+
+    def collect_interface_metadata(
+        target: str,
+    ) -> Tuple[Set[str], Set[str], Set[str]]:
+        candidate_names: Set[str] = set()
+        local_macs: Set[str] = set()
+        local_ips: Set[str] = set()
+
+        target_lower = target.lower()
+        candidate_names.add(target_lower)
+
+        try:
+            addrs = psutil.net_if_addrs().get(target, [])
+            for addr in addrs:
+                family_name = getattr(addr.family, "name", addr.family)
+                if (
+                    family_name == "AF_LINK"
+                    or addr.family == getattr(psutil, "AF_LINK", None)
+                    or family_name == "AF_PACKET"
+                ):
+                    mac_val = normalize_mac(addr.address)
+                    if mac_val:
+                        local_macs.add(mac_val)
+                if family_name == "AF_INET" or addr.family == socket.AF_INET:
+                    if addr.address:
+                        local_ips.add(addr.address)
+        except Exception:
+            pass
+
+        try:
+            if get_windows_if_list:
+                for iface in get_windows_if_list():
+                    if not isinstance(iface, dict):
+                        continue
+                    values = [
+                        iface.get("name"),
+                        iface.get("friendlyname"),
+                        iface.get("description"),
+                        iface.get("guid"),
+                        iface.get("interfacealias"),
+                        iface.get("interfacedescription"),
+                    ]
+                    lowered = {str(v).lower() for v in values if v}
+                    if target_lower in lowered:
+                        candidate_names.update(lowered)
+        except Exception:
+            pass
+
+        return candidate_names, local_macs, local_ips
+
+    def value_matches_names(value: Any, names: Set[str]) -> bool:
+        if not value:
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(value_matches_names(v, names) for v in value)
+        low_val = str(value).lower()
+        return any(low_val == n or low_val in n or n in low_val for n in names)
+
+    def value_matches_macs(value: Any, macs: Set[str]) -> bool:
+        if not value:
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(value_matches_macs(v, macs) for v in value)
+        norm = normalize_mac(value)
+        return bool(norm and norm in macs)
+
+    def value_matches_ips(value: Any, ips: Set[str]) -> bool:
+        if not value:
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(value_matches_ips(v, ips) for v in value)
+        return str(value) in ips
+
+    def filter_neighbors_for_interface(
+        items: List[dict],
+        iface_name: str,
+    ) -> Tuple[List[dict], Dict[str, Any]]:
+        names, macs, ips = collect_interface_metadata(iface_name)
+        filter_meta = {
+            "interface_filter_names": sorted(names),
+            "interface_filter_macs": sorted(macs),
+            "interface_filter_ips": sorted(ips),
+            "before": len(items),
+            "after": None,
+        }
+
+        def matches(neighbor: dict) -> bool:
+            raw = neighbor.get("raw") or {}
+            text_candidates = [neighbor.get("interface"), neighbor.get("connection")]
+            for key in [
+                "Interface",
+                "Connection",
+                "InterfaceName",
+                "InterfaceDescription",
+                "InterfaceAlias",
+                "Adapter",
+                "AdapterName",
+                "AdapterDescription",
+                "LocalInterface",
+                "LocalConnection",
+            ]:
+                text_candidates.append(raw.get(key))
+
+            if any(value_matches_names(val, names) for val in text_candidates):
+                return True
+
+            mac_candidates = []
+            for key in [
+                "LocalMac",
+                "LocalMacAddress",
+                "MacAddress",
+                "LocalMacs",
+                "LocalPortMacAddress",
+            ]:
+                mac_candidates.append(raw.get(key))
+
+            if any(value_matches_macs(val, macs) for val in mac_candidates):
+                return True
+
+            ip_candidates = [neighbor.get("management_address")]
+            for key in ["LocalIp", "LocalIpAddress", "IPAddress", "IPAddresses"]:
+                ip_candidates.append(raw.get(key))
+
+            if any(value_matches_ips(val, ips) for val in ip_candidates):
+                return True
+
+            return False
+
+        filtered = [n for n in items if matches(n)]
+        filter_meta["after"] = len(filtered)
+        return filtered, filter_meta
+
     script_path = POWERSHELL_DIR / "run_lldp_capture.ps1"
     if not script_path.exists():
         meta["error"] = f"PowerShell LLDP script missing at {script_path}"
@@ -678,9 +821,6 @@ def run_lldp_powershell_capture(
         "-DurationSeconds",
         str(LLDP_CAPTURE_SECONDS),
     ]
-
-    if interface_name_or_alias:
-        cmd.extend(["-InterfaceNameOrAlias", interface_name_or_alias])
     meta["used_cmd"] = cmd
     logger.info("PowerShell command line: %s", cmd)
 
@@ -720,6 +860,15 @@ def run_lldp_powershell_capture(
         meta["error"] = f"LLDP capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
         try:
             proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(1)
+        except Exception:
+            pass
+        try:
+            proc.kill()
+            meta["killed_on_timeout"] = True
         except Exception:
             pass
         meta["status"] = "Error"
@@ -813,6 +962,33 @@ def run_lldp_powershell_capture(
         neighbors = []
         return finalize()
 
+    if interface_name_or_alias and neighbors:
+        neighbors, filter_meta = filter_neighbors_for_interface(
+            neighbors, interface_name_or_alias
+        )
+        meta.update(filter_meta)
+        meta["interface_filter_applied"] = True
+        logger.info(
+            "Post-capture LLDP filter applied for %s: kept %s of %s entries",
+            interface_name_or_alias,
+            filter_meta.get("after"),
+            filter_meta.get("before"),
+        )
+        meta.setdefault(
+            "status_label",
+            "LLDP capture succeeded, but interface-specific capture is not supported by Windows. "
+            "Results are filtered after capture.",
+        )
+
+    if interface_name_or_alias:
+        meta.setdefault(
+            "status_label",
+            "LLDP capture succeeded, but interface-specific capture is not supported by Windows. "
+            "Results are filtered after capture.",
+        )
+
+    meta["lldp_frames"] = len(neighbors)
+
     if debug_log:
         try:
             normalized_path = Path("logs") / f"lldp_normalized_{timestamp}.json"
@@ -825,11 +1001,8 @@ def run_lldp_powershell_capture(
 
     exit_code = meta.get("exit_code")
     has_neighbors = bool(neighbors)
-    parameter_error = structured_error_type == "ParameterError"
 
-    if parameter_error:
-        meta["status"] = "LLDP: Parameter error"
-    elif has_neighbors:
+    if has_neighbors:
         meta["status"] = "LLDP: OK (Detected)"
     elif json_valid:
         if structured_error_type:
@@ -837,7 +1010,13 @@ def run_lldp_powershell_capture(
         else:
             meta["status"] = "LLDP: No neighbors"
             meta["error_type"] = meta.get("error_type") or "NoNeighbors"
-            meta["error"] = structured_error_message or meta.get("error") or "No LLDP neighbors detected"
+            no_neighbor_msg = (
+                structured_error_message
+                or meta.get("error")
+                or "LLDP captured successfully, no neighbors detected."
+            )
+            meta["error"] = no_neighbor_msg
+            meta.setdefault("status_label", no_neighbor_msg)
     else:
         meta["status"] = meta.get("status") or "LLDP: Error (Invalid JSON)"
 
@@ -2535,17 +2714,20 @@ class Layer2InfoWorker(QThread):
         ps_status_text = ps_meta.get("status") or (
             "LLDP: OK (Detected)" if lldp_neighbors_cache else "LLDP: No neighbors"
         )
+        status_label_override = ps_meta.get("status_label")
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
         payload["lldp"]["status"] = ps_status_text
-        payload["lldp"]["status_label"] = ps_status_text if str(ps_status_text).startswith("LLDP:") else f"LLDP: {ps_status_text}"
+        payload["lldp"]["status_label"] = status_label_override or (
+            ps_status_text if str(ps_status_text).startswith("LLDP:") else f"LLDP: {ps_status_text}"
+        )
         payload["lldp"]["source"] = ps_meta.get("lldp_source") or ps_meta.get("source")
         error_message = ps_meta.get("error_short") or ps_meta.get("error") or ps_meta.get("stderr_preview")
         exit_code = ps_meta.get("exit_code")
         if exit_code not in (0, None) and not error_message:
             error_message = "PowerShell execution failed"
         if str(ps_status_text).lower().startswith("no neighbors") and not error_message:
-            error_message = "No LLDP neighbors detected"
+            error_message = "LLDP captured successfully, no neighbors detected."
         payload["lldp"]["error"] = error_message
         if payload["lldp"]["primary"]:
             payload["lldp"].update(payload["lldp"]["primary"])
@@ -4387,6 +4569,7 @@ QHeaderView::section {
         status_label = lldp.get("status_label") or (
             lldp_status if lldp_status.lower().startswith("lldp:") else f"LLDP: {lldp_status}"
         )
+        status_label_lower = status_label.lower()
 
         badge_state = "gray"
         if status_core.startswith("ok"):
@@ -4399,6 +4582,8 @@ QHeaderView::section {
             badge_state = "red"
         elif status_core.startswith("error"):
             badge_state = "red"
+        elif "interface-specific capture is not supported" in status_label_lower:
+            badge_state = "yellow"
 
         set_badge(self.lldp_status_lbl, badge_state, status_label)
         self.lldp_status_lbl.setToolTip(status_label)
@@ -4460,13 +4645,21 @@ QHeaderView::section {
                 self.lldp_neighbors_combo.addItem("Unavailable", None)
             self.lldp_error_hint.setText(lldp.get("error") or "Run application as Administrator to enable LLDP discovery")
         elif status_core.startswith("no neighbors"):
-            self.lldp_error_hint.setText(lldp.get("error") or "LLDP: No neighbors detected")
+            self.lldp_error_hint.setText(
+                lldp.get("error")
+                or "LLDP captured successfully, no neighbors detected."
+            )
         elif status_core.startswith("parameter error"):
-            self.lldp_error_hint.setText(lldp.get("error") or "LLDP: Parameter error")
+            self.lldp_error_hint.setText(
+                lldp.get("error")
+                or "LLDP capture succeeded, but interface-specific capture is not supported by Windows. Results are filtered after capture."
+            )
         elif status_core.startswith("error"):
             self.lldp_error_hint.setText(
                 f"LLDP error: {lldp.get('error') or meta_error or 'Unknown error'}"
             )
+        elif "interface-specific capture is not supported" in status_label_lower:
+            self.lldp_error_hint.setText(status_label)
         elif lldp.get("error"):
             self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
         elif meta_error:
