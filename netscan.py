@@ -425,6 +425,10 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "ps_module_autoinstall_success": False,
         "attempts": [],
         "admin": is_running_as_admin(),
+        "error_type": None,
+        "failed_stage": None,
+        "module_imported": None,
+        "cmdlet_available": None,
     }
 
     def finalize():
@@ -459,7 +463,8 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             if meta["ps_module_autoinstall_success"]:
                 meta["ps_module_available"] = True
         if not meta["ps_module_available"]:
-            meta["error"] = "PSDiscoveryProtocol module not available"
+            meta["error"] = "PSDiscoveryProtocol module not loaded or incompatible"
+            meta["error_type"] = "ModuleError"
             return finalize()
 
     def ps_value_to_bytes(value: Any) -> bytes:
@@ -525,9 +530,8 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             return str(value[0]) if value else None
         return str(value)
 
-    def parse_neighbors(raw_output: str) -> List[dict]:
+    def parse_neighbors(data: Any) -> List[dict]:
         parsed_neighbors: List[dict] = []
-        data = json.loads(raw_output)
         entries = data if isinstance(data, list) else [data]
         for entry in entries:
             if not isinstance(entry, dict):
@@ -556,6 +560,12 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             "stderr": None,
             "error": None,
             "timeout": False,
+            "module_imported": None,
+            "cmdlet_available": None,
+            "cmdlet_used": None,
+            "error_type": None,
+            "failed_stage": None,
+            "lldp_frames": 0,
         }
 
         resolved_iface, iface_reason = resolve_active_ethernet_interface(interface_name_or_alias)
@@ -575,18 +585,59 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         script = f"""
 $ProgressPreference='SilentlyContinue'
 $ErrorActionPreference='Stop'
-Import-Module PSDiscoveryProtocol -ErrorAction Stop
 $ifaceName = '{safe_iface}'
 $duration = {LLDP_CAPTURE_SECONDS}
-$capture = Start-DiscoveryProtocolCapture -Type LLDP -Interface $ifaceName -DurationSeconds $duration -Force
+$result = [ordered]@{{
+    module_imported = $false
+    cmdlet_available = $false
+    cmdlet_used = 'Invoke-DiscoveryProtocolCapture'
+    neighbors = @()
+    error_type = $null
+    error_message = $null
+    failed_stage = $null
+}}
+
 try {{
+    Import-Module PSDiscoveryProtocol -ErrorAction Stop
+    $result.module_imported = $true
+}} catch {{
+    $result.error_type = 'ModuleError'
+    $result.error_message = "PSDiscoveryProtocol module not loaded or incompatible: $($_.Exception.Message)"
+    $result.failed_stage = 'ImportModule'
+    $result | ConvertTo-Json -Depth 8
+    exit 1
+}}
+
+try {{
+    $null = Get-Command Invoke-DiscoveryProtocolCapture -ErrorAction Stop
+    $result.cmdlet_available = $true
+}} catch {{
+    $result.error_type = 'CmdletUnavailable'
+    $result.error_message = "PSDiscoveryProtocol module not loaded or incompatible: $($_.Exception.Message)"
+    $result.failed_stage = 'ValidateCmdlet'
+    $result | ConvertTo-Json -Depth 8
+    exit 1
+}}
+
+try {{
+    $capture = Invoke-DiscoveryProtocolCapture -Type LLDP -Interface $ifaceName -DurationSeconds $duration -Force
     $null = $capture | Wait-DiscoveryProtocolCapture -TimeoutSeconds ($duration + {LLDP_PROCESS_GRACE_SECONDS})
     $data = $capture | Get-DiscoveryProtocolData -ErrorAction Stop
+}} catch {{
+    $result.error_type = 'CaptureError'
+    $result.error_message = $_.Exception.Message
+    $result.failed_stage = 'Capture'
 }} finally {{
     try {{ $capture | Stop-DiscoveryProtocolCapture -ErrorAction SilentlyContinue | Out-Null }} catch {{ }}
 }}
+
+if ($result.error_type) {{
+    $result | ConvertTo-Json -Depth 8
+    exit 1
+}}
+
 if ($null -eq $data) {{ $data = @() }}
-$data | ForEach-Object {{
+$result.neighbors = $data | ForEach-Object {{
     [pscustomobject]@{{
         ChassisId = $_.ChassisId
         PortId = $_.PortId
@@ -598,7 +649,8 @@ $data | ForEach-Object {{
         Interface = $_.Interface
         InterfaceAlias = $_.InterfaceAlias
     }}
-}} | ConvertTo-Json -Depth 8
+}}
+$result | ConvertTo-Json -Depth 8
 """
 
         cmd = [
@@ -680,17 +732,48 @@ $data | ForEach-Object {{
         if attempt_meta.get("error"):
             return [], attempt_meta
 
-        if attempt_meta["exit_code"] not in (0, None):
-            attempt_meta["error"] = attempt_meta.get("stderr") or "PowerShell execution failed"
-            return [], attempt_meta
-
         output = (stdout or "").strip()
         if not output:
             attempt_meta["error"] = "PowerShell returned no LLDP data"
             return [], attempt_meta
 
         try:
-            parsed_neighbors = parse_neighbors(output)
+            parsed_json = json.loads(output)
+        except Exception as e:
+            attempt_meta["error"] = f"Failed to parse PowerShell output: {e}"
+            return [], attempt_meta
+
+        if isinstance(parsed_json, dict):
+            attempt_meta["module_imported"] = parsed_json.get("module_imported")
+            attempt_meta["cmdlet_available"] = parsed_json.get("cmdlet_available")
+            attempt_meta["cmdlet_used"] = parsed_json.get("cmdlet_used") or "Invoke-DiscoveryProtocolCapture"
+            attempt_meta["error_type"] = parsed_json.get("error_type")
+            attempt_meta["failed_stage"] = parsed_json.get("failed_stage")
+
+            logger.info("PowerShell LLDP cmdlet used: %s", attempt_meta["cmdlet_used"])
+            logger.info("PSDiscoveryProtocol imported: %s", attempt_meta.get("module_imported"))
+            logger.info("Invoke-DiscoveryProtocolCapture available: %s", attempt_meta.get("cmdlet_available"))
+
+            if attempt_meta["error_type"]:
+                ps_error_message = parsed_json.get("error_message") or attempt_meta["error_type"]
+                attempt_meta["error"] = ps_error_message
+                logger.error(
+                    "PowerShell LLDP failed at %s: %s",
+                    attempt_meta["failed_stage"] or "Unknown stage",
+                    ps_error_message,
+                )
+                return [], attempt_meta
+
+            neighbor_payload = parsed_json.get("neighbors")
+        else:
+            neighbor_payload = parsed_json
+
+        try:
+            parsed_neighbors = parse_neighbors(neighbor_payload)
+            attempt_meta["lldp_frames"] = len(parsed_neighbors)
+            if attempt_meta["exit_code"] not in (0, None) and not attempt_meta.get("error"):
+                attempt_meta["error"] = attempt_meta.get("stderr") or "PowerShell execution failed"
+                return [], attempt_meta
             return parsed_neighbors, attempt_meta
         except Exception as e:
             attempt_meta["error"] = f"Failed to parse PowerShell output: {e}"
@@ -699,6 +782,10 @@ $data | ForEach-Object {{
     for attempt in range(1, LLDP_MAX_ATTEMPTS + 1):
         attempt_neighbors, attempt_meta = run_single_attempt(attempt)
         meta["attempts"].append(attempt_meta)
+        meta["module_imported"] = attempt_meta.get("module_imported")
+        meta["cmdlet_available"] = attempt_meta.get("cmdlet_available")
+        meta["error_type"] = attempt_meta.get("error_type") or meta.get("error_type")
+        meta["failed_stage"] = attempt_meta.get("failed_stage") or meta.get("failed_stage")
         if attempt_neighbors:
             neighbors = attempt_neighbors
             logger.info("LLDP neighbors discovered on attempt %s", attempt)
@@ -713,9 +800,23 @@ $data | ForEach-Object {{
             meta["timeout"] = True
             meta["error"] = attempt_meta.get("error")
             break
-        if attempt < LLDP_MAX_ATTEMPTS:
-            time.sleep(LLDP_RETRY_DELAY_SECONDS)
-            interface_name_or_alias = resolve_active_ethernet_interface(interface_name_or_alias)[0]
+        allow_retry = (
+            attempt < LLDP_MAX_ATTEMPTS
+            and not attempt_neighbors
+            and attempt_meta.get("module_imported") is True
+            and attempt_meta.get("cmdlet_available") is True
+            and not attempt_meta.get("error")
+            and not attempt_meta.get("error_type")
+            and attempt_meta.get("lldp_frames", 0) == 0
+        )
+
+        if not allow_retry:
+            if attempt_meta.get("error_type"):
+                meta["error"] = attempt_meta.get("error")
+            break
+
+        time.sleep(LLDP_RETRY_DELAY_SECONDS)
+        interface_name_or_alias = resolve_active_ethernet_interface(interface_name_or_alias)[0]
 
     if not neighbors and not meta.get("error"):
         # Set a clear reason for failure
@@ -727,6 +828,16 @@ $data | ForEach-Object {{
         meta["exit_code"] = last_attempt.get("exit_code", -1)
         meta["stdout_preview"] = (last_attempt.get("stdout") or "")[:500]
         meta["stderr_preview"] = (last_attempt.get("stderr") or "")[:1000]
+        if meta.get("module_imported") is None:
+            meta["module_imported"] = last_attempt.get("module_imported")
+        if meta.get("cmdlet_available") is None:
+            meta["cmdlet_available"] = last_attempt.get("cmdlet_available")
+        meta["cmdlet_used"] = last_attempt.get("cmdlet_used") or meta.get("cmdlet_used")
+        if meta.get("error_type") is None:
+            meta["error_type"] = last_attempt.get("error_type")
+        if meta.get("failed_stage") is None:
+            meta["failed_stage"] = last_attempt.get("failed_stage")
+        meta["lldp_frames"] = last_attempt.get("lldp_frames", 0)
 
     meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
     return finalize()
@@ -2402,14 +2513,16 @@ class Layer2InfoWorker(QThread):
             except Exception as e:
                 logger.error(f"Failed to resolve interface {self.iface_name}: {e}")
                 resolved_iface = self.iface_name
-        lldp_status = "Detected" if lldp_neighbors_cache else "Not detected"
+        lldp_status = "Detected" if lldp_neighbors_cache else "No neighbors"
         if ps_meta.get("timeout"):
             lldp_status = "Timeout"
+        elif ps_meta.get("error_type") in ("ModuleError", "CmdletUnavailable"):
+            lldp_status = "Not supported / Module error"
         elif ps_meta.get("error"):
             if "administrator" in str(ps_meta.get("error")).lower():
                 lldp_status = "Unavailable (Administrator required)"
             else:
-                lldp_status = "Error"
+                lldp_status = "Module error"
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
         payload["lldp"]["status"] = lldp_status
@@ -2421,6 +2534,10 @@ class Layer2InfoWorker(QThread):
         payload["meta"]["lldp_frames"] = len(lldp_neighbors_cache)
         payload["meta"]["lldp_source"] = payload["lldp"].get("source")
         payload["meta"]["lldp_debug"] = ps_meta
+        payload["meta"]["module_imported"] = ps_meta.get("module_imported")
+        payload["meta"]["cmdlet_available"] = ps_meta.get("cmdlet_available")
+        payload["meta"]["error_type"] = ps_meta.get("error_type")
+        payload["meta"]["failed_stage"] = ps_meta.get("failed_stage")
         if ps_meta.get("error"):
             payload["meta"]["error"] = ps_meta.get("error_short") or ps_meta.get("error")
 
@@ -4243,14 +4360,21 @@ QHeaderView::section {
             overall_status = "Unavailable"
         elif status_lower == "timeout":
             overall_status = "Timeout"
+        elif status_lower.startswith("not supported"):
+            overall_status = "Not supported / Module error"
+        elif status_lower == "no neighbors":
+            overall_status = "No neighbors"
         elif error_text and not neighbors:
-            overall_status = "Error"
+            overall_status = "Module error" if meta.get("error_type") else "Error"
         color_map = {
             "ok": "green",
             "unavailable": "yellow",
             "error": "red",
             "unknown": "gray",
             "timeout": "red",
+            "not supported / module error": "red",
+            "no neighbors": "yellow",
+            "module error": "red",
         }
         badge_state = color_map.get(overall_status.lower(), "gray")
         status_label = f"LLDP: {overall_status}"
@@ -4315,6 +4439,10 @@ QHeaderView::section {
                 self.lldp_neighbors_combo.clear()
                 self.lldp_neighbors_combo.addItem("Unavailable", None)
             self.lldp_error_hint.setText(lldp.get("error") or "Run application as Administrator to enable LLDP discovery")
+        elif status_lower.startswith("not supported"):
+            self.lldp_error_hint.setText(lldp.get("error") or "LLDP: Not supported / Module error")
+        elif status_lower == "no neighbors":
+            self.lldp_error_hint.setText("LLDP: No neighbors detected")
         elif lldp.get("error"):
             self.lldp_error_hint.setText(f"LLDP error: {lldp.get('error')}")
         elif meta_error:
