@@ -142,6 +142,9 @@ DEFAULT_OUI_URLS = [
     "https://raw.githubusercontent.com/oui-lookup/ieee-oui/master/oui.csv",
 ]
 
+# Some OUI sources enforce a basic User-Agent check and return 418/403 otherwise.
+DEFAULT_OUI_HEADERS = {"User-Agent": "Scanner/1.0 (+https://example.invalid)"}
+
 
 def setup_logging():
     log_dir = Path.home() / ".scanner" / "logs"
@@ -205,7 +208,7 @@ def load_oui_map(path: str = "oui.csv", urls: Optional[List[str]] = None) -> Dic
 
     for url in urls or DEFAULT_OUI_URLS:
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=10, headers=DEFAULT_OUI_HEADERS)
             resp.raise_for_status()
             if resp.text:
                 _write_target(primary_path, resp.text)
