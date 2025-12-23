@@ -727,15 +727,21 @@ def run_lldp_powershell_capture(
     meta["stdout_preview"] = (stdout or "")[:500]
     meta["stderr_preview"] = (stderr or "")[:1000]
 
+    logger.info(
+        "LLDP PowerShell finished with exit code %s", meta.get("exit_code")
+    )
+    logger.info("LLDP PowerShell stdout preview: %s", meta.get("stdout_preview"))
+    logger.info("LLDP PowerShell stderr preview: %s", meta.get("stderr_preview"))
+
     if meta.get("error_type"):
-        meta["status"] = meta.get("status") or "Error"
+        meta["status"] = meta.get("status") or "LLDP: Error"
         return finalize()
 
     output = (stdout or "").strip()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     raw_log_path: Optional[Path] = None
-    if debug_log:
+    if debug_log and output:
         try:
             raw_log_path = Path("logs") / f"lldp_raw_{timestamp}.json"
             raw_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -743,18 +749,29 @@ def run_lldp_powershell_capture(
             meta["debug_log_path"] = str(raw_log_path)
         except Exception:
             logger.debug("Failed to write LLDP raw debug output", exc_info=True)
+
+    if meta.get("exit_code") not in (0, None):
+        meta["status"] = "LLDP: Error"
+        if not meta.get("error"):
+            meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
+        if not meta.get("error_type"):
+            meta["error_type"] = "ExecutionError"
+        return finalize()
+
     if not output:
         meta["error"] = "PowerShell returned no LLDP data"
-        meta["error_type"] = meta.get("error_type") or "Timeout"
-        meta["status"] = "Error"
+        meta["error_type"] = meta.get("error_type") or "ParseError"
+        meta["status"] = "LLDP: Error (Invalid JSON)"
         return finalize()
 
     try:
         parsed_json = json.loads(output)
+        json_valid = True
     except Exception as e:
+        json_valid = False
         meta["error_type"] = meta.get("error_type") or "ParseError"
         meta["error"] = f"Failed to parse PowerShell output: {e}"
-        meta["status"] = "Error"
+        meta["status"] = "LLDP: Error (Invalid JSON)"
         return finalize()
 
     neighbor_payload = parsed_json
@@ -784,8 +801,9 @@ def run_lldp_powershell_capture(
     except Exception as e:
         meta["error_type"] = meta.get("error_type") or "ParseError"
         meta["error"] = f"Failed to parse PowerShell output: {e}"
-        meta["status"] = "Error"
+        meta["status"] = "LLDP: Error (Invalid JSON)"
         neighbors = []
+        return finalize()
 
     if debug_log:
         try:
@@ -799,27 +817,18 @@ def run_lldp_powershell_capture(
 
     exit_code = meta.get("exit_code")
     has_neighbors = bool(neighbors)
-    parameter_error = meta.get("error_type") == "ParameterError"
+    parameter_error = structured_error_type == "ParameterError"
 
     if parameter_error:
         meta["status"] = "LLDP: Parameter error"
-    elif exit_code not in (0, None):
-        meta["status"] = "LLDP: Error"
     elif has_neighbors:
         meta["status"] = "LLDP: OK (Detected)"
-    else:
+    elif json_valid:
         meta["status"] = "LLDP: No neighbors"
-
-    if has_neighbors and exit_code in (0, None) and not parameter_error:
-        meta["error"] = None
-        meta["error_type"] = None
-    elif not has_neighbors and not meta.get("error") and exit_code in (0, None):
         meta["error_type"] = meta.get("error_type") or "NoNeighbors"
-        meta["error"] = "No LLDP frames detected on the network"
-    elif exit_code not in (0, None) and not meta.get("error"):
-        meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
-        if not meta.get("error_type"):
-            meta["error_type"] = "ExecutionError"
+        meta["error"] = structured_error_message or meta.get("error") or "No LLDP neighbors detected"
+    else:
+        meta["status"] = meta.get("status") or "LLDP: Error (Invalid JSON)"
 
     meta["lldp_source"] = "PowerShell" if has_neighbors else meta.get("lldp_source")
     return finalize()
