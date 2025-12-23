@@ -1,6 +1,5 @@
 param (
-    [int]$DurationSeconds = 30,
-    [string]$InterfaceNameOrAlias
+    [int]$DurationSeconds = 30
 )
 
 function Write-Log {
@@ -48,38 +47,11 @@ $captureParams = @{
     Duration = $DurationSeconds
 }
 
-if ($InterfaceNameOrAlias) {
-    $paramCandidates = @(
-        'InterfaceNameOrAlias',
-        'InterfaceAlias',
-        'InterfaceName',
-        'Interface',
-        'InterfaceDescription'
-    )
-
-    $selectedParam = $paramCandidates |
-        Where-Object { $cmdlet.Parameters.ContainsKey($_) } |
-        Select-Object -First 1
-
-    if ($selectedParam) {
-        $payload.interface_parameter_used = $selectedParam
-        $captureParams[$selectedParam] = $InterfaceNameOrAlias
-    }
-    else {
-        Write-Log "Invoke-DiscoveryProtocolCapture does not support interface parameter on this system"
-        $payload.error_type = "ParameterError"
-        $payload.failed_stage = "ParameterSelection"
-        $payload.error_message = "No supported interface parameter found for Invoke-DiscoveryProtocolCapture"
-        $payload | ConvertTo-Json -Depth 6
-        exit 0
-    }
-}
-
 $payload.cmdlet_used = "Invoke-DiscoveryProtocolCapture"
 
 try {
-    $result = Invoke-DiscoveryProtocolCapture @captureParams
-    $data = $result | Get-DiscoveryProtocolData
+    $data = Invoke-DiscoveryProtocolCapture @captureParams |
+        Get-DiscoveryProtocolData
 }
 catch {
     $exception = $_.Exception
