@@ -82,10 +82,19 @@ try {
     $data = $result | Get-DiscoveryProtocolData
 }
 catch {
-    Write-Log "LLDP capture failed due to parameter error: $($_.Exception.Message)"
-    $payload.error_type = "ParameterError"
+    $exception = $_.Exception
     $payload.failed_stage = "Capture"
-    $payload.error_message = $_.Exception.Message
+    $payload.error_message = $exception.Message
+
+    if ($exception -is [System.Management.Automation.ParameterBindingException]) {
+        Write-Log "LLDP capture failed due to parameter error: $($exception.Message)"
+        $payload.error_type = "ParameterError"
+    }
+    else {
+        Write-Log "LLDP capture failed: $($exception.Message)"
+        $payload.error_type = "CaptureError"
+    }
+
     $payload | ConvertTo-Json -Depth 6
     exit 0
 }

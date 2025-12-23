@@ -832,9 +832,12 @@ def run_lldp_powershell_capture(
     elif has_neighbors:
         meta["status"] = "LLDP: OK (Detected)"
     elif json_valid:
-        meta["status"] = "LLDP: No neighbors"
-        meta["error_type"] = meta.get("error_type") or "NoNeighbors"
-        meta["error"] = structured_error_message or meta.get("error") or "No LLDP neighbors detected"
+        if structured_error_type:
+            meta["status"] = "LLDP: Error"
+        else:
+            meta["status"] = "LLDP: No neighbors"
+            meta["error_type"] = meta.get("error_type") or "NoNeighbors"
+            meta["error"] = structured_error_message or meta.get("error") or "No LLDP neighbors detected"
     else:
         meta["status"] = meta.get("status") or "LLDP: Error (Invalid JSON)"
 
