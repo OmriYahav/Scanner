@@ -229,7 +229,26 @@ def build_encoded_ps(script: str) -> str:
     return base64.b64encode(encoded).decode("ascii")
 
 
+def check_psdiscovery_module() -> bool:
+    """Check if PSDiscoveryProtocol module is available."""
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command", "Get-Module -ListAvailable PSDiscoveryProtocol"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return "PSDiscoveryProtocol" in (result.stdout or "")
+    except Exception:
+        return False
+
+
 def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple[List[dict], dict]:
+    import logging
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting LLDP capture for interface: {interface_name_or_alias}")
     start_ts = time.monotonic()
     neighbors: List[dict] = []
     meta: Dict[str, Any] = {
@@ -242,6 +261,7 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "error": None,
         "parse_error": None,
         "source": "PowerShell",
+        "ps_module_available": None,
     }
 
     def finalize():
@@ -271,11 +291,20 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             f"-or $_.InterfaceAlias -eq '{safe_iface}' }}"
         )
 
+    meta["ps_module_available"] = check_psdiscovery_module()
+    if meta["ps_module_available"] is False:
+        logger.warning("PSDiscoveryProtocol module not available")
+
     script_lines = [
         "$ProgressPreference='SilentlyContinue'",
-        "$ErrorActionPreference='Stop'",
-        "Import-Module PSDiscoveryProtocol -ErrorAction Stop",
-        "$data = Invoke-DiscoveryProtocolCapture -Type LLDP -Force | Get-DiscoveryProtocolData",
+        "$ErrorActionPreference='Continue'",
+        "try {",
+        "  Import-Module PSDiscoveryProtocol -ErrorAction Stop",
+        "  $data = Invoke-DiscoveryProtocolCapture -Type LLDP -Force | Get-DiscoveryProtocolData",
+        "} catch {",
+        "  # Fallback to direct capture",
+        "  $data = Get-DiscoveryProtocolData -Type LLDP",
+        "}",
         "if ($null -eq $data) { $data = @() }",
     ]
 
@@ -286,7 +315,7 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "$data | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer, Type | ConvertTo-Json -Depth 6"
     )
 
-    encoded_script = build_encoded_ps("; ".join(script_lines))
+    script = "; ".join(script_lines)
 
     cmd = [
         ps_exe,
@@ -294,10 +323,11 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
-        "-EncodedCommand",
-        encoded_script,
+        "-Command",
+        script,
     ]
     meta["used_cmd"] = cmd
+    logger.debug(f"PowerShell command: {cmd}")
 
     startupinfo = None
     creationflags = 0
@@ -354,6 +384,9 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
     meta["stdout_preview"] = (stdout or "")[:500]
     meta["stderr_preview"] = (stderr or "")[:1000]
     meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+    logger.info(f"PowerShell exit code: {exit_code}")
+    logger.debug(f"PowerShell stdout: {(stdout or '')[:500]}")
+    logger.debug(f"PowerShell stderr: {(stderr or '')[:500]}")
 
     stderr_clean = (stderr or "").strip() or None
     if meta.get("error") or exit_code not in (0, None):
@@ -1951,6 +1984,22 @@ class Layer2InfoWorker(QThread):
 
         neighbors, ps_meta = run_lldp_powershell_capture(self.iface_name)
         lldp_neighbors_cache = list(neighbors)
+        seen_neighbors = {
+            (
+                n.get("system_name"),
+                n.get("chassis_id"),
+                n.get("port_id"),
+            )
+            for n in lldp_neighbors_cache
+        }
+        scapy_added_neighbor = False
+        resolved_iface: Optional[str] = None
+        if self.iface_name and sniff and SCAPY_AVAILABLE:
+            try:
+                resolved_iface = resolve_capture_interface(self.iface_name)
+            except Exception as e:
+                logger.error(f"Failed to resolve interface {self.iface_name}: {e}")
+                resolved_iface = self.iface_name
         lldp_status = "Detected" if lldp_neighbors_cache else "Not detected"
         if ps_meta.get("error"):
             lldp_status = "Error"
@@ -1973,6 +2022,37 @@ class Layer2InfoWorker(QThread):
             and (ps_meta.get("error") or not lldp_neighbors_cache)
         )
 
+        if allow_lldp_from_scapy and resolved_iface and sniff and SCAPY_AVAILABLE:
+            try:
+                packets = sniff(
+                    filter="ether proto 0x88cc",
+                    iface=resolved_iface,
+                    timeout=5,
+                    store=True,
+                )
+                for pkt in packets:
+                    parsed = parse_lldp_tlvs(bytes(pkt.payload))
+                    if parsed:
+                        neighbor = {
+                            "system_name": parsed.get("system_name"),
+                            "chassis_id": parsed.get("chassis_id"),
+                            "port_id": parsed.get("port_id"),
+                            "port_description": parsed.get("port_description"),
+                            "management_address": parsed.get("management_address"),
+                            "raw": parsed,
+                        }
+                        key = (
+                            neighbor.get("system_name"),
+                            neighbor.get("chassis_id"),
+                            neighbor.get("port_id"),
+                        )
+                        if key not in seen_neighbors:
+                            seen_neighbors.add(key)
+                            lldp_neighbors_cache.append(neighbor)
+                            scapy_added_neighbor = True
+            except Exception as e:
+                logger.error(f"Scapy LLDP capture failed: {e}")
+
         if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
             if not payload["vlans"].get("status"):
                 payload["vlans"]["status"] = "Unknown"
@@ -1980,9 +2060,8 @@ class Layer2InfoWorker(QThread):
             return
 
         try:
-            resolved_iface = resolve_capture_interface(self.iface_name)
             payload["meta"]["iface"] = resolved_iface or self.iface_name
-            packets = sniff(iface=resolved_iface, timeout=3, store=True, promisc=True)
+            packets = sniff(iface=resolved_iface or self.iface_name, timeout=3, store=True, promisc=True)
         except Exception as e:
             payload["lldp"]["status"] = payload["lldp"].get(
                 "status",
@@ -1997,18 +2076,9 @@ class Layer2InfoWorker(QThread):
         payload["meta"]["captured"] = len(packets)
         lldp_detected = False
         lldp_details: Dict[str, str] = {}
-        seen_neighbors = {
-            (
-                n.get("system_name"),
-                n.get("chassis_id"),
-                n.get("port_id"),
-            )
-            for n in lldp_neighbors_cache
-        }
         vlan_ids: Set[int] = set()
         lldp_frames = 0
         vlan_frame_count = 0
-        scapy_added_neighbor = False
 
         for pkt in packets:
             try:
