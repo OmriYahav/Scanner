@@ -220,7 +220,111 @@ def is_running_as_admin() -> Optional[bool]:
         return None
 
 
-LLDP_TIMEOUT_SECONDS = 8
+def ensure_admin_privileges() -> bool:
+    """Ensure the current process is elevated on Windows.
+
+    If not running as Administrator, re-launch the current executable with UAC prompt
+    and terminate the current process. Returns True only when the current process is
+    elevated (or on non-Windows platforms).
+    """
+
+    if os.name != "nt":
+        return True
+
+    logger.info("Checking Administrator privileges at startup")
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            logger.info("Process already running with Administrator privileges")
+            return True
+    except Exception:
+        logger.exception("Failed to verify Administrator privileges")
+        return False
+
+    # Relaunch with elevation
+    executable = sys.executable
+    params_list = []
+    if getattr(sys, "frozen", False):
+        params_list = sys.argv[1:]
+    else:
+        script_path = os.path.abspath(sys.argv[0])
+        params_list = [script_path, *sys.argv[1:]]
+    params = subprocess.list2cmdline(params_list)
+
+    logger.info("Requesting elevation for %s with params: %s", executable, params)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            executable,
+            params,
+            None,
+            1,
+        )
+    except Exception:
+        logger.exception("Failed to trigger UAC elevation")
+        return False
+
+    if rc <= 32:
+        logger.error("Elevation request was rejected or failed (code=%s)", rc)
+        return False
+
+    logger.info("Elevation request dispatched successfully; exiting current process")
+    sys.exit(0)
+
+
+def is_wifi_interface(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    lower = name.lower()
+    return any(tag in lower for tag in ["wi-fi", "wifi", "wlan", "wireless"])
+
+
+def resolve_active_ethernet_interface(preferred: Optional[str]) -> Tuple[Optional[str], str]:
+    """Return the active Ethernet interface name and reason message."""
+
+    addrs = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+    reason = ""
+
+    def has_ipv4(name: str) -> bool:
+        for addr in addrs.get(name, []):
+            family_name = getattr(addr.family, "name", addr.family)
+            if family_name == "AF_INET" or addr.family == socket.AF_INET:
+                return bool(addr.address)
+        return False
+
+    if preferred and preferred in stats and stats[preferred].isup:
+        if not is_wifi_interface(preferred):
+            return preferred, "Using user-selected interface"
+        return preferred, "Using explicitly requested Wi-Fi interface"
+
+    ethernet_candidates: List[str] = []
+    for ifname, st in stats.items():
+        if not st.isup:
+            continue
+        if is_wifi_interface(ifname):
+            continue
+        if not has_ipv4(ifname):
+            continue
+        ethernet_candidates.append(ifname)
+
+    if ethernet_candidates:
+        chosen = sorted(ethernet_candidates)[0]
+        return chosen, "Selected active Ethernet interface"
+
+    if preferred:
+        reason = "Falling back to requested interface (may be Wi-Fi)"
+        return preferred, reason
+
+    reason = "No active Ethernet interface found"
+    return None, reason
+
+
+LLDP_CAPTURE_SECONDS = 30
+LLDP_PROCESS_GRACE_SECONDS = 5
+LLDP_TIMEOUT_SECONDS = LLDP_CAPTURE_SECONDS + LLDP_PROCESS_GRACE_SECONDS
+LLDP_MAX_ATTEMPTS = 3
+LLDP_RETRY_DELAY_SECONDS = 2.5
 
 
 def build_encoded_ps(script: str) -> str:
@@ -303,7 +407,7 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
     import logging
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Starting LLDP capture for interface: {interface_name_or_alias}")
+    logger.info("Starting LLDP capture for interface: %s", interface_name_or_alias)
     start_ts = time.monotonic()
     neighbors: List[dict] = []
     meta: Dict[str, Any] = {
@@ -319,6 +423,8 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "ps_module_available": None,
         "ps_module_autoinstall_attempted": False,
         "ps_module_autoinstall_success": False,
+        "attempts": [],
+        "admin": is_running_as_admin(),
     }
 
     def finalize():
@@ -334,19 +440,15 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
         return finalize()
 
+    if meta["admin"] is not True:
+        meta["error"] = "Administrator privileges required"
+        return finalize()
+
     ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
     if not ps_exe:
         meta["error"] = "PowerShell not found"
         meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
         return finalize()
-
-    iface_filter = ""
-    if interface_name_or_alias:
-        safe_iface = str(interface_name_or_alias).replace("'", "''")
-        iface_filter = (
-            f"$data = $data | Where-Object {{ $_.Interface -eq '{safe_iface}' "
-            f"-or $_.InterfaceAlias -eq '{safe_iface}' }}"
-        )
 
     meta["ps_module_available"] = check_psdiscovery_module()
     if meta["ps_module_available"] is False:
@@ -359,111 +461,6 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         if not meta["ps_module_available"]:
             meta["error"] = "PSDiscoveryProtocol module not available"
             return finalize()
-
-    script_lines = [
-        "$ProgressPreference='SilentlyContinue'",
-        "$ErrorActionPreference='Continue'",
-        "try {",
-        "  Import-Module PSDiscoveryProtocol -ErrorAction Stop",
-        "  $data = Invoke-DiscoveryProtocolCapture -Type LLDP -Force | Get-DiscoveryProtocolData",
-        "} catch {",
-        "  # Fallback to direct capture",
-        "  $data = Get-DiscoveryProtocolData -Type LLDP",
-        "}",
-        "if ($null -eq $data) { $data = @() }",
-        iface_filter,
-        "$data | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer, Type | ConvertTo-Json -Depth 6",
-    ]
-
-    script = "\n".join(line for line in script_lines if line)
-
-    cmd = [
-        ps_exe,
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        script,
-    ]
-    meta["used_cmd"] = cmd
-    logger.debug(f"PowerShell command: {cmd}")
-
-    startupinfo = None
-    creationflags = 0
-    if os.name == "nt":  # pragma: no cover - Windows only
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        try:
-            creationflags |= subprocess.CREATE_NO_WINDOW
-        except AttributeError:
-            creationflags = 0
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            startupinfo=startupinfo,
-            creationflags=creationflags,
-        )
-    except Exception as e:
-        meta["error"] = str(e)
-        meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
-        return finalize()
-
-    try:
-        stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        meta["timeout"] = True
-        meta["error"] = f"LLDP PowerShell capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        if os.name == "nt":  # pragma: no cover - Windows only
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                )
-            except Exception:
-                pass
-        try:
-            stdout, stderr = proc.communicate(timeout=1)
-        except Exception:
-            stdout, stderr = "", ""
-    except Exception as e:
-        meta["error"] = str(e)
-        stdout, stderr = "", ""
-
-    exit_code = proc.returncode if proc.returncode is not None else -1
-    meta["exit_code"] = exit_code
-    meta["stdout_preview"] = (stdout or "")[:500]
-    meta["stderr_preview"] = (stderr or "")[:1000]
-    meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
-    logger.info(f"PowerShell exit code: {exit_code}")
-    logger.debug(f"PowerShell stdout: {(stdout or '')[:500]}")
-    logger.debug(f"PowerShell stderr: {(stderr or '')[:500]}")
-
-    stderr_clean = (stderr or "").strip() or None
-    if meta.get("error") or exit_code not in (0, None):
-        meta["error"] = meta.get("error") or stderr_clean or "PowerShell execution failed"
-        return finalize()
-
-    output = (stdout or "").strip()
-    if not output:
-        meta["error"] = "PowerShell returned no LLDP data"
-        return finalize()
-
-    try:
-        data = json.loads(output)
-    except Exception as e:
-        meta["parse_error"] = str(e)
-        meta["error"] = f"Failed to parse PowerShell output: {e}"
-        return finalize()
 
     def ps_value_to_bytes(value: Any) -> bytes:
         if value is None:
@@ -528,21 +525,210 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             return str(value[0]) if value else None
         return str(value)
 
-    entries = data if isinstance(data, list) else [data]
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
+    def parse_neighbors(raw_output: str) -> List[dict]:
+        parsed_neighbors: List[dict] = []
+        data = json.loads(raw_output)
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
 
-        neighbor = {
-            "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
-            "chassis_id": format_chassis(entry) or norm(entry.get("ChassisId")),
-            "port_id": norm(entry.get("Port") or entry.get("PortId")),
-            "port_description": norm(entry.get("PortDescription")),
-            "management_address": format_management_address(entry) or norm(entry.get("ManagementAddress") or entry.get("IPAddress")),
-            "raw": entry,
+            neighbor = {
+                "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
+                "chassis_id": format_chassis(entry) or norm(entry.get("ChassisId")),
+                "port_id": norm(entry.get("Port") or entry.get("PortId")),
+                "port_description": norm(entry.get("PortDescription")),
+                "management_address": format_management_address(entry)
+                or norm(entry.get("ManagementAddress") or entry.get("IPAddress")),
+                "vlans": entry.get("Vlans") or entry.get("VlanIds") or [],
+                "raw": entry,
+            }
+            parsed_neighbors.append(neighbor)
+        return parsed_neighbors
+
+    def run_single_attempt(attempt_idx: int) -> Tuple[List[dict], Dict[str, Any]]:
+        attempt_meta: Dict[str, Any] = {
+            "attempt": attempt_idx,
+            "interface_requested": interface_name_or_alias,
+            "interface_resolved": None,
+            "exit_code": None,
+            "stdout": None,
+            "stderr": None,
+            "error": None,
+            "timeout": False,
         }
-        neighbors.append(neighbor)
 
+        resolved_iface, iface_reason = resolve_active_ethernet_interface(interface_name_or_alias)
+        attempt_meta["interface_resolved"] = resolved_iface
+        attempt_meta["interface_reason"] = iface_reason
+        logger.info(
+            "LLDP attempt %s using interface '%s' (%s)",
+            attempt_idx,
+            resolved_iface,
+            iface_reason,
+        )
+        if not resolved_iface:
+            attempt_meta["error"] = iface_reason or "No usable interface"
+            return [], attempt_meta
+
+        safe_iface = str(resolved_iface).replace("'", "''")
+        script = f"""
+$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+Import-Module PSDiscoveryProtocol -ErrorAction Stop
+$ifaceName = '{safe_iface}'
+$duration = {LLDP_CAPTURE_SECONDS}
+$capture = Start-DiscoveryProtocolCapture -Type LLDP -Interface $ifaceName -DurationSeconds $duration -Force
+try {{
+    $null = $capture | Wait-DiscoveryProtocolCapture -TimeoutSeconds ($duration + {LLDP_PROCESS_GRACE_SECONDS})
+    $data = $capture | Get-DiscoveryProtocolData -ErrorAction Stop
+}} finally {{
+    try {{ $capture | Stop-DiscoveryProtocolCapture -ErrorAction SilentlyContinue | Out-Null }} catch {{ }}
+}}
+if ($null -eq $data) {{ $data = @() }}
+$data | ForEach-Object {{
+    [pscustomobject]@{{
+        ChassisId = $_.ChassisId
+        PortId = $_.PortId
+        SystemName = $_.SystemName
+        PortDescription = $_.PortDescription
+        ManagementAddress = $_.ManagementAddress
+        Vlans = $_.Vlans
+        VlanIds = $_.VlanIds
+        Interface = $_.Interface
+        InterfaceAlias = $_.InterfaceAlias
+    }}
+}} | ConvertTo-Json -Depth 8
+"""
+
+        cmd = [
+            ps_exe,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ]
+        attempt_meta["cmd"] = cmd
+        meta["used_cmd"] = cmd
+        logger.info("PowerShell command line: %s", cmd)
+
+        startupinfo = None
+        creationflags = 0
+        if os.name == "nt":  # pragma: no cover - Windows only
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            try:
+                creationflags |= subprocess.CREATE_NO_WINDOW
+            except AttributeError:
+                creationflags = 0
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+        except Exception as e:
+            attempt_meta["error"] = str(e)
+            return [], attempt_meta
+
+        logger.info("LLDP capture started (attempt %s)", attempt_idx)
+        capture_start = time.monotonic()
+        try:
+            stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            attempt_meta["timeout"] = True
+            attempt_meta["error"] = f"LLDP capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            if os.name == "nt":  # pragma: no cover - Windows only
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                    )
+                except Exception:
+                    pass
+            try:
+                stdout, stderr = proc.communicate(timeout=1)
+            except Exception:
+                stdout, stderr = "", ""
+        except Exception as e:
+            attempt_meta["error"] = str(e)
+            stdout, stderr = "", ""
+
+        attempt_meta["duration_ms"] = int((time.monotonic() - capture_start) * 1000)
+        attempt_meta["exit_code"] = proc.returncode if proc.returncode is not None else -1
+        attempt_meta["stdout"] = (stdout or "")[:1000]
+        attempt_meta["stderr"] = (stderr or "")[:1000]
+        logger.info(
+            "LLDP attempt %s completed (exit=%s, duration_ms=%s)",
+            attempt_idx,
+            attempt_meta["exit_code"],
+            attempt_meta["duration_ms"],
+        )
+        if attempt_meta["stderr"]:
+            logger.warning("LLDP stderr (attempt %s): %s", attempt_idx, attempt_meta["stderr"])
+
+        if attempt_meta.get("error"):
+            return [], attempt_meta
+
+        if attempt_meta["exit_code"] not in (0, None):
+            attempt_meta["error"] = attempt_meta.get("stderr") or "PowerShell execution failed"
+            return [], attempt_meta
+
+        output = (stdout or "").strip()
+        if not output:
+            attempt_meta["error"] = "PowerShell returned no LLDP data"
+            return [], attempt_meta
+
+        try:
+            parsed_neighbors = parse_neighbors(output)
+            return parsed_neighbors, attempt_meta
+        except Exception as e:
+            attempt_meta["error"] = f"Failed to parse PowerShell output: {e}"
+            return [], attempt_meta
+
+    for attempt in range(1, LLDP_MAX_ATTEMPTS + 1):
+        attempt_neighbors, attempt_meta = run_single_attempt(attempt)
+        meta["attempts"].append(attempt_meta)
+        if attempt_neighbors:
+            neighbors = attempt_neighbors
+            logger.info("LLDP neighbors discovered on attempt %s", attempt)
+            break
+        logger.warning(
+            "LLDP attempt %s failed (error=%s, exit=%s)",
+            attempt,
+            attempt_meta.get("error"),
+            attempt_meta.get("exit_code"),
+        )
+        if attempt_meta.get("timeout"):
+            meta["timeout"] = True
+            meta["error"] = attempt_meta.get("error")
+            break
+        if attempt < LLDP_MAX_ATTEMPTS:
+            time.sleep(LLDP_RETRY_DELAY_SECONDS)
+            interface_name_or_alias = resolve_active_ethernet_interface(interface_name_or_alias)[0]
+
+    if not neighbors and not meta.get("error"):
+        # Set a clear reason for failure
+        last_attempt_error = meta["attempts"][-1].get("error") if meta.get("attempts") else None
+        meta["error"] = last_attempt_error or "No LLDP frames detected on the network"
+
+    if meta.get("attempts"):
+        last_attempt = meta["attempts"][-1]
+        meta["exit_code"] = last_attempt.get("exit_code", -1)
+        meta["stdout_preview"] = (last_attempt.get("stdout") or "")[:500]
+        meta["stderr_preview"] = (last_attempt.get("stderr") or "")[:1000]
+
+    meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
     return finalize()
 
 
@@ -2217,8 +2403,13 @@ class Layer2InfoWorker(QThread):
                 logger.error(f"Failed to resolve interface {self.iface_name}: {e}")
                 resolved_iface = self.iface_name
         lldp_status = "Detected" if lldp_neighbors_cache else "Not detected"
-        if ps_meta.get("error"):
-            lldp_status = "Error"
+        if ps_meta.get("timeout"):
+            lldp_status = "Timeout"
+        elif ps_meta.get("error"):
+            if "administrator" in str(ps_meta.get("error")).lower():
+                lldp_status = "Unavailable (Administrator required)"
+            else:
+                lldp_status = "Error"
         payload["lldp"]["neighbors"] = lldp_neighbors_cache
         payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
         payload["lldp"]["status"] = lldp_status
@@ -2457,6 +2648,10 @@ class MainWindow(QMainWindow):
         self.presence_timer.setInterval(1000)
         self.presence_timer.timeout.connect(self._tick_presence)
         self.presence_timer.start()
+        self.lldp_countdown_timer = QTimer(self)
+        self.lldp_countdown_timer.setInterval(1000)
+        self.lldp_countdown_timer.timeout.connect(self._update_lldp_countdown_label)
+        self._lldp_deadline_ts: Optional[float] = None
         self.live_feed_lines: List[str] = []
         self.continuous_worker: Optional['BackgroundDiscoveryWorker'] = None
         self._last_presence_state: Dict[str, str] = {}
@@ -3991,6 +4186,7 @@ QHeaderView::section {
 
         self.l2_check_running = True
         self._set_l2_refreshing_state("Running...")
+        self._start_lldp_countdown()
         self.l2_worker = Layer2InfoWorker(iface_name, self.is_admin)
         self.l2_worker.result.connect(self.apply_l2_result)
         self.l2_worker.finished.connect(self.on_l2_finished)
@@ -4034,6 +4230,7 @@ QHeaderView::section {
         set_or_dash(self.lldp_mgmt_lbl, selected.get("management_address"))
 
     def _update_l2_ui(self, payload: dict):
+        self._stop_lldp_countdown()
         lldp = payload.get("lldp", {}) if payload else {}
         vlans = payload.get("vlans", {}) if payload else {}
         meta = payload.get("meta", {}) if payload else {}
@@ -4044,9 +4241,17 @@ QHeaderView::section {
         overall_status = "OK"
         if status_lower.startswith("unavailable"):
             overall_status = "Unavailable"
+        elif status_lower == "timeout":
+            overall_status = "Timeout"
         elif error_text and not neighbors:
             overall_status = "Error"
-        color_map = {"ok": "green", "unavailable": "yellow", "error": "red", "unknown": "gray"}
+        color_map = {
+            "ok": "green",
+            "unavailable": "yellow",
+            "error": "red",
+            "unknown": "gray",
+            "timeout": "red",
+        }
         badge_state = color_map.get(overall_status.lower(), "gray")
         status_label = f"LLDP: {overall_status}"
         if overall_status == "OK" and lldp_status:
@@ -4120,6 +4325,7 @@ QHeaderView::section {
 
     def on_l2_finished(self):
         self.l2_check_running = False
+        self._stop_lldp_countdown()
 
     @Slot(int)
     def on_lldp_neighbor_selected(self, index: int):
@@ -4310,6 +4516,23 @@ QHeaderView::section {
         self.lldp_source_hint.setText("LLDP source: -")
         self.lldp_neighbors_hint.setText("LLDP neighbors count: 0")
         self.lldp_error_hint.setText("LLDP error: None")
+
+    def _start_lldp_countdown(self, seconds: int = LLDP_CAPTURE_SECONDS):
+        self._lldp_deadline_ts = time.time() + max(1, seconds)
+        self._update_lldp_countdown_label()
+        self.lldp_countdown_timer.start()
+
+    def _stop_lldp_countdown(self):
+        self._lldp_deadline_ts = None
+        self.lldp_countdown_timer.stop()
+
+    def _update_lldp_countdown_label(self):
+        if not self._lldp_deadline_ts:
+            return
+        remaining = int(max(0, self._lldp_deadline_ts - time.time()))
+        set_badge(self.lldp_status_lbl, "yellow", f"LLDP: Capturing ({remaining}s left)")
+        if remaining <= 0:
+            self._stop_lldp_countdown()
 
     def _update_network_updated_label(self):
         if not getattr(self, "network_updated_lbl", None):
@@ -4943,6 +5166,9 @@ QHeaderView::section {
 
 def main():
     setup_logging()
+    if not ensure_admin_privileges():
+        logger.error("Administrator privileges are required to run this application")
+        sys.exit(1)
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
