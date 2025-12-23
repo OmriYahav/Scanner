@@ -445,7 +445,10 @@ def check_psdiscovery_module() -> bool:
         return False
 
 
-def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple[List[dict], dict]:
+def run_lldp_powershell_capture(
+    interface_name_or_alias: Optional[str],
+    debug_log: bool = False,
+) -> Tuple[List[dict], dict]:
     import logging
 
     logger = logging.getLogger(__name__)
@@ -568,18 +571,91 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
 
     def parse_neighbors(data: Any) -> List[dict]:
         parsed_neighbors: List[dict] = []
+        if data is None:
+            return parsed_neighbors
+
         entries = data if isinstance(data, list) else [data]
+
+        def pick_entry_value(entry: dict, keys: List[str]) -> Optional[Any]:
+            for key in keys:
+                if key not in entry:
+                    continue
+                val = entry.get(key)
+                if val is None:
+                    continue
+                if isinstance(val, (list, tuple)):
+                    if not val:
+                        continue
+                    val = val[0]
+                if isinstance(val, (str, bytes)):
+                    val = val.decode(errors="ignore") if isinstance(val, bytes) else val.strip()
+                    if not val:
+                        continue
+                return val
+            return None
+
+        def stringify(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return str(value)
+            if isinstance(value, bytes):
+                return value.decode(errors="ignore")
+            if isinstance(value, (list, tuple, set)):
+                return ", ".join(str(v) for v in value)
+            try:
+                as_str = str(value)
+                return as_str if as_str else None
+            except Exception:
+                return None
+
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
 
+            mgmt_address = pick_entry_value(entry, ["management_address"])
+            if not mgmt_address:
+                ips = entry.get("IPAddresses")
+                if isinstance(ips, list) and ips:
+                    mgmt_address = ips[0]
+            if not mgmt_address:
+                mgmt_address = pick_entry_value(
+                    entry,
+                    ["ManagementAddress", "IPAddress", "ManagementAddresses"],
+                )
+
             neighbor = {
-                "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
-                "chassis_id": format_chassis(entry) or norm(entry.get("ChassisId")),
-                "port_id": norm(entry.get("Port") or entry.get("PortId")),
-                "port_description": norm(entry.get("PortDescription")),
-                "management_address": format_management_address(entry)
-                or norm(entry.get("ManagementAddress") or entry.get("IPAddress")),
+                "system_name": stringify(
+                    pick_entry_value(
+                        entry,
+                        [
+                            "system_name",
+                            "ComputerName",
+                            "SystemName",
+                            "SystemDescription",
+                        ],
+                    )
+                ),
+                "system_description": stringify(
+                    pick_entry_value(entry, ["system_description", "SystemDescription"])
+                ),
+                "chassis_id": format_chassis(entry)
+                or stringify(pick_entry_value(entry, ["chassis_id", "ChassisId"])),
+                "port_id": stringify(
+                    pick_entry_value(entry, ["port_id", "Port", "PortId"])
+                ),
+                "port_description": stringify(
+                    pick_entry_value(entry, ["port_description", "PortDescription"])
+                ),
+                "management_address": stringify(
+                    pick_entry_value(
+                        {"management_address": mgmt_address} if mgmt_address else entry,
+                        ["management_address"],
+                    )
+                ),
+                "ttl": stringify(pick_entry_value(entry, ["ttl", "TimeToLive"])),
+                "connection": stringify(pick_entry_value(entry, ["connection", "Connection"])),
+                "interface": stringify(pick_entry_value(entry, ["interface", "Interface"])),
                 "vlans": entry.get("Vlans") or entry.get("VlanIds") or [],
                 "raw": entry,
             }
@@ -660,6 +736,15 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         return finalize()
 
     output = (stdout or "").strip()
+
+    if debug_log:
+        try:
+            log_path = Path("logs") / "lldp_raw.json"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(output, encoding="utf-8")
+            meta["debug_log_path"] = str(log_path)
+        except Exception:
+            logger.debug("Failed to write LLDP debug output", exc_info=True)
     if not output:
         meta["error"] = "PowerShell returned no LLDP data"
         meta["error_type"] = "Timeout"
@@ -2290,10 +2375,11 @@ class DiagnosticsWorker(QThread):
 class Layer2InfoWorker(QThread):
     result = Signal(dict)
 
-    def __init__(self, iface_name: Optional[str], is_admin: Optional[bool]):
+    def __init__(self, iface_name: Optional[str], is_admin: Optional[bool], debug_log: bool = False):
         super().__init__()
         self.iface_name = iface_name
         self.is_admin = is_admin
+        self.debug_log = debug_log
 
     def _normalize_lldp_neighbor(self, entry: dict) -> dict:
         def first_val(keys: List[str]) -> Optional[str]:
@@ -2327,7 +2413,9 @@ class Layer2InfoWorker(QThread):
             if neighbor.get("system_name"):
                 return neighbor
             raw = neighbor.get("raw") or {}
-            if raw.get("SystemDescription") or raw.get("SystemName"):
+            if raw.get("SystemDescription") or raw.get("system_description"):
+                return neighbor
+            if raw.get("SystemName") or raw.get("system_name") or raw.get("ComputerName"):
                 return neighbor
         return neighbors[0]
 
@@ -2363,7 +2451,9 @@ class Layer2InfoWorker(QThread):
             self.result.emit(payload)
             return
 
-        neighbors, ps_meta = run_lldp_powershell_capture(self.iface_name)
+        neighbors, ps_meta = run_lldp_powershell_capture(
+            self.iface_name, debug_log=self.debug_log
+        )
         lldp_neighbors_cache = list(neighbors)
         seen_neighbors = {
             (
@@ -2989,9 +3079,15 @@ class MainWindow(QMainWindow):
         debug_layout.addWidget(self.lldp_error_hint)
         self.l2_debug_container.setVisible(False)
 
+        self.lldp_debug_chk = QCheckBox("Save raw LLDP JSON")
+        self.lldp_debug_chk.setToolTip(
+            "When enabled, raw PowerShell LLDP JSON is saved to logs/lldp_raw.json"
+        )
+
         toggle_row = QHBoxLayout()
         toggle_row.setContentsMargins(0, 0, 0, 0)
         toggle_row.addStretch(1)
+        toggle_row.addWidget(self.lldp_debug_chk)
         self.l2_toggle_btn = QPushButton("Show capture details")
         self.l2_toggle_btn.setObjectName("linkButton")
         self.l2_toggle_btn.setCursor(Qt.PointingHandCursor)
@@ -4181,7 +4277,10 @@ QHeaderView::section {
         self.l2_check_running = True
         self._set_l2_refreshing_state("Running...")
         self._start_lldp_countdown()
-        self.l2_worker = Layer2InfoWorker(iface_name, self.is_admin)
+        debug_enabled = getattr(self, "lldp_debug_chk", None)
+        self.l2_worker = Layer2InfoWorker(
+            iface_name, self.is_admin, bool(debug_enabled and debug_enabled.isChecked())
+        )
         self.l2_worker.result.connect(self.apply_l2_result)
         self.l2_worker.finished.connect(self.on_l2_finished)
         self.l2_worker.start()
