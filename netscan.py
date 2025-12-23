@@ -371,16 +371,11 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "  $data = Get-DiscoveryProtocolData -Type LLDP",
         "}",
         "if ($null -eq $data) { $data = @() }",
+        iface_filter,
+        "$data | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer, Type | ConvertTo-Json -Depth 6",
     ]
 
-    if iface_filter:
-        script_lines.append(iface_filter)
-
-    script_lines.append(
-        "$data | Select Port, SystemName, SystemDescription, ChassisId, PortId, TimeToLive, ManagementAddress, IPAddress, Interface, Computer, Type | ConvertTo-Json -Depth 6"
-    )
-
-    script = "; ".join(script_lines)
+    script = "\n".join(line for line in script_lines if line)
 
     cmd = [
         ps_exe,
@@ -460,6 +455,7 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
 
     output = (stdout or "").strip()
     if not output:
+        meta["error"] = "PowerShell returned no LLDP data"
         return finalize()
 
     try:
@@ -469,28 +465,80 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         meta["error"] = f"Failed to parse PowerShell output: {e}"
         return finalize()
 
+    def ps_value_to_bytes(value: Any) -> bytes:
+        if value is None:
+            return b""
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, list) and all(isinstance(v, int) for v in value):
+            try:
+                return bytes([v & 0xFF for v in value])
+            except Exception:
+                return b""
+        if isinstance(value, str):
+            return value.encode(errors="ignore")
+        try:
+            return bytes(value)
+        except Exception:
+            return str(value).encode(errors="ignore")
+
+    def format_chassis(entry: dict) -> Optional[str]:
+        raw = ps_value_to_bytes(entry.get("ChassisId"))
+        subtype_val = entry.get("ChassisIdSubtype")
+        try:
+            subtype = int(subtype_val) if subtype_val is not None else None
+        except Exception:
+            subtype = None
+
+        raw_bytes = raw
+        if subtype is not None and (not raw or raw[0] != subtype):
+            raw_bytes = bytes([subtype]) + raw
+
+        tlv_obj = SimpleNamespace(_type=1, raw=raw_bytes, subtype=subtype)
+        return format_lldp_value(tlv_obj)
+
+    def format_management_address(entry: dict) -> Optional[str]:
+        mgmt_addr = entry.get("ManagementAddress") or entry.get("IPAddress")
+        if isinstance(mgmt_addr, list):
+            mgmt_addr = mgmt_addr[0] if mgmt_addr else None
+
+        addr_bytes = ps_value_to_bytes(mgmt_addr)
+        subtype_val = entry.get("ManagementAddressSubtype")
+        try:
+            subtype = int(subtype_val) if subtype_val is not None else None
+        except Exception:
+            subtype = None
+
+        raw_payload = addr_bytes
+        if subtype is not None:
+            raw_payload = bytes([len(addr_bytes), subtype]) + addr_bytes if addr_bytes else bytes([0, subtype])
+
+        tlv_obj = SimpleNamespace(
+            _type=8,
+            raw=raw_payload,
+            management_address_subtype=subtype,
+            management_address=addr_bytes,
+        )
+        return format_lldp_value(tlv_obj)
+
+    def norm(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return str(value[0]) if value else None
+        return str(value)
+
     entries = data if isinstance(data, list) else [data]
     for entry in entries:
         if not isinstance(entry, dict):
             continue
 
-        mgmt_addr = entry.get("ManagementAddress") or entry.get("IPAddress")
-        if isinstance(mgmt_addr, list):
-            mgmt_addr = mgmt_addr[0] if mgmt_addr else None
-
-        def norm(value: Optional[str]) -> Optional[str]:
-            if value is None:
-                return None
-            if isinstance(value, list):
-                return str(value[0]) if value else None
-            return str(value)
-
         neighbor = {
             "system_name": norm(entry.get("SystemName") or entry.get("SystemDescription")),
-            "chassis_id": norm(entry.get("ChassisId")),
+            "chassis_id": format_chassis(entry) or norm(entry.get("ChassisId")),
             "port_id": norm(entry.get("Port") or entry.get("PortId")),
             "port_description": norm(entry.get("PortDescription")),
-            "management_address": norm(mgmt_addr),
+            "management_address": format_management_address(entry) or norm(entry.get("ManagementAddress") or entry.get("IPAddress")),
             "raw": entry,
         }
         neighbors.append(neighbor)
@@ -953,6 +1001,8 @@ def format_lldp_value(tlv: Any) -> Optional[str]:
             return socket.inet_ntop(socket.AF_INET, addr_bytes[:4])
         if subtype == 2 and len(addr_bytes) >= 16:  # IPv6
             return socket.inet_ntop(socket.AF_INET6, addr_bytes[:16])
+        if subtype == 4 and addr_bytes:  # MAC Address
+            return mac_to_str(addr_bytes)
         return addr_bytes.hex(":") if addr_bytes else None
 
     # Default/fallback: try UTF-8, otherwise hex so UI does not break.
