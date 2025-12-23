@@ -450,15 +450,15 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "ps_module_available": None,
         "ps_module_autoinstall_attempted": False,
         "ps_module_autoinstall_success": False,
-        "attempts": [],
         "admin": is_running_as_admin(),
         "error_type": None,
         "failed_stage": None,
         "module_imported": None,
         "cmdlet_available": None,
+        "attempts": [],
     }
 
-    def finalize():
+    def finalize() -> Tuple[List[dict], dict]:
         if meta.get("elapsed_ms") is None:
             meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
         if meta.get("error") and "error_short" not in meta:
@@ -520,43 +520,36 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         except Exception:
             subtype = None
 
-        raw_bytes = raw
-        if subtype is not None and (not raw or raw[0] != subtype):
-            raw_bytes = bytes([subtype]) + raw
-
-        tlv_obj = SimpleNamespace(_type=1, raw=raw_bytes, subtype=subtype)
-        return format_lldp_value(tlv_obj)
+        if not raw:
+            return None
+        if subtype == 4:  # MAC Address
+            if len(raw) == 6:
+                return ":".join(f"{b:02x}" for b in raw)
+            return raw.hex(":")
+        if subtype in (5, 7):  # Interface name / Local
+            return raw.decode(errors="ignore").strip()
+        return raw.hex(":") if raw else None
 
     def format_management_address(entry: dict) -> Optional[str]:
-        mgmt_addr = entry.get("ManagementAddress") or entry.get("IPAddress")
-        if isinstance(mgmt_addr, list):
-            mgmt_addr = mgmt_addr[0] if mgmt_addr else None
+        mgmt_addr = ps_value_to_bytes(entry.get("ManagementAddress"))
+        if len(mgmt_addr) == 5:
+            try:
+                return str(ipaddress.IPv4Address(mgmt_addr[1:]))
+            except Exception:
+                return mgmt_addr.hex(":")
+        return mgmt_addr.decode(errors="ignore") if mgmt_addr else None
 
-        addr_bytes = ps_value_to_bytes(mgmt_addr)
-        subtype_val = entry.get("ManagementAddressSubtype")
-        try:
-            subtype = int(subtype_val) if subtype_val is not None else None
-        except Exception:
-            subtype = None
-
-        raw_payload = addr_bytes
-        if subtype is not None:
-            raw_payload = bytes([len(addr_bytes), subtype]) + addr_bytes if addr_bytes else bytes([0, subtype])
-
-        tlv_obj = SimpleNamespace(
-            _type=8,
-            raw=raw_payload,
-            management_address_subtype=subtype,
-            management_address=addr_bytes,
-        )
-        return format_lldp_value(tlv_obj)
-
-    def norm(value: Optional[str]) -> Optional[str]:
+    def norm(value: Any) -> Optional[str]:
         if value is None:
             return None
-        if isinstance(value, list):
-            return str(value[0]) if value else None
-        return str(value)
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(v) for v in value)
+        try:
+            return str(value)
+        except Exception:
+            return None
 
     def parse_neighbors(data: Any) -> List[dict]:
         parsed_neighbors: List[dict] = []
@@ -578,28 +571,7 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
             parsed_neighbors.append(neighbor)
         return parsed_neighbors
 
-    def run_single_attempt(attempt_idx: int) -> Tuple[List[dict], Dict[str, Any]]:
-        attempt_meta: Dict[str, Any] = {
-            "attempt": attempt_idx,
-            "interface_requested": interface_name_or_alias,
-            "interface_resolved": None,
-            "exit_code": None,
-            "stdout": None,
-            "stderr": None,
-            "error": None,
-            "timeout": False,
-            "module_imported": None,
-            "cmdlet_available": None,
-            "cmdlet_used": None,
-            "error_type": None,
-            "failed_stage": None,
-            "lldp_frames": 0,
-        }
-
-        attempt_meta["interface_reason"] = "Cmdlet auto-selects active interface"
-        logger.info("LLDP attempt %s using automatic interface selection", attempt_idx)
-
-        script = f"""
+    script = f"""
 $ProgressPreference='SilentlyContinue'
 $ErrorActionPreference='Stop'
 $duration = {LLDP_CAPTURE_SECONDS}
@@ -613,45 +585,45 @@ $result = [ordered]@{{
     failed_stage = $null
 }}
 
-try {{
+try {
     Import-Module PSDiscoveryProtocol -ErrorAction Stop
     $result.module_imported = $true
-}} catch {{
+} catch {
     $result.error_type = 'ModuleError'
     $result.error_message = "PSDiscoveryProtocol module missing: $($_.Exception.Message)"
     $result.failed_stage = 'ImportModule'
     $result | ConvertTo-Json -Depth 8
     exit 1
-}}
+}
 
-try {{
+try {
     $null = Get-Command Invoke-DiscoveryProtocolCapture -ErrorAction Stop
     $result.cmdlet_available = $true
-}} catch {{
+} catch {
     $result.error_type = 'ModuleError'
     $result.error_message = "Invoke-DiscoveryProtocolCapture unavailable: $($_.Exception.Message)"
     $result.failed_stage = 'ValidateCmdlet'
     $result | ConvertTo-Json -Depth 8
     exit 1
-}}
+}
 
-try {{
+try {
     $capture = Invoke-DiscoveryProtocolCapture -Type LLDP -Force -Duration $duration
     $data = $capture | Get-DiscoveryProtocolData
-}} catch {{
+} catch {
     $result.error_type = 'ParameterError'
     $result.error_message = $_.Exception.Message
     $result.failed_stage = 'Capture'
-}}
+}
 
-if ($result.error_type) {{
+if ($result.error_type) {
     $result | ConvertTo-Json -Depth 8
     exit 1
-}}
+}
 
-if ($null -eq $data) {{ $data = @() }}
-$result.neighbors = $data | ForEach-Object {{
-    [pscustomobject]@{{
+if ($null -eq $data) { $data = @() }
+$result.neighbors = $data | ForEach-Object {
+    [pscustomobject]@{
         ChassisId = $_.ChassisId
         PortId = $_.PortId
         SystemName = $_.SystemName
@@ -661,208 +633,123 @@ $result.neighbors = $data | ForEach-Object {{
         VlanIds = $_.VlanIds
         Interface = $_.Interface
         InterfaceAlias = $_.InterfaceAlias
-    }}
-}}
+    }
+}
 $result | ConvertTo-Json -Depth 8
 """
 
-        cmd = [
-            ps_exe,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ]
-        attempt_meta["cmd"] = cmd
-        meta["used_cmd"] = cmd
-        logger.info("PowerShell command line: %s", cmd)
+    cmd = [
+        ps_exe,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+    meta["used_cmd"] = cmd
+    logger.info("PowerShell command line: %s", cmd)
 
-        startupinfo = None
-        creationflags = 0
-        if os.name == "nt":  # pragma: no cover - Windows only
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            try:
-                creationflags |= subprocess.CREATE_NO_WINDOW
-            except AttributeError:
-                creationflags = 0
-
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":  # pragma: no cover - Windows only
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                startupinfo=startupinfo,
-                creationflags=creationflags,
-            )
-        except Exception as e:
-            attempt_meta["error"] = str(e)
-            return [], attempt_meta
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        except AttributeError:
+            creationflags = 0
 
-        logger.info("LLDP capture started (attempt %s)", attempt_idx)
-        capture_start = time.monotonic()
-        try:
-            stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            attempt_meta["timeout"] = True
-            attempt_meta["error_type"] = "Timeout"
-            attempt_meta["error"] = f"LLDP capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            if os.name == "nt":  # pragma: no cover - Windows only
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                        capture_output=True,
-                        text=True,
-                    )
-                except Exception:
-                    pass
-            try:
-                stdout, stderr = proc.communicate(timeout=1)
-            except Exception:
-                stdout, stderr = "", ""
-        except Exception as e:
-            attempt_meta["error"] = str(e)
-            stdout, stderr = "", ""
-
-        attempt_meta["duration_ms"] = int((time.monotonic() - capture_start) * 1000)
-        attempt_meta["exit_code"] = proc.returncode if proc.returncode is not None else -1
-        attempt_meta["stdout"] = (stdout or "")[:1000]
-        attempt_meta["stderr"] = (stderr or "")[:1000]
-        logger.info(
-            "LLDP attempt %s completed (exit=%s, duration_ms=%s)",
-            attempt_idx,
-            attempt_meta["exit_code"],
-            attempt_meta["duration_ms"],
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
         )
-        if attempt_meta["stderr"]:
-            logger.warning("LLDP stderr (attempt %s): %s", attempt_idx, attempt_meta["stderr"])
+    except Exception as e:
+        meta["error"] = str(e)
+        meta["error_type"] = "ParameterError"
+        return finalize()
 
-        if attempt_meta.get("error"):
-            return [], attempt_meta
-
-        output = (stdout or "").strip()
-        if not output:
-            attempt_meta["error"] = "PowerShell returned no LLDP data"
-            attempt_meta["error_type"] = "Timeout"
-            return [], attempt_meta
-
+    logger.info("LLDP capture started (blocking until completion)")
+    capture_start = time.monotonic()
+    try:
+        stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        meta["timeout"] = True
+        meta["error_type"] = "Timeout"
+        meta["error"] = f"LLDP capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
         try:
-            parsed_json = json.loads(output)
-        except Exception as e:
-            attempt_meta["error_type"] = "ParameterError"
-            attempt_meta["error"] = f"Failed to parse PowerShell output: {e}"
-            return [], attempt_meta
+            proc.terminate()
+        except Exception:
+            pass
+        stdout, stderr = "", ""
+    except Exception as e:
+        meta["error"] = str(e)
+        meta["error_type"] = "ParameterError"
+        stdout, stderr = "", ""
 
-        if isinstance(parsed_json, dict):
-            attempt_meta["module_imported"] = parsed_json.get("module_imported")
-            attempt_meta["cmdlet_available"] = parsed_json.get("cmdlet_available")
-            attempt_meta["cmdlet_used"] = parsed_json.get("cmdlet_used") or "Invoke-DiscoveryProtocolCapture"
-            attempt_meta["error_type"] = parsed_json.get("error_type")
-            attempt_meta["failed_stage"] = parsed_json.get("failed_stage")
+    meta["elapsed_ms"] = int((time.monotonic() - capture_start) * 1000)
+    meta["exit_code"] = proc.returncode if proc.returncode is not None else -1
+    meta["stdout_preview"] = (stdout or "")[:500]
+    meta["stderr_preview"] = (stderr or "")[:1000]
 
-            logger.info("PowerShell LLDP cmdlet used: %s", attempt_meta["cmdlet_used"])
-            logger.info("PSDiscoveryProtocol imported: %s", attempt_meta.get("module_imported"))
-            logger.info("Invoke-DiscoveryProtocolCapture available: %s", attempt_meta.get("cmdlet_available"))
+    if meta.get("error_type"):
+        return finalize()
 
-            if attempt_meta["error_type"]:
-                ps_error_message = parsed_json.get("error_message") or attempt_meta["error_type"]
-                attempt_meta["error"] = ps_error_message
-                logger.error(
-                    "PowerShell LLDP failed at %s: %s",
-                    attempt_meta["failed_stage"] or "Unknown stage",
-                    ps_error_message,
-                )
-                return [], attempt_meta
+    output = (stdout or "").strip()
+    if not output:
+        meta["error"] = "PowerShell returned no LLDP data"
+        meta["error_type"] = "Timeout"
+        return finalize()
 
-            neighbor_payload = parsed_json.get("neighbors")
-        else:
-            neighbor_payload = parsed_json
+    try:
+        parsed_json = json.loads(output)
+    except Exception as e:
+        meta["error_type"] = "ParameterError"
+        meta["error"] = f"Failed to parse PowerShell output: {e}"
+        return finalize()
 
-        try:
-            parsed_neighbors = parse_neighbors(neighbor_payload)
-            attempt_meta["lldp_frames"] = len(parsed_neighbors)
-            if attempt_meta["exit_code"] not in (0, None) and not attempt_meta.get("error"):
-                attempt_meta["error"] = attempt_meta.get("stderr") or "PowerShell execution failed"
-                return [], attempt_meta
-            return parsed_neighbors, attempt_meta
-        except Exception as e:
-            attempt_meta["error_type"] = attempt_meta.get("error_type") or "ParameterError"
-            attempt_meta["error"] = f"Failed to parse PowerShell output: {e}"
-            return [], attempt_meta
+    if isinstance(parsed_json, dict):
+        meta["module_imported"] = parsed_json.get("module_imported")
+        meta["cmdlet_available"] = parsed_json.get("cmdlet_available")
+        meta["cmdlet_used"] = parsed_json.get("cmdlet_used") or "Invoke-DiscoveryProtocolCapture"
+        meta["error_type"] = parsed_json.get("error_type")
+        meta["failed_stage"] = parsed_json.get("failed_stage")
 
-    for attempt in range(1, LLDP_MAX_ATTEMPTS + 1):
-        attempt_neighbors, attempt_meta = run_single_attempt(attempt)
-        meta["attempts"].append(attempt_meta)
-        meta["module_imported"] = attempt_meta.get("module_imported")
-        meta["cmdlet_available"] = attempt_meta.get("cmdlet_available")
-        meta["error_type"] = attempt_meta.get("error_type") or meta.get("error_type")
-        meta["failed_stage"] = attempt_meta.get("failed_stage") or meta.get("failed_stage")
-        if attempt_neighbors:
-            neighbors = attempt_neighbors
-            logger.info("LLDP neighbors discovered on attempt %s", attempt)
-            break
-        logger.warning(
-            "LLDP attempt %s failed (error=%s, exit=%s)",
-            attempt,
-            attempt_meta.get("error"),
-            attempt_meta.get("exit_code"),
-        )
-        if attempt_meta.get("timeout"):
-            meta["timeout"] = True
-            meta["error_type"] = attempt_meta.get("error_type") or "Timeout"
-            meta["error"] = attempt_meta.get("error")
-            break
-        allow_retry = (
-            attempt < LLDP_MAX_ATTEMPTS
-            and not attempt_neighbors
-            and attempt_meta.get("module_imported") is True
-            and attempt_meta.get("cmdlet_available") is True
-            and not attempt_meta.get("error")
-            and not attempt_meta.get("error_type")
-            and attempt_meta.get("lldp_frames", 0) == 0
-        )
+        logger.info("PowerShell LLDP cmdlet used: %s", meta.get("cmdlet_used"))
+        logger.info("PSDiscoveryProtocol imported: %s", meta.get("module_imported"))
+        logger.info("Invoke-DiscoveryProtocolCapture available: %s", meta.get("cmdlet_available"))
 
-        if not allow_retry:
-            if attempt_meta.get("error_type"):
-                meta["error"] = attempt_meta.get("error")
-            break
+        if meta["error_type"]:
+            meta["error"] = parsed_json.get("error_message") or meta["error_type"]
+            return finalize()
 
-        time.sleep(LLDP_RETRY_DELAY_SECONDS)
+        neighbor_payload = parsed_json.get("neighbors")
+    else:
+        neighbor_payload = parsed_json
 
-    if not neighbors and not meta.get("error"):
-        # Set a clear reason for failure
-        last_attempt_error = meta["attempts"][-1].get("error") if meta.get("attempts") else None
-        meta["error"] = last_attempt_error or "No LLDP frames detected on the network"
+    try:
+        parsed_neighbors = parse_neighbors(neighbor_payload)
+        meta["lldp_frames"] = len(parsed_neighbors)
+        if meta.get("exit_code") not in (0, None) and not meta.get("error"):
+            meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
+            meta["error_type"] = meta.get("error_type") or "ParameterError"
+            return finalize()
+        neighbors = parsed_neighbors
+    except Exception as e:
+        meta["error_type"] = meta.get("error_type") or "ParameterError"
+        meta["error"] = f"Failed to parse PowerShell output: {e}"
+        return finalize()
+
+    if not neighbors:
         meta["error_type"] = meta.get("error_type") or "NoNeighbors"
+        meta["error"] = meta.get("error") or "No LLDP frames detected on the network"
 
-    if meta.get("attempts"):
-        last_attempt = meta["attempts"][-1]
-        meta["exit_code"] = last_attempt.get("exit_code", -1)
-        meta["stdout_preview"] = (last_attempt.get("stdout") or "")[:500]
-        meta["stderr_preview"] = (last_attempt.get("stderr") or "")[:1000]
-        if meta.get("module_imported") is None:
-            meta["module_imported"] = last_attempt.get("module_imported")
-        if meta.get("cmdlet_available") is None:
-            meta["cmdlet_available"] = last_attempt.get("cmdlet_available")
-        meta["cmdlet_used"] = last_attempt.get("cmdlet_used") or meta.get("cmdlet_used")
-        if meta.get("error_type") is None:
-            meta["error_type"] = last_attempt.get("error_type")
-        if meta.get("failed_stage") is None:
-            meta["failed_stage"] = last_attempt.get("failed_stage")
-        meta["lldp_frames"] = last_attempt.get("lldp_frames", 0)
-
-    if neighbors:
-        meta["lldp_source"] = "PowerShell"
-
-    meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+    meta["lldp_source"] = "PowerShell" if neighbors else meta.get("lldp_source")
     return finalize()
-
 
 def is_device_online(d: Device) -> bool:
     if d.rtt_ms is not None:
@@ -5328,10 +5215,10 @@ QHeaderView::section {
 
 
 def main():
-    setup_logging()
     if not ensure_admin_privileges():
         logger.error("Administrator privileges are required to run this application")
         sys.exit(1)
+    setup_logging()
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
