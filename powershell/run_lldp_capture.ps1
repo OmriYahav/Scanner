@@ -3,6 +3,11 @@ param (
     [string]$InterfaceNameOrAlias
 )
 
+function Write-Log {
+    param([string]$Message)
+    [Console]::Error.WriteLine($Message)
+}
+
 $payload = @{
     module_imported = $false
     cmdlet_available = $false
@@ -18,6 +23,7 @@ try {
     $payload.module_imported = $true
 }
 catch {
+    Write-Log "LLDP module import failed: $($_.Exception.Message)"
     $payload.error_type = "ModuleError"
     $payload.failed_stage = "ImportModule"
     $payload.error_message = $_.Exception.Message
@@ -28,6 +34,7 @@ catch {
 $cmdlet = Get-Command Invoke-DiscoveryProtocolCapture -ErrorAction SilentlyContinue
 $payload.cmdlet_available = [bool]$cmdlet
 if (-not $payload.cmdlet_available) {
+    Write-Log "Invoke-DiscoveryProtocolCapture not available"
     $payload.error_type = "ModuleError"
     $payload.failed_stage = "GetCommand"
     $payload.error_message = "Invoke-DiscoveryProtocolCapture not available"
@@ -52,6 +59,7 @@ try {
     $data = $result | Get-DiscoveryProtocolData
 }
 catch {
+    Write-Log "LLDP capture failed due to parameter error: $($_.Exception.Message)"
     $payload.error_type = "ParameterError"
     $payload.failed_stage = "Capture"
     $payload.error_message = $_.Exception.Message
@@ -60,6 +68,7 @@ catch {
 }
 
 if (-not $data) {
+    Write-Log "LLDP capture completed with no neighbors detected"
     $payload.error_type = "NoNeighbors"
     $payload.error_message = "No LLDP neighbors detected"
     $payload.neighbors = @()
