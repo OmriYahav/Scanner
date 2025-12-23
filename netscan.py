@@ -908,12 +908,17 @@ def run_lldp_powershell_capture(
             logger.debug("Failed to write LLDP raw debug output", exc_info=True)
 
     if meta.get("exit_code") not in (0, None):
-        meta["status"] = "LLDP: Error"
-        if not meta.get("error"):
-            meta["error"] = meta.get("stderr_preview") or "PowerShell execution failed"
-        if not meta.get("error_type"):
-            meta["error_type"] = "ExecutionError"
-        return finalize()
+        meta.setdefault("error", meta.get("stderr_preview") or "PowerShell execution failed")
+        meta.setdefault("error_type", "ExecutionError")
+        meta.setdefault("status", "LLDP: Error")
+        meta["non_zero_exit_code"] = True
+
+        # Some PowerShell environments emit a non-zero exit code even when structured
+        # JSON is written to stdout. In those cases, attempt to parse the payload so the
+        # UI can still show useful error details or neighbors instead of returning early
+        # with an opaque failure.
+        if not output:
+            return finalize()
 
     if not output:
         meta["error"] = "PowerShell returned no LLDP data"
