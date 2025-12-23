@@ -229,6 +229,60 @@ def build_encoded_ps(script: str) -> str:
     return base64.b64encode(encoded).decode("ascii")
 
 
+def install_powershell_module(module_name: str, ps_exe: Optional[str] = None) -> bool:
+    """Attempt to install the given PowerShell module for the current user.
+
+    Returns True if the installation command reports success.
+    """
+
+    if os.name != "nt":
+        return False
+
+    ps_path = ps_exe or shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    if not ps_path:
+        return False
+
+    script = rf"""
+$ErrorActionPreference='Stop'
+if (-not (Get-PackageProvider -Name NuGet -ListAvailable)) {{
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+}}
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+Install-Module -Name '{module_name}' -Scope CurrentUser -Force -AllowClobber
+"OK"
+"""
+
+    try:
+        result = subprocess.run(
+            [
+                ps_path,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception:
+        logger.exception("PowerShell module installation failed for %s", module_name)
+        return False
+
+    if result.returncode != 0:
+        logger.warning(
+            "PowerShell installation of %s failed (code=%s, stderr=%s)",
+            module_name,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip()[:500],
+        )
+        return False
+
+    return "OK" in (result.stdout or "")
+
+
 def check_psdiscovery_module() -> bool:
     """Check if PSDiscoveryProtocol module is available."""
 
@@ -262,6 +316,8 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
         "parse_error": None,
         "source": "PowerShell",
         "ps_module_available": None,
+        "ps_module_autoinstall_attempted": False,
+        "ps_module_autoinstall_success": False,
     }
 
     def finalize():
@@ -294,6 +350,14 @@ def run_lldp_powershell_capture(interface_name_or_alias: Optional[str]) -> Tuple
     meta["ps_module_available"] = check_psdiscovery_module()
     if meta["ps_module_available"] is False:
         logger.warning("PSDiscoveryProtocol module not available")
+        if is_running_as_admin():
+            meta["ps_module_autoinstall_attempted"] = True
+            meta["ps_module_autoinstall_success"] = install_powershell_module("PSDiscoveryProtocol", ps_exe=ps_exe)
+            if meta["ps_module_autoinstall_success"]:
+                meta["ps_module_available"] = True
+        if not meta["ps_module_available"]:
+            meta["error"] = "PSDiscoveryProtocol module not available"
+            return finalize()
 
     script_lines = [
         "$ProgressPreference='SilentlyContinue'",
