@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Optional, Set, List, Dict, Tuple, Any
 
 import psutil
@@ -877,6 +878,79 @@ def fetch_upnp_friendly_name(location_url: str, timeout_s: float = 1.5) -> Optio
 # -----------------------------
 # Passive Layer 2 / AV helpers
 # -----------------------------
+def parse_lldp_tlv(tlv: Any) -> Optional[str]:
+    """Return a human-readable value for a Scapy LLDP TLV object.
+
+    The function is resilient to binary data by formatting MAC/IP addresses as
+    strings and falling back to hex when UTF-8 decoding fails.
+    """
+
+    def mac_to_str(data: bytes) -> str:
+        return ":".join(f"{b:02X}" for b in data)
+
+    def safe_decode(data: bytes) -> str:
+        if data is None:
+            return ""
+        try:
+            return data.decode("utf-8")
+        except Exception:
+            return data.hex(":")
+
+    tlv_type = getattr(tlv, "_type", getattr(tlv, "type", None))
+    raw_val: bytes = b""
+
+    if hasattr(tlv, "id"):
+        val = getattr(tlv, "id")
+        raw_val = val if isinstance(val, (bytes, bytearray)) else bytes(val)
+    elif hasattr(tlv, "value"):
+        val = getattr(tlv, "value")
+        raw_val = val if isinstance(val, (bytes, bytearray)) else bytes(val)
+    elif hasattr(tlv, "raw"):
+        val = getattr(tlv, "raw")
+        raw_val = val if isinstance(val, (bytes, bytearray)) else bytes(val)
+
+    if tlv_type == 1:  # Chassis ID
+        subtype = getattr(tlv, "subtype", raw_val[0] if raw_val else None)
+        chassis_id = raw_val[1:] if raw_val else b""
+        if subtype == 4:  # MAC address
+            return mac_to_str(chassis_id)
+        return safe_decode(chassis_id)
+
+    if tlv_type == 2:  # Port ID
+        subtype = getattr(tlv, "subtype", raw_val[0] if raw_val else None)
+        port_id = raw_val[1:] if raw_val else b""
+        if subtype == 3:  # MAC address
+            return mac_to_str(port_id)
+        if subtype in (5, 7):  # Interface name
+            try:
+                return port_id.decode("utf-8")
+            except Exception:
+                return port_id.hex(":")
+        return safe_decode(port_id)
+
+    if tlv_type == 8:  # Management address
+        subtype = getattr(tlv, "management_address_subtype", None)
+        addr_bytes = getattr(tlv, "management_address", raw_val) or b""
+        if isinstance(addr_bytes, str):
+            addr_bytes = addr_bytes.encode()
+
+        if not subtype and raw_val:
+            mgmt_len = raw_val[0]
+            subtype = raw_val[1] if len(raw_val) > 1 else None
+            addr_bytes = raw_val[2 : 1 + mgmt_len]
+
+        if subtype == 1 and len(addr_bytes) >= 4:  # IPv4
+            return socket.inet_ntop(socket.AF_INET, bytes(addr_bytes[:4]))
+        if subtype == 2 and len(addr_bytes) >= 16:  # IPv6
+            return socket.inet_ntop(socket.AF_INET6, bytes(addr_bytes[:16]))
+        return addr_bytes.hex(":") if addr_bytes else None
+
+    if tlv_type in (4, 5):  # Port description / System name
+        return safe_decode(raw_val)
+
+    return safe_decode(raw_val) if raw_val else None
+
+
 def parse_lldp_tlvs(raw: bytes) -> Dict[str, str]:
     info: Dict[str, str] = {}
     idx = 0
@@ -891,16 +965,30 @@ def parse_lldp_tlvs(raw: bytes) -> Dict[str, str]:
         idx += l
         if t == 0:  # End of LLDPDU
             break
-        if t == 1 and l >= 2:  # Chassis ID
-            info["chassis_id"] = val[1:].decode("utf-8", errors="ignore")
-        elif t == 2 and l >= 2:  # Port ID
-            info["port_id"] = val[1:].decode("utf-8", errors="ignore")
-        elif t == 4:  # Port description
-            info["port_description"] = val.decode("utf-8", errors="ignore")
-        elif t == 5:  # System name
-            info["system_name"] = val.decode("utf-8", errors="ignore")
-        elif t == 8 and l >= 1:  # Management address
-            info["management_address"] = val[1:].decode("utf-8", errors="ignore")
+
+        tlv_obj: Any = SimpleNamespace(_type=t, raw=val)
+        if t in (1, 2) and l >= 1:
+            tlv_obj.subtype = val[0]
+            tlv_obj.id = val[1:]
+        elif t == 8 and l >= 1:
+            mgmt_len = val[0]
+            tlv_obj.management_address_subtype = val[1] if len(val) > 1 else None
+            tlv_obj.management_address = val[2 : 1 + mgmt_len]
+        elif t in (4, 5):
+            tlv_obj.value = val
+
+        parsed_val = parse_lldp_tlv(tlv_obj)
+        if parsed_val:
+            if t == 1:  # Chassis ID
+                info["chassis_id"] = parsed_val
+            elif t == 2:  # Port ID
+                info["port_id"] = parsed_val
+            elif t == 4:  # Port description
+                info["port_description"] = parsed_val
+            elif t == 5:  # System name
+                info["system_name"] = parsed_val
+            elif t == 8:  # Management address
+                info["management_address"] = parsed_val
     return info
 
 
