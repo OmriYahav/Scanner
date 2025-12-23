@@ -356,8 +356,8 @@ def resolve_active_ethernet_interface(preferred: Optional[str]) -> Tuple[Optiona
     return None, reason
 
 
-LLDP_CAPTURE_SECONDS = 30
-LLDP_PROCESS_GRACE_SECONDS = 5
+LLDP_CAPTURE_SECONDS = 12
+LLDP_PROCESS_GRACE_SECONDS = 3
 LLDP_TIMEOUT_SECONDS = LLDP_CAPTURE_SECONDS + LLDP_PROCESS_GRACE_SECONDS
 LLDP_MAX_ATTEMPTS = 3
 LLDP_RETRY_DELAY_SECONDS = 2.5
@@ -467,6 +467,7 @@ def run_lldp_powershell_capture(
             "Invoke-DiscoveryProtocolCapture does not support interface selection; "
             "capturing all interfaces and filtering results locally"
         )
+
     start_ts = time.monotonic()
     neighbors: List[dict] = []
     meta: Dict[str, Any] = {
@@ -478,7 +479,7 @@ def run_lldp_powershell_capture(
         "timeout": False,
         "error": None,
         "parse_error": None,
-        "source": "PowerShell",
+        "source": "PowerShell (Diagnostic)",
         "ps_module_available": None,
         "ps_module_autoinstall_attempted": False,
         "ps_module_autoinstall_success": False,
@@ -489,37 +490,38 @@ def run_lldp_powershell_capture(
         "cmdlet_available": None,
         "attempts": [],
         "interface_filtering_requested": bool(interface_name_or_alias),
+        "lldp_source": "Diagnostic (best-effort)",
     }
 
     def finalize() -> Tuple[List[dict], dict]:
-        if meta.get("elapsed_ms") is None:
-            meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        meta.setdefault("elapsed_ms", int((time.monotonic() - start_ts) * 1000))
         if meta.get("error") and "error_short" not in meta:
             err = str(meta.get("error") or "")
             meta["error_short"] = (err.splitlines()[0] if err else "Unknown error")[:200]
         if meta.get("status") is None:
-            if meta.get("exit_code") not in (0, None):
-                meta["status"] = "LLDP: Error"
-            elif neighbors:
-                meta["status"] = "LLDP: OK (Detected)"
+            if neighbors:
+                meta["status"] = "Diagnostic (best-effort)"
+            elif meta.get("error"):
+                meta["status"] = meta.get("status") or "No LLDP traffic detected"
             else:
-                meta["status"] = "LLDP: No neighbors"
+                meta["status"] = "No LLDP traffic detected"
         return neighbors, meta
 
     if os.name != "nt":
         meta["error"] = "PowerShell LLDP unavailable on non-Windows"
-        meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        meta["status"] = "No LLDP traffic detected"
         return finalize()
 
     if meta["admin"] is not True:
         meta["error"] = "Administrator privileges required"
         meta["error_type"] = "PermissionError"
+        meta["status"] = "Administrator privileges required"
         return finalize()
 
     ps_exe = shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
     if not ps_exe:
         meta["error"] = "PowerShell not found"
-        meta["elapsed_ms"] = int((time.monotonic() - start_ts) * 1000)
+        meta["status"] = "No LLDP traffic detected"
         return finalize()
 
     meta["ps_module_available"] = check_psdiscovery_module()
@@ -533,281 +535,14 @@ def run_lldp_powershell_capture(
         if not meta["ps_module_available"]:
             meta["error"] = "PSDiscoveryProtocol module not loaded or incompatible"
             meta["error_type"] = "ModuleError"
+            meta["status"] = "Diagnostic (best-effort)"
             return finalize()
-
-    def ps_value_to_bytes(value: Any) -> bytes:
-        if value is None:
-            return b""
-        if isinstance(value, (bytes, bytearray)):
-            return bytes(value)
-        if isinstance(value, list) and all(isinstance(v, int) for v in value):
-            try:
-                return bytes([v & 0xFF for v in value])
-            except Exception:
-                return b""
-        if isinstance(value, str):
-            return value.encode(errors="ignore")
-        try:
-            return bytes(value)
-        except Exception:
-            return str(value).encode(errors="ignore")
-
-    def format_chassis(entry: dict) -> Optional[str]:
-        raw = ps_value_to_bytes(entry.get("ChassisId"))
-        subtype_val = entry.get("ChassisIdSubtype")
-        try:
-            subtype = int(subtype_val) if subtype_val is not None else None
-        except Exception:
-            subtype = None
-
-        if not raw:
-            return None
-        if subtype == 4:  # MAC Address
-            if len(raw) == 6:
-                return ":".join(f"{b:02x}" for b in raw)
-            return raw.hex(":")
-        if subtype in (5, 7):  # Interface name / Local
-            return raw.decode(errors="ignore").strip()
-        return raw.hex(":") if raw else None
-
-    def format_management_address(entry: dict) -> Optional[str]:
-        mgmt_addr = ps_value_to_bytes(entry.get("ManagementAddress"))
-        if len(mgmt_addr) == 5:
-            try:
-                return str(ipaddress.IPv4Address(mgmt_addr[1:]))
-            except Exception:
-                return mgmt_addr.hex(":")
-        return mgmt_addr.decode(errors="ignore") if mgmt_addr else None
-
-    def norm(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return str(value)
-        if isinstance(value, (list, tuple, set)):
-            return ", ".join(str(v) for v in value)
-        try:
-            return str(value)
-        except Exception:
-            return None
-
-    def parse_neighbors(data: Any) -> List[dict]:
-        parsed_neighbors: List[dict] = []
-        if data is None:
-            return parsed_neighbors
-
-        entries = data if isinstance(data, list) else [data]
-
-        def pick_entry_value(entry: dict, keys: List[str]) -> Optional[Any]:
-            for key in keys:
-                if key not in entry:
-                    continue
-                val = entry.get(key)
-                if val is None:
-                    continue
-                if isinstance(val, (list, tuple)):
-                    if not val:
-                        continue
-                    val = val[0]
-                if isinstance(val, (str, bytes)):
-                    val = val.decode(errors="ignore") if isinstance(val, bytes) else val.strip()
-                    if not val:
-                        continue
-                return val
-            return None
-
-        def stringify(value: Any) -> Optional[str]:
-            if value is None:
-                return None
-            if isinstance(value, (int, float)):
-                return str(value)
-            if isinstance(value, bytes):
-                return value.decode(errors="ignore")
-            if isinstance(value, (list, tuple, set)):
-                return ", ".join(str(v) for v in value)
-            try:
-                as_str = str(value)
-                return as_str if as_str else None
-            except Exception:
-                return None
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            ip_addresses = entry.get("IPAddresses")
-            mgmt_address = None
-            if isinstance(ip_addresses, (list, tuple)) and ip_addresses:
-                mgmt_address = ip_addresses[0]
-            else:
-                mgmt_address = pick_entry_value(
-                    entry, ["management_address", "ManagementAddress"]
-                )
-                mgmt_list = pick_entry_value(entry, ["ManagementAddresses", "IPAddress"])
-                if mgmt_address is None and mgmt_list is not None:
-                    mgmt_address = mgmt_list
-
-            neighbor = {
-                "chassis_id": stringify(
-                    format_chassis(entry) or pick_entry_value(entry, ["chassis_id", "ChassisId"])
-                ),
-                "port_id": stringify(pick_entry_value(entry, ["port_id", "Port", "PortId"])),
-                "system_name": stringify(pick_entry_value(entry, ["system_name", "ComputerName", "SystemName"])),
-                "port_description": stringify(pick_entry_value(entry, ["port_description", "PortDescription"])),
-                "system_description": stringify(
-                    pick_entry_value(entry, ["system_description", "SystemDescription"])
-                ),
-                "management_address": stringify(mgmt_address),
-                "ttl": stringify(pick_entry_value(entry, ["ttl", "TimeToLive"])),
-                "connection": stringify(pick_entry_value(entry, ["connection", "Connection"])),
-                "interface": stringify(pick_entry_value(entry, ["interface", "Interface"])),
-                "vlans": entry.get("Vlans") or entry.get("VlanIds") or [],
-                "raw": entry,
-            }
-            parsed_neighbors.append(neighbor)
-        return parsed_neighbors
-
-    def normalize_mac(mac: Any) -> str:
-        try:
-            return re.sub(r"[^0-9a-f]", "", str(mac).lower())
-        except Exception:
-            return ""
-
-    def collect_interface_metadata(
-        target: str,
-    ) -> Tuple[Set[str], Set[str], Set[str]]:
-        candidate_names: Set[str] = set()
-        local_macs: Set[str] = set()
-        local_ips: Set[str] = set()
-
-        target_lower = target.lower()
-        candidate_names.add(target_lower)
-
-        try:
-            addrs = psutil.net_if_addrs().get(target, [])
-            for addr in addrs:
-                family_name = getattr(addr.family, "name", addr.family)
-                if (
-                    family_name == "AF_LINK"
-                    or addr.family == getattr(psutil, "AF_LINK", None)
-                    or family_name == "AF_PACKET"
-                ):
-                    mac_val = normalize_mac(addr.address)
-                    if mac_val:
-                        local_macs.add(mac_val)
-                if family_name == "AF_INET" or addr.family == socket.AF_INET:
-                    if addr.address:
-                        local_ips.add(addr.address)
-        except Exception:
-            pass
-
-        try:
-            if get_windows_if_list:
-                for iface in get_windows_if_list():
-                    if not isinstance(iface, dict):
-                        continue
-                    values = [
-                        iface.get("name"),
-                        iface.get("friendlyname"),
-                        iface.get("description"),
-                        iface.get("guid"),
-                        iface.get("interfacealias"),
-                        iface.get("interfacedescription"),
-                    ]
-                    lowered = {str(v).lower() for v in values if v}
-                    if target_lower in lowered:
-                        candidate_names.update(lowered)
-        except Exception:
-            pass
-
-        return candidate_names, local_macs, local_ips
-
-    def value_matches_names(value: Any, names: Set[str]) -> bool:
-        if not value:
-            return False
-        if isinstance(value, (list, tuple, set)):
-            return any(value_matches_names(v, names) for v in value)
-        low_val = str(value).lower()
-        return any(low_val == n or low_val in n or n in low_val for n in names)
-
-    def value_matches_macs(value: Any, macs: Set[str]) -> bool:
-        if not value:
-            return False
-        if isinstance(value, (list, tuple, set)):
-            return any(value_matches_macs(v, macs) for v in value)
-        norm = normalize_mac(value)
-        return bool(norm and norm in macs)
-
-    def value_matches_ips(value: Any, ips: Set[str]) -> bool:
-        if not value:
-            return False
-        if isinstance(value, (list, tuple, set)):
-            return any(value_matches_ips(v, ips) for v in value)
-        return str(value) in ips
-
-    def filter_neighbors_for_interface(
-        items: List[dict],
-        iface_name: str,
-    ) -> Tuple[List[dict], Dict[str, Any]]:
-        names, macs, ips = collect_interface_metadata(iface_name)
-        filter_meta = {
-            "interface_filter_names": sorted(names),
-            "interface_filter_macs": sorted(macs),
-            "interface_filter_ips": sorted(ips),
-            "before": len(items),
-            "after": None,
-        }
-
-        def matches(neighbor: dict) -> bool:
-            raw = neighbor.get("raw") or {}
-            text_candidates = [neighbor.get("interface"), neighbor.get("connection")]
-            for key in [
-                "Interface",
-                "Connection",
-                "InterfaceName",
-                "InterfaceDescription",
-                "InterfaceAlias",
-                "Adapter",
-                "AdapterName",
-                "AdapterDescription",
-                "LocalInterface",
-                "LocalConnection",
-            ]:
-                text_candidates.append(raw.get(key))
-
-            if any(value_matches_names(val, names) for val in text_candidates):
-                return True
-
-            mac_candidates = []
-            for key in [
-                "LocalMac",
-                "LocalMacAddress",
-                "MacAddress",
-                "LocalMacs",
-                "LocalPortMacAddress",
-            ]:
-                mac_candidates.append(raw.get(key))
-
-            if any(value_matches_macs(val, macs) for val in mac_candidates):
-                return True
-
-            ip_candidates = [neighbor.get("management_address")]
-            for key in ["LocalIp", "LocalIpAddress", "IPAddress", "IPAddresses"]:
-                ip_candidates.append(raw.get(key))
-
-            if any(value_matches_ips(val, ips) for val in ip_candidates):
-                return True
-
-            return False
-
-        filtered = [n for n in items if matches(n)]
-        filter_meta["after"] = len(filtered)
-        return filtered, filter_meta
 
     script_path = POWERSHELL_DIR / "run_lldp_capture.ps1"
     if not script_path.exists():
         meta["error"] = f"PowerShell LLDP script missing at {script_path}"
         meta["error_type"] = "ScriptMissing"
+        meta["status"] = "Diagnostic (best-effort)"
         return finalize()
 
     cmd = [
@@ -846,12 +581,12 @@ def run_lldp_powershell_capture(
     except Exception as e:
         meta["error"] = str(e)
         meta["error_type"] = "ExecutionError"
-        meta["status"] = "Error"
-        stdout, stderr = "", ""
+        meta["status"] = "Diagnostic (best-effort)"
         return finalize()
 
-    logger.info("LLDP capture started (blocking until completion)")
+    logger.info("LLDP PowerShell capture started (diagnostic, blocking until completion)")
     capture_start = time.monotonic()
+    stdout, stderr = "", ""
     try:
         stdout, stderr = proc.communicate(timeout=LLDP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -859,174 +594,88 @@ def run_lldp_powershell_capture(
         meta["error_type"] = "Timeout"
         meta["error"] = f"LLDP capture timed out after {LLDP_TIMEOUT_SECONDS} seconds"
         try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(1)
-        except Exception:
-            pass
-        try:
             proc.kill()
-            meta["killed_on_timeout"] = True
         except Exception:
             pass
-        meta["status"] = "Error"
-        stdout, stderr = "", ""
     except Exception as e:
         meta["error"] = str(e)
         meta["error_type"] = "ExecutionError"
-        meta["status"] = "Error"
-        stdout, stderr = "", ""
-
     meta["elapsed_ms"] = int((time.monotonic() - capture_start) * 1000)
     meta["exit_code"] = proc.returncode if proc.returncode is not None else -1
     meta["stdout_preview"] = (stdout or "")[:500]
-    meta["stderr_preview"] = (stderr or "")[:1000]
+    meta["stderr_preview"] = (stderr or "")[:500]
 
-    logger.info(
-        "LLDP PowerShell finished with exit code %s", meta.get("exit_code")
-    )
+    logger.info("LLDP PowerShell finished with exit code %s", meta.get("exit_code"))
     logger.info("LLDP PowerShell stdout preview: %s", meta.get("stdout_preview"))
     logger.info("LLDP PowerShell stderr preview: %s", meta.get("stderr_preview"))
 
     if meta.get("error_type"):
-        meta["status"] = meta.get("status") or "LLDP: Error"
+        meta.setdefault("status", "Diagnostic (best-effort)")
         return finalize()
 
     output = (stdout or "").strip()
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    raw_log_path: Optional[Path] = None
     if debug_log and output:
         try:
-            raw_log_path = Path("logs") / f"lldp_raw_{timestamp}.json"
+            raw_log_path = Path("logs") / f"lldp_raw_{timestamp}.txt"
             raw_log_path.parent.mkdir(parents=True, exist_ok=True)
             raw_log_path.write_text(output, encoding="utf-8")
-            meta["debug_log_path"] = str(raw_log_path)
+            meta["raw_log_path"] = str(raw_log_path)
         except Exception:
             logger.debug("Failed to write LLDP raw debug output", exc_info=True)
 
-    if meta.get("exit_code") not in (0, None):
-        meta.setdefault("error", meta.get("stderr_preview") or "PowerShell execution failed")
-        meta.setdefault("error_type", "ExecutionError")
-        meta.setdefault("status", "LLDP: Error")
-        meta["non_zero_exit_code"] = True
-
-        # Some PowerShell environments emit a non-zero exit code even when structured
-        # JSON is written to stdout. In those cases, attempt to parse the payload so the
-        # UI can still show useful error details or neighbors instead of returning early
-        # with an opaque failure.
-        if not output:
-            return finalize()
-
     if not output:
-        meta["error"] = "PowerShell returned no LLDP data"
-        meta["error_type"] = meta.get("error_type") or "ParseError"
-        meta["status"] = "LLDP: Error (Invalid JSON)"
+        meta["error"] = meta.get("error") or "PowerShell returned no LLDP data"
+        meta["status"] = "No LLDP traffic detected"
         return finalize()
 
+    def parse_text_neighbors(text: str) -> List[dict]:
+        neighbors_out: List[dict] = []
+        current: Dict[str, Any] = {}
+        patterns = {
+            "system_name": re.compile(r"system\s*name\s*[:=]\s*(.+)", re.IGNORECASE),
+            "chassis_id": re.compile(r"chassis\s*id\s*[:=]\s*(.+)", re.IGNORECASE),
+            "port_id": re.compile(r"port\s*id\s*[:=]\s*(.+)", re.IGNORECASE),
+            "port_description": re.compile(r"port\s*description\s*[:=]\s*(.+)", re.IGNORECASE),
+            "management_address": re.compile(r"management\s*address\s*[:=]\s*(.+)", re.IGNORECASE),
+        }
+
+        def flush():
+            nonlocal current
+            if current:
+                neighbors_out.append({k: str(v).strip() for k, v in current.items() if v})
+                current = {}
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                flush()
+                continue
+            for key, pat in patterns.items():
+                match = pat.search(stripped)
+                if match:
+                    current[key] = match.group(1)
+            if stripped.lower().startswith("neighbor"):
+                flush()
+
+        flush()
+        return neighbors_out
+
     try:
-        parsed_json = json.loads(output)
-        json_valid = True
-    except Exception as e:
-        json_valid = False
-        meta["error_type"] = meta.get("error_type") or "ParseError"
-        meta["error"] = f"Failed to parse PowerShell output: {e}"
-        meta["status"] = "LLDP: Error (Invalid JSON)"
-        return finalize()
-
-    neighbor_payload = parsed_json
-    structured_error_type = None
-    structured_error_message = None
-    if isinstance(parsed_json, dict):
-        meta["module_imported"] = parsed_json.get("module_imported")
-        meta["cmdlet_available"] = parsed_json.get("cmdlet_available")
-        meta["cmdlet_used"] = parsed_json.get("cmdlet_used")
-        structured_error_type = parsed_json.get("error_type")
-        meta["failed_stage"] = parsed_json.get("failed_stage")
-        structured_error_message = parsed_json.get("error_message")
-
-        logger.info("PowerShell LLDP cmdlet used: %s", meta.get("cmdlet_used"))
-        logger.info("PSDiscoveryProtocol imported: %s", meta.get("module_imported"))
-        logger.info("Invoke-DiscoveryProtocolCapture available: %s", meta.get("cmdlet_available"))
-
-        neighbor_payload = parsed_json.get("neighbors")
-
-    if structured_error_type:
-        meta["error_type"] = structured_error_type
-        meta["error"] = structured_error_message or meta.get("error") or structured_error_type
-
-    try:
-        neighbors = parse_neighbors(neighbor_payload)
+        neighbors = parse_text_neighbors(output)
         meta["lldp_frames"] = len(neighbors)
     except Exception as e:
         meta["error_type"] = meta.get("error_type") or "ParseError"
         meta["error"] = f"Failed to parse PowerShell output: {e}"
-        meta["status"] = "LLDP: Error (Invalid JSON)"
         neighbors = []
-        return finalize()
 
-    if interface_name_or_alias and neighbors:
-        neighbors, filter_meta = filter_neighbors_for_interface(
-            neighbors, interface_name_or_alias
-        )
-        meta.update(filter_meta)
-        meta["interface_filter_applied"] = True
-        logger.info(
-            "Post-capture LLDP filter applied for %s: kept %s of %s entries",
-            interface_name_or_alias,
-            filter_meta.get("after"),
-            filter_meta.get("before"),
-        )
-        meta.setdefault(
-            "status_label",
-            "LLDP capture succeeded, but interface-specific capture is not supported by Windows. "
-            "Results are filtered after capture.",
-        )
-
-    if interface_name_or_alias:
-        meta.setdefault(
-            "status_label",
-            "LLDP capture succeeded, but interface-specific capture is not supported by Windows. "
-            "Results are filtered after capture.",
-        )
-
-    meta["lldp_frames"] = len(neighbors)
-
-    if debug_log:
-        try:
-            normalized_path = Path("logs") / f"lldp_normalized_{timestamp}.json"
-            normalized_path.write_text(
-                json.dumps(neighbors, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            meta["normalized_log_path"] = str(normalized_path)
-        except Exception:
-            logger.debug("Failed to write LLDP normalized debug output", exc_info=True)
-
-    exit_code = meta.get("exit_code")
-    has_neighbors = bool(neighbors)
-
-    if has_neighbors:
-        meta["status"] = "LLDP: OK (Detected)"
-    elif json_valid:
-        if structured_error_type:
-            meta["status"] = "LLDP: Error"
-        else:
-            meta["status"] = "LLDP: No neighbors"
-            meta["error_type"] = meta.get("error_type") or "NoNeighbors"
-            no_neighbor_msg = (
-                structured_error_message
-                or meta.get("error")
-                or "LLDP captured successfully, no neighbors detected."
-            )
-            meta["error"] = no_neighbor_msg
-            meta.setdefault("status_label", no_neighbor_msg)
+    if neighbors:
+        meta["status"] = "Diagnostic (best-effort)"
     else:
-        meta["status"] = meta.get("status") or "LLDP: Error (Invalid JSON)"
+        meta["status"] = "No LLDP traffic detected"
 
-    meta["lldp_source"] = "PowerShell" if has_neighbors else meta.get("lldp_source")
     return finalize()
+
 
 def is_device_online(d: Device) -> bool:
     if d.rtt_ms is not None:
@@ -1194,6 +843,43 @@ def parse_dhcp_info_from_ipconfig(interface_name: str) -> Dict[str, str]:
     if dns_collect:
         info["dns"] = ", ".join(dns_collect)
     return info
+
+
+def get_primary_interface_with_gateway(preferred: Optional[str] = None) -> Optional[str]:
+    stats = psutil.net_if_stats()
+    addrs = psutil.net_if_addrs()
+    preferred_lower = preferred.lower() if preferred else None
+
+    def first_ipv4(name: str) -> Optional[str]:
+        for addr in addrs.get(name, []):
+            family = getattr(addr.family, "name", addr.family)
+            if family == "AF_INET" or addr.family == socket.AF_INET:
+                return addr.address
+        return None
+
+    candidates: List[Tuple[bool, str]] = []
+    for name, stat in stats.items():
+        if not stat.isup:
+            continue
+        ipv4_addr = first_ipv4(name)
+        if not ipv4_addr:
+            continue
+        dhcp_info = parse_dhcp_info_from_ipconfig(name) if os.name == "nt" else {}
+        has_gateway = bool(dhcp_info.get("gateway"))
+        candidates.append((has_gateway, name))
+
+    if preferred_lower:
+        for has_gateway, name in candidates:
+            if name.lower() == preferred_lower and has_gateway:
+                return name
+        for _, name in candidates:
+            if name.lower() == preferred_lower:
+                return name
+
+    for has_gateway, name in candidates:
+        if has_gateway:
+            return name
+    return candidates[0][1] if candidates else None
 
 
 def get_dhcp_info(interface_name: Optional[str], iface_data: Optional[dict]) -> Dict[str, str]:
@@ -2664,8 +2350,11 @@ class Layer2InfoWorker(QThread):
         return neighbors[0]
 
     def run(self):
+        logger.info("LLDP worker starting for iface %s", self.iface_name)
         admin_state = self.is_admin if self.is_admin is not None else is_running_as_admin()
         admin_text = "Yes" if admin_state else ("No" if admin_state is False else "Unknown")
+        capture_iface = get_primary_interface_with_gateway(self.iface_name)
+
         payload = {
             "lldp": {
                 "status": "Unknown",
@@ -2676,7 +2365,7 @@ class Layer2InfoWorker(QThread):
             },
             "vlans": {"status": "Unknown", "vlans": []},
             "meta": {
-                "iface": self.iface_name or "-",
+                "iface": capture_iface or self.iface_name or "-",
                 "captured": 0,
                 "lldp_frames": 0,
                 "vlan_frames": 0,
@@ -2687,166 +2376,130 @@ class Layer2InfoWorker(QThread):
         }
 
         if admin_state is not True:
-            payload["lldp"]["status"] = "Unavailable (Administrator required)"
-            payload["lldp"]["source"] = "Unavailable"
-            payload["lldp"]["error"] = "Requires Administrator privileges"
-            payload["meta"]["lldp_source"] = "Unavailable"
-            payload["meta"]["error"] = "Requires Administrator privileges"
+            payload["lldp"]["status"] = "Administrator privileges required"
+            payload["lldp"]["error"] = "Administrator privileges required"
+            payload["meta"]["error"] = "Administrator privileges required"
             self.result.emit(payload)
             return
 
-        neighbors, ps_meta = run_lldp_powershell_capture(
-            self.iface_name, debug_log=self.debug_log
-        )
-        lldp_neighbors_cache = [self._normalize_lldp_neighbor(n) for n in neighbors]
-        seen_neighbors = {
-            (
-                n.get("system_name"),
-                n.get("chassis_id"),
-                n.get("port_id"),
-            )
-            for n in lldp_neighbors_cache
-        }
+        if not SCAPY_AVAILABLE or not sniff or not Ether:
+            payload["lldp"]["status"] = "Npcap not installed"
+            payload["lldp"]["error"] = "Npcap not installed"
+            payload["meta"]["error"] = "Npcap not installed"
+            self.result.emit(payload)
+            return
+
+        if os.name == "nt" and not is_npcap_available():
+            payload["lldp"]["status"] = "Npcap not installed"
+            payload["lldp"]["error"] = "Npcap not installed"
+            payload["meta"]["error"] = "Npcap not installed"
+            self.result.emit(payload)
+            return
+
+        if not capture_iface:
+            payload["lldp"]["status"] = "No LLDP traffic detected"
+            payload["lldp"]["error"] = "No active interface with gateway"
+            self.result.emit(payload)
+            return
+
+        lldp_neighbors: List[dict] = []
+        seen_neighbors = set()
         scapy_added_neighbor = False
-        resolved_iface: Optional[str] = None
-        if self.iface_name and sniff and SCAPY_AVAILABLE:
-            try:
-                resolved_iface = resolve_capture_interface(self.iface_name)
-            except Exception as e:
-                logger.error(f"Failed to resolve interface {self.iface_name}: {e}")
-                resolved_iface = self.iface_name
-        ps_error_type = ps_meta.get("error_type")
-        ps_status_text = ps_meta.get("status") or (
-            "LLDP: OK (Detected)" if lldp_neighbors_cache else "LLDP: No neighbors"
-        )
-        status_label_override = ps_meta.get("status_label")
-        payload["lldp"]["neighbors"] = lldp_neighbors_cache
-        payload["lldp"]["primary"] = self._choose_primary_neighbor(lldp_neighbors_cache)
-        payload["lldp"]["status"] = ps_status_text
-        payload["lldp"]["status_label"] = status_label_override or (
-            ps_status_text if str(ps_status_text).startswith("LLDP:") else f"LLDP: {ps_status_text}"
-        )
-        payload["lldp"]["source"] = ps_meta.get("lldp_source") or ps_meta.get("source")
-        error_message = ps_meta.get("error_short") or ps_meta.get("error") or ps_meta.get("stderr_preview")
-        exit_code = ps_meta.get("exit_code")
-        if exit_code not in (0, None) and not error_message:
-            error_message = "PowerShell execution failed"
-        if str(ps_status_text).lower().startswith("no neighbors") and not error_message:
-            error_message = "LLDP captured successfully, no neighbors detected."
-        payload["lldp"]["error"] = error_message
-        if payload["lldp"]["primary"]:
-            payload["lldp"].update(payload["lldp"]["primary"])
-        payload["meta"]["captured"] = ps_meta.get("lldp_frames", len(lldp_neighbors_cache))
-        payload["meta"]["lldp_frames"] = ps_meta.get("lldp_frames", len(lldp_neighbors_cache))
-        payload["meta"]["lldp_source"] = payload["lldp"].get("source")
-        payload["meta"]["lldp_debug"] = ps_meta
-        payload["meta"]["module_imported"] = ps_meta.get("module_imported")
-        payload["meta"]["cmdlet_available"] = ps_meta.get("cmdlet_available")
-        payload["meta"]["error_type"] = ps_error_type
-        payload["meta"]["failed_stage"] = ps_meta.get("failed_stage")
-        if error_message:
-            payload["meta"]["error"] = error_message
-
-        allow_lldp_from_scapy = (
-            admin_state is True
-            and (ps_meta.get("error") or not lldp_neighbors_cache)
-        )
-
-        if allow_lldp_from_scapy and resolved_iface and sniff and SCAPY_AVAILABLE:
-            try:
-                packets = sniff(
-                    filter="ether proto 0x88cc",
-                    iface=resolved_iface,
-                    timeout=5,
-                    store=True,
-                )
-                for pkt in packets:
-                    parsed = parse_lldp_tlvs(bytes(pkt.payload))
-                    if parsed:
-                        neighbor = {
-                            "system_name": parsed.get("system_name"),
-                            "chassis_id": parsed.get("chassis_id"),
-                            "port_id": parsed.get("port_id"),
-                            "port_description": parsed.get("port_description"),
-                            "management_address": parsed.get("management_address"),
-                            "raw": parsed,
-                        }
-                        key = (
-                            neighbor.get("system_name"),
-                            neighbor.get("chassis_id"),
-                            neighbor.get("port_id"),
-                        )
-                        if key not in seen_neighbors:
-                            seen_neighbors.add(key)
-                            lldp_neighbors_cache.append(neighbor)
-                            scapy_added_neighbor = True
-            except Exception as e:
-                logger.error(f"Scapy LLDP capture failed: {e}")
-
-        if not self.iface_name or not sniff or not SCAPY_AVAILABLE:
-            if not payload["vlans"].get("status"):
-                payload["vlans"]["status"] = "Unknown"
-            self.result.emit(payload)
-            return
-
+        parse_fail_reason: Optional[str] = None
+        lldp_packets = []
+        capture_start = time.monotonic()
         try:
-            payload["meta"]["iface"] = resolved_iface or self.iface_name
-            packets = sniff(iface=resolved_iface or self.iface_name, timeout=3, store=True, promisc=True)
-        except Exception as e:
-            payload["lldp"]["status"] = payload["lldp"].get(
-                "status",
-                "Layer 2 capture: Unavailable (requires Npcap + permissions)",
+            lldp_packets = sniff(
+                filter="ether proto 0x88cc",
+                iface=resolve_capture_interface(capture_iface),
+                timeout=LLDP_CAPTURE_SECONDS,
+                store=True,
+                promisc=True,
             )
-            payload["vlans"]["status"] = "Unknown (capture failed)"
+        except PermissionError as e:
+            payload["lldp"]["status"] = "Administrator privileges required"
+            payload["lldp"]["error"] = str(e)
             payload["meta"]["error"] = str(e)
-            payload["meta"]["lldp_source"] = payload["lldp"].get("source")
+            self.result.emit(payload)
+            return
+        except Exception as e:
+            payload["lldp"]["status"] = "Npcap not installed"
+            payload["lldp"]["error"] = str(e)
+            payload["meta"]["error"] = str(e)
             self.result.emit(payload)
             return
 
-        payload["meta"]["captured"] = len(packets)
-        lldp_detected = False
-        lldp_details: Dict[str, str] = {}
-        vlan_ids: Set[int] = set()
-        lldp_frames = 0
-        vlan_frame_count = 0
-
-        for pkt in packets:
+        capture_duration = time.monotonic() - capture_start
+        lldp_frame_count = 0
+        for pkt in lldp_packets:
             try:
                 eth = pkt.getlayer(Ether)
-                if not eth:
+                if not eth or getattr(eth, "type", None) != 0x88CC:
                     continue
+                lldp_frame_count += 1
+                parsed = parse_lldp_tlvs(bytes(pkt.payload))
+                if parsed:
+                    neighbor = {
+                        "system_name": parsed.get("system_name"),
+                        "chassis_id": parsed.get("chassis_id"),
+                        "port_id": parsed.get("port_id"),
+                        "port_description": parsed.get("port_description"),
+                        "management_address": parsed.get("management_address"),
+                        "raw": parsed,
+                    }
+                    key = (
+                        neighbor.get("system_name"),
+                        neighbor.get("chassis_id"),
+                        neighbor.get("port_id"),
+                    )
+                    if key not in seen_neighbors:
+                        seen_neighbors.add(key)
+                        lldp_neighbors.append(neighbor)
+                        scapy_added_neighbor = True
+                else:
+                    parse_fail_reason = parse_fail_reason or "Failed to parse LLDP TLVs"
+            except Exception as exc:
+                parse_fail_reason = parse_fail_reason or str(exc)
+                continue
 
-                eth_type = getattr(eth, "type", None)
-                dst_mac = getattr(eth, "dst", "").lower()
+        payload["meta"]["captured"] = len(lldp_packets)
+        payload["meta"]["lldp_frames"] = lldp_frame_count
+        payload["meta"]["lldp_source"] = "Scapy" if scapy_added_neighbor else None
 
-                if eth_type == 0x88CC or dst_mac == "01:80:c2:00:00:0e":
-                    lldp_detected = True
-                    lldp_frames += 1
-                    raw = bytes(pkt.payload)
-                    parsed = parse_lldp_tlvs(raw)
-                    for k, v in parsed.items():
-                        if v:
-                            lldp_details.setdefault(k, v)
+        logger.info(
+            "LLDP capture complete on %s: duration=%.2fs frames=%s neighbors=%s", 
+            capture_iface,
+            capture_duration,
+            lldp_frame_count,
+            len(lldp_neighbors),
+        )
+        if parse_fail_reason:
+            logger.info("LLDP parse note: %s", parse_fail_reason)
 
-                    if allow_lldp_from_scapy:
-                        neighbor = {
-                            "system_name": parsed.get("system_name"),
-                            "chassis_id": parsed.get("chassis_id"),
-                            "port_id": parsed.get("port_id"),
-                            "port_description": parsed.get("port_description"),
-                            "management_address": parsed.get("management_address"),
-                            "raw": parsed,
-                        }
-                        key = (
-                            neighbor.get("system_name"),
-                            neighbor.get("chassis_id"),
-                            neighbor.get("port_id"),
-                        )
-                        if key not in seen_neighbors:
-                            seen_neighbors.add(key)
-                            lldp_neighbors_cache.append(neighbor)
-                            scapy_added_neighbor = True
+        if lldp_neighbors:
+            payload["lldp"]["neighbors"] = [self._normalize_lldp_neighbor(n) for n in lldp_neighbors]
+            payload["lldp"]["primary"] = self._choose_primary_neighbor(payload["lldp"]["neighbors"])
+            payload["lldp"]["status"] = "LLDP: OK (Detected)"
+            payload["lldp"]["source"] = "Scapy"
+        else:
+            payload["lldp"]["status"] = "No LLDP traffic detected"
+            if parse_fail_reason:
+                payload["lldp"]["error"] = parse_fail_reason
 
+        vlan_ids: Set[int] = set()
+        vlan_frame_count = 0
+        try:
+            vlan_packets = sniff(iface=resolve_capture_interface(capture_iface), timeout=3, store=True, promisc=True)
+        except Exception as e:
+            payload["vlans"]["status"] = "Unknown (capture failed)"
+            payload["meta"]["error"] = payload["meta"].get("error") or str(e)
+            self.result.emit(payload)
+            return
+
+        for pkt in vlan_packets:
+            try:
+                eth = pkt.getlayer(Ether)
+                eth_type = getattr(eth, "type", None) if eth else None
                 vlan_layer = pkt[Dot1Q] if Dot1Q and pkt.haslayer(Dot1Q) else None
                 if vlan_layer or eth_type == 0x8100:
                     vlan_frame_count += 1
@@ -2856,33 +2509,27 @@ class Layer2InfoWorker(QThread):
             except Exception:
                 continue
 
-        payload["meta"]["lldp_frames"] = lldp_frames or payload["meta"].get("lldp_frames", 0)
         payload["meta"]["vlan_frames"] = vlan_frame_count
-        if scapy_added_neighbor:
-            payload["lldp"]["source"] = "Scapy"
-        if not payload["lldp"].get("source") and scapy_added_neighbor:
-            payload["lldp"]["source"] = "Scapy"
-        payload["meta"]["lldp_source"] = payload["lldp"].get("source") or payload["meta"].get("lldp_source")
-        if not payload["lldp"].get("neighbors") and lldp_neighbors_cache:
-            payload["lldp"]["neighbors"] = lldp_neighbors_cache
-        payload["lldp"]["primary"] = payload["lldp"].get("primary") or self._choose_primary_neighbor(
-            payload["lldp"].get("neighbors", [])
-        )
-        if payload["lldp"].get("status", "").lower().startswith("unavailable"):
-            pass
-        elif payload["lldp"].get("neighbors"):
-            payload["lldp"]["status"] = "Detected"
-        elif scapy_added_neighbor or lldp_detected:
-            payload["lldp"]["status"] = "Detected"
-        elif payload["lldp"].get("status") in (None, "Unknown"):
-            payload["lldp"]["status"] = "Not detected"
-        payload["lldp"].update(payload["lldp"].get("primary") or lldp_details)
-
         if vlan_ids:
             payload["vlans"]["status"] = "Detected"
             payload["vlans"]["vlans"] = sorted(vlan_ids)
         else:
             payload["vlans"]["status"] = "None detected"
+
+        if not lldp_neighbors and os.name == "nt":
+            ps_neighbors, ps_meta = run_lldp_powershell_capture(capture_iface, debug_log=self.debug_log)
+            if ps_neighbors:
+                normalized = [self._normalize_lldp_neighbor(n) for n in ps_neighbors]
+                payload["lldp"]["neighbors"] = normalized
+                payload["lldp"]["primary"] = self._choose_primary_neighbor(normalized)
+                payload["lldp"]["status"] = "Diagnostic (best-effort)"
+                payload["lldp"]["source"] = ps_meta.get("lldp_source")
+                payload["meta"]["lldp_source"] = ps_meta.get("lldp_source")
+                payload["meta"]["lldp_frames"] = ps_meta.get("lldp_frames", len(normalized))
+            if ps_meta:
+                payload["meta"]["lldp_debug"] = ps_meta
+                payload["lldp"]["error"] = payload["lldp"].get("error") or ps_meta.get("error")
+
         self.result.emit(payload)
 
 
