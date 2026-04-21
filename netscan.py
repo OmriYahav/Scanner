@@ -49,12 +49,13 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange  # type: ignore
 
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QTableWidget, QTableWidgetItem,
     QFileDialog, QCheckBox, QSpinBox, QMessageBox, QLineEdit, QGroupBox,
     QTabWidget, QPlainTextEdit, QGridLayout, QScrollArea,
-    QSplitter, QDoubleSpinBox
+    QSplitter, QDoubleSpinBox, QGraphicsDropShadowEffect
 )
 
 
@@ -1991,6 +1992,11 @@ class Card(QWidget):
     def __init__(self, title: str = "", parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setObjectName("card")
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(32)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(37, 99, 235, 28))
+        self.setGraphicsEffect(shadow)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
@@ -2013,32 +2019,57 @@ class Card(QWidget):
 
 GLOBAL_QSS = f"""
 QMainWindow {{
-    background: #F6F7FB;
+    background: #F3F5FA;
+    color: #1F2937;
+}}
+
+QWidget {{
+    font-family: "Inter", "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
 }}
 
 QTabWidget::pane {{
     border: 0;
+    top: -1px;
+}}
+
+QTabBar {{
+    background: transparent;
 }}
 
 QTabBar::tab {{
-    background: transparent;
-    padding: 8px 16px;
-    margin-right: 4px;
-    color: #6B7280;
-    border-bottom: 2px solid transparent;
+    background: rgba(255, 255, 255, 0.7);
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 10px 18px;
+    margin-right: 8px;
+    margin-bottom: 10px;
+    color: #64748B;
     font-weight: 600;
 }}
 
+QTabBar::tab:hover {{
+    color: #334155;
+    border-color: #CBD5E1;
+    background: rgba(255, 255, 255, 0.95);
+}}
+
 QTabBar::tab:selected {{
-    color: #111827;
-    border-bottom: 2px solid #2563EB;
+    color: #0F172A;
+    border: 1px solid transparent;
+    border-top: 2px solid #00C2C7;
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 rgba(0, 194, 199, 0.16),
+        stop:1 rgba(123, 97, 255, 0.16)
+    );
 }}
 
 QWidget#card, QGroupBox {{
-    background: #FFFFFF;
-    border: 1px solid #E5E7EB;
+    background: rgba(255, 255, 255, 0.88);
+    border: 1px solid rgba(148, 163, 184, 0.22);
     border-radius: {CARD_RADIUS}px;
-    padding: 2px;
+    padding: 4px;
 }}
 
 QGroupBox {{
@@ -2056,19 +2087,21 @@ QGroupBox::title {{
 }}
 
 QLabel#pageTitle {{
-    font-size: 18px;
-    font-weight: 600;
-    color: #111827;
+    font-size: 26px;
+    font-weight: 700;
+    color: #0F172A;
+    letter-spacing: 0.2px;
 }}
 
 QLabel#cardTitle, QLabel#sectionTitle {{
-    font-size: 14px;
-    font-weight: 600;
-    color: #111827;
+    font-size: 15px;
+    font-weight: 700;
+    color: #1E293B;
+    letter-spacing: 0.1px;
 }}
 
 QLabel#keyLabel {{
-    color: #6B7280;
+    color: #64748B;
     font-size: 12px;
 }}
 
@@ -2079,7 +2112,7 @@ QLabel#valueLabel {{
 }}
 
 QLabel#hintLabel {{
-    color: #9CA3AF;
+    color: #94A3B8;
     font-size: 11px;
 }}
 
@@ -2130,17 +2163,18 @@ QLabel#badge[badgeState="blue"] {{
 }}
 
 QPushButton {{
-    background: #2563EB;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00C2C7, stop:1 #7B61FF);
     color: white;
-    border-radius: 10px;
-    padding: 8px 14px;
-    border: 1px solid #2563EB;
-    font-weight: 600;
+    border-radius: 11px;
+    padding: 9px 16px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    font-weight: 700;
+    min-height: 20px;
 }}
 
 QPushButton:hover {{
-    background: #1D4ED8;
-    border-color: #1D4ED8;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00D5DB, stop:1 #896FFF);
+    border-color: rgba(123, 97, 255, 0.45);
 }}
 
 QPushButton:disabled {{
@@ -2150,20 +2184,20 @@ QPushButton:disabled {{
 }}
 
 QPushButton#ghostButton {{
-    background: transparent;
-    color: #2563EB;
-    border: 1px solid #E5E7EB;
+    background: rgba(255, 255, 255, 0.55);
+    color: #334155;
+    border: 1px solid #CBD5E1;
 }}
 
 QPushButton#secondaryButton {{
-    background: #EEF2FF;
-    color: #1D4ED8;
-    border: 1px solid #C7D2FE;
+    background: rgba(0, 194, 199, 0.12);
+    color: #1E3A8A;
+    border: 1px solid rgba(0, 194, 199, 0.35);
 }}
 
 QPushButton#secondaryButton:hover {{
-    background: #E0E7FF;
-    border-color: #A5B4FC;
+    background: rgba(123, 97, 255, 0.16);
+    border-color: rgba(123, 97, 255, 0.45);
 }}
 
 QPushButton#dangerButton {{
@@ -2178,7 +2212,7 @@ QPushButton#dangerButton:hover {{
 
 QPushButton#linkButton {{
     background: transparent;
-    color: #2563EB;
+    color: #5B5DEB;
     border: none;
     padding: 0px;
     font-weight: 600;
@@ -2189,9 +2223,16 @@ QPushButton#linkButton:hover {{
 }}
 
 QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTableWidget {{
-    border: 1px solid #E5E7EB;
-    border-radius: 8px;
-    padding: 6px 8px;
+    border: 1px solid #D6DEEA;
+    border-radius: 10px;
+    padding: 7px 10px;
+    background: rgba(255, 255, 255, 0.95);
+    selection-background-color: #7B61FF;
+    selection-color: white;
+}}
+
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {{
+    border: 1px solid #00C2C7;
     background: #FFFFFF;
 }}
 
@@ -2206,15 +2247,16 @@ QPlainTextEdit#console {{
 
 QTableWidget {{
     border-radius: 12px;
-    gridline-color: #E5E7EB;
+    gridline-color: #E2E8F0;
 }}
 
 QHeaderView::section {{
-    background: #F3F4F6;
-    color: #111827;
-    padding: 8px 6px;
+    background: #EEF2F9;
+    color: #1E293B;
+    padding: 10px 8px;
     border: 0px;
-    border-bottom: 1px solid #E5E7EB;
+    border-bottom: 1px solid #D6DEEA;
+    font-weight: 700;
 }}
 
 QHeaderView::section:horizontal {{
@@ -2223,15 +2265,15 @@ QHeaderView::section:horizontal {{
 }}
 
 QFrame#metricTile, QWidget#metricTile {{
-    background: #FFFFFF;
-    border: 1px solid #E5E7EB;
+    background: rgba(255, 255, 255, 0.92);
+    border: 1px solid rgba(148, 163, 184, 0.24);
     border-radius: 12px;
     padding: 12px;
 }}
 
 QLabel#tileTitle {{
     font-size: 12px;
-    color: #6B7280;
+    color: #64748B;
 }}
 """
 
@@ -2700,6 +2742,7 @@ class MainWindow(QMainWindow):
     def apply_stylesheet(self):
         app = QApplication.instance()
         if app:
+            app.setFont(QFont("Inter", 10))
             app.setStyleSheet(GLOBAL_QSS)
 
     def build_network_info_tab(self) -> QWidget:
@@ -3275,22 +3318,22 @@ class MainWindow(QMainWindow):
         self.table.setStyleSheet(
             """
 QTableWidget {
-    background-color: #ffffff;
-    color: #111827;
-    gridline-color: #cbd5e1;
+    background-color: rgba(255, 255, 255, 0.96);
+    color: #0F172A;
+    gridline-color: #d6deea;
     font-size: 13px;
 }
-QTableWidget::item { padding: 6px; color: #111827; }
+QTableWidget::item { padding: 8px; color: #0F172A; }
 QTableWidget::item:selected {
-    background-color: #2f6fed;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00C2C7, stop:1 #7B61FF);
     color: #ffffff;
 }
 QHeaderView::section {
-    background-color: #E5E7EB;
-    color: #111827;
-    padding: 6px;
-    border: 1px solid #cbd5e1;
-    font-weight: 600;
+    background-color: #EEF2F9;
+    color: #1E293B;
+    padding: 10px 8px;
+    border: 1px solid #D6DEEA;
+    font-weight: 700;
 }
 """
         )
